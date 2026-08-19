@@ -13,6 +13,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::core::tag::{Tag, TagColor, TagStore};
 use crate::core::matcher;
 
+// SAFETY: SetFocus 是 user32 标准 API，安全调用
+#[link(name = "user32")]
+extern "system" {
+    fn SetFocus(hWnd: HWND) -> HWND;
+}
+
 const IDC_TITLE_EDIT: i32 = 101;
 const IDC_NOTE_EDIT: i32 = 103;
 const IDC_OK_BUTTON: i32 = 104;
@@ -136,8 +142,8 @@ extern "system" fn popup_wndproc(
             let title_wide: Vec<u16> = unsafe {
                 (*data).window_title.encode_utf16().chain(std::iter::once(0)).collect()
             };
-            unsafe {
-                let _ = CreateWindowExW(
+            let title_edit = unsafe {
+                CreateWindowExW(
                     WS_EX_CLIENTEDGE,
                     windows::core::w!("EDIT"),
                     PCWSTR(title_wide.as_ptr()),
@@ -146,8 +152,9 @@ extern "system" fn popup_wndproc(
                     hwnd,
                     windows::Win32::UI::WindowsAndMessaging::HMENU(IDC_TITLE_EDIT as *mut std::ffi::c_void),
                     instance, None,
-                );
-            }
+                )
+                .expect("创建标题编辑框失败")
+            };
 
             // 备注标签
             unsafe {
@@ -206,6 +213,9 @@ extern "system" fn popup_wndproc(
                 );
             }
 
+            // 焦点设置到标题编辑框
+            unsafe { let _ = SetFocus(title_edit); }
+
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -250,7 +260,7 @@ extern "system" fn popup_wndproc(
                         }
                         println!("已标记窗口：{}", unsafe { &(*data).window_title });
                     }
-                    unsafe { let _ = DestroyWindow(hwnd); }
+                    unsafe { let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); }
                 }
                 IDC_CANCEL_BUTTON => {
                     let hidden = unsafe { (*data).hidden_hwnd };
@@ -264,7 +274,7 @@ extern "system" fn popup_wndproc(
                         );
                     }
                     println!("取消标记窗口：{}", unsafe { &(*data).window_title });
-                    unsafe { let _ = DestroyWindow(hwnd); }
+                    unsafe { let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); }
                 }
                 _ => {}
             }
