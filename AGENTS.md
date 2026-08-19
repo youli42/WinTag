@@ -33,7 +33,8 @@ cargo fmt
 
 ```
 src/
-├── main.rs          # 入口，初始化各子系统
+├── lib.rs           # 库入口，公开模块
+├── main.rs          # 入口，消息循环、热键分发、覆盖层管理
 ├── sys/             # 底层系统服务层 — Win32 API 调用
 │   ├── mod.rs
 │   ├── window.rs    # 窗口检测、句柄捕获、事件监听
@@ -47,6 +48,8 @@ src/
 │   ├── panel.rs     # 全局概览面板
 │   └── popup.rs     # 悬浮便签浮窗
 └── hotkey.rs        # 全局热键注册
+tests/
+└── smoke.rs         # 冒烟测试（30 个用例）
 ```
 
 ## 编码规范
@@ -57,13 +60,20 @@ src/
 - 模块间的依赖方向：`ui → core → sys`，禁止反向依赖
 - 所有公开 API 必须添加文档注释 (`///`)
 
-## 关键技术点
+## 架构要点
+
+### 消息循环
+- 主线程创建隐藏窗口（`WinTagHiddenWnd`）用于接收热键和覆盖层管理消息
+- 热键通过 `RegisterHotKey` 挂载到隐藏窗口
+- 覆盖层创建/销毁通过 `PostMessage(WM_CREATE_OVERLAY / WM_DESTROY_OVERLAY)` 发送到隐藏窗口
+- `GetMessageW(None, ...)` 处理本线程所有窗口消息（包括覆盖层的 `WM_PAINT`）
+- 全局状态通过 `OnceLock<Arc<Mutex<...>>>` 在 WndProc 和主循环间共享
 
 ### 透明覆盖层
 - 使用 `WS_EX_LAYERED` + `WS_EX_TRANSPARENT` 创建穿透式透明窗口
 - 使用 `WS_EX_TOPMOST` 确保覆盖层在目标窗口之上
-- 监听 `EVENT_OBJECT_LOCATIONCHANGE` 事件同步位置，而非轮询
-- 必须处理高 DPI 缩放 (`GetDpiForWindow`)
+- 覆盖层在主线程创建，由主消息循环处理绘制消息
+- 待实现：`EVENT_OBJECT_LOCATIONCHANGE` 事件同步位置、高 DPI 缩放
 
 ### 安全性
 - 绝不向其他进程注入代码
@@ -77,4 +87,4 @@ src/
 
 ## 当前阶段
 
-项目处于 **规划阶段**，尚未开始编码。详细设计文档见 `doc/` 目录。
+项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步等细节待完善。详细设计文档见 `doc/` 目录。
