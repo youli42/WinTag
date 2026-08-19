@@ -20,3 +20,7 @@ Desktop.ini
 
 # Local config
 *.local.toml
+
+# Added by cargo
+
+/target
