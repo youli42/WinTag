@@ -44,6 +44,9 @@ fn main() -> anyhow::Result<()> {
     // 共享的标签存储
     let tag_store: Arc<Mutex<TagStore>> = Arc::new(Mutex::new(TagStore::new()));
 
+    // 设置全局标签存储引用（供覆盖层 WndProc 悬停查询）
+    let _ = core::tag::TAG_STORE.set(Arc::clone(&tag_store));
+
     // 创建概览面板（隐藏）
     let panel_hwnd = ui::panel::create_panel(Arc::clone(&tag_store));
     PANEL_HWND.set(panel_hwnd.0 as isize).unwrap();
