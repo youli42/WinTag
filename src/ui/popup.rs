@@ -5,7 +5,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetDlgItem, GetWindowTextW, PostMessageW,
     RegisterClassW, SetWindowLongPtrW, ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     GWLP_USERDATA, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WS_BORDER, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOPMOST,
+    WM_DESTROY, WS_BORDER, WS_CHILD, WS_EX_TOPMOST,
     WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
     WS_EX_CLIENTEDGE, ES_AUTOHSCROLL, ES_MULTILINE, ES_AUTOVSCROLL, BS_PUSHBUTTON,
 };
@@ -64,7 +64,7 @@ pub fn create_popup(
     let style = WINDOW_STYLE(
         (WS_OVERLAPPEDWINDOW.0 & !((WS_SYSMENU | WS_BORDER).0)) | WS_VISIBLE.0,
     );
-    let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
+    let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0);
 
     unsafe {
         let hwnd = CreateWindowExW(
@@ -292,7 +292,6 @@ extern "system" fn popup_wndproc(
             if !data.is_null() {
                 unsafe { drop(Box::from_raw(data)); }
             }
-            unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0); }
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

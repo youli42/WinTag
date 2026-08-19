@@ -59,7 +59,7 @@ pub fn create_panel(data: Arc<Mutex<TagStore>>) -> HWND {
     };
     unsafe { let _ = InitCommonControlsEx(&icc); }
 
-    let style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_VISIBLE.0);
+    let style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0); // 初始隐藏，由 toggle_panel 控制
     unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
