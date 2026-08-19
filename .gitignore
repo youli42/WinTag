@@ -1,0 +1,22 @@
+# Rust
+target/
+debug/
+*.pdb
+*.exe
+*.dll
+*.sys
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local config
+*.local.toml
