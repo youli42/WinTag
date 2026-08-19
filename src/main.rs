@@ -1,7 +1,7 @@
-mod core;
-mod hotkey;
-mod sys;
-mod ui;
+use wintag::core;
+use wintag::hotkey;
+use wintag::sys;
+use wintag::ui;
 
 use core::tag::{Tag, TagColor, TagStore};
 use std::sync::{Arc, Mutex};
