@@ -77,41 +77,26 @@ Windows 缩放比例（125%、150%、200%）会导致坐标偏移。
 
 ## 窗口唯一标识方案
 
+以窗口句柄（HWND）为唯一标识，仅会话内有效。
+
 ```rust
-struct WindowId {
-    process_path: String,  // 进程完整路径，如 "C:\Program Files\Google\Chrome\Application\chrome.exe"
-    process_name: String,  // 进程名，如 "chrome.exe"
-    window_title: String,  // 窗口标题（辅助匹配，非唯一）
-}
+// 标签以 HWND 为键，存储在 HashMap 中
+type TagStore = HashMap<HWND, Tag>;
 ```
+
+窗口句柄在进程生命周期内唯一，窗口关闭后句柄失效。不使用进程路径、进程名等持久化标识，因为：
+- 系统重启后 HWND 必然不同，无法匹配
+- 即使通过进程路径匹配到"同一个窗口"，工作进度已清空，标签继承无意义
 
 ### 匹配策略
 
-1. **精确匹配**：窗口句柄仍然有效 → 直接匹配句柄
-2. **进程路径匹配**：窗口重开后 → 按 `process_path` + 标题相似度匹配
-3. **用户确认**：无法自动匹配时 → 提示用户手动关联
+1. 直接用 HWND 查找 HashMap
+2. 窗口关闭时，自动从 HashMap 中移除对应条目
+3. 无需持久化匹配或用户确认
 
-## 数据存储设计
+## 数据存储
 
-### SQLite 表结构
-
-```sql
-CREATE TABLE tags (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    process_path TEXT NOT NULL,
-    process_name TEXT NOT NULL,
-    window_title TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    note        TEXT DEFAULT '',
-    color       TEXT DEFAULT '#FFB74D',
-    is_active   INTEGER DEFAULT 1,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX idx_process_path ON tags(process_path);
-CREATE INDEX idx_title ON tags(title);
-```
+无持久化存储。所有标签数据以 `HashMap<HWND, Tag>` 形式存于内存中，程序退出即清除。无需数据库、无需文件 I/O、无需序列化。
 
 ## 覆盖层绘制细节
 
@@ -135,12 +120,11 @@ CREATE INDEX idx_title ON tags(title);
 | :--- | :--- |
 | 目标窗口最小化 | 隐藏覆盖层 |
 | 目标窗口最大化 | 重新计算覆盖层位置 |
-| 目标窗口关闭 | 保存标签数据，销毁覆盖层 |
-| 窗口重开 | 按进程路径匹配，恢复标签和覆盖层 |
+| 目标窗口关闭 | 移除标签，销毁覆盖层 |
 | 全屏应用 | 检测全屏状态，隐藏覆盖层，仅托盘通知 |
 | 多显示器 | 覆盖层跟随窗口在不同显示器间移动 |
 | 管理员权限窗口 | 程序也需以管理员权限运行 |
-| 程序自身退出 | 销毁所有覆盖层，保存所有数据 |
+| 程序自身退出 | 销毁所有覆盖层，丢弃所有数据 |
 
 ## 性能目标
 

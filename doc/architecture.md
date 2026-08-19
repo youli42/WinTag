@@ -11,10 +11,10 @@
 │  └──────────┘  └────────────────────┘   │
 ├─────────────────────────────────────────┤
 │          Data Core Layer (core/)         │
-│  ┌──────────┐ ┌──────────┐ ┌────────┐  │
-│  │   tag    │ │ storage  │ │matcher │  │
-│  │ 数据结构  │ │ SQLite   │ │窗口匹配 │  │
-│  └──────────┘ └──────────┘ └────────┘  │
+│  ┌──────────┐  ┌────────────────────┐    │
+│  │   tag    │  │      matcher       │    │
+│  │ 数据结构  │  │  窗口句柄匹配       │    │
+│  └──────────┘  └────────────────────┘    │
 ├─────────────────────────────────────────┤
 │        System Service Layer (sys/)       │
 │  ┌──────────┐  ┌────────────────────┐   │
@@ -56,31 +56,23 @@ ui → core → sys
 
 ### core/ — 数据核心层
 
-负责业务逻辑与数据管理，不涉及 UI 渲染。
+负责业务逻辑与数据管理，不涉及 UI 渲染。所有数据仅存在于内存中，无持久化。
 
 #### tag.rs
 - 定义核心数据结构：
   ```rust
   struct Tag {
-      id: u64,
-      window_id: WindowId,
+      hwnd: HWND,           // 窗口句柄，唯一标识
       title: String,        // 必填，快速索引
       note: String,         // 选填，长文本描述
       color: Color,         // 标记颜色
-      created_at: DateTime,
-      updated_at: DateTime,
   }
   ```
 
-#### storage.rs
-- SQLite 数据库初始化与迁移
-- CRUD 操作封装
-- 连接池管理
-
 #### matcher.rs
-- 窗口标识匹配逻辑
-- 实现窗口重开后的标签继承（按进程路径匹配）
-- 处理窗口句柄失效后的重新绑定
+- 以窗口句柄（HWND）为键的标签查找
+- 窗口句柄失效时自动清理对应标签
+- 简洁的 HashMap 存储，无状态外溢
 
 ### ui/ — 用户界面层
 
@@ -100,24 +92,25 @@ ui → core → sys
 
 ### hotkey.rs
 - 注册全局热键 (`RegisterHotKey`)
-- 处理热键消息，触发概览面板显示/隐藏
+- 两个热键：`Ctrl+Shift+M` 打开概览面板，`Ctrl+Shift+N` 快速标记当前窗口
+- 处理热键消息，触发对应操作
 
 ## 数据流
 
 ### 标记窗口流程
 ```
-1. 用户按下热键 → 触发标记操作
-2. sys/window 获取当前活动窗口信息
+1. 用户按下热键（Ctrl+Shift+N）→ 触发快速标记操作
+2. sys/window 获取当前活动窗口 HWND 和标题
 3. core/matcher 检查是否已有标签
-4. ui/popup 显示编辑界面
-5. 用户确认 → core/storage 保存标签
+4. ui/popup 显示编辑界面（预填标题，可修改）
+5. 用户确认 → core/tag 存入内存 HashMap
 6. sys/overlay 在目标窗口上创建覆盖层
 ```
 
 ### 窗口切换流程
 ```
 1. sys/window 检测到 EVENT_SYSTEM_FOREGROUND
-2. core/matcher 查找新窗口的标签
+2. core/matcher 查找新窗口 HWND 的标签
 3. 如果有标签 → sys/overlay 显示标记并短暂闪烁
 4. 如果无标签 → 隐藏覆盖层
 ```
@@ -125,10 +118,10 @@ ui → core → sys
 ### 窗口关闭流程
 ```
 1. sys/window 检测到 EVENT_OBJECT_DESTROY
-2. core/storage 保存标签数据
+2. core/matcher 移除对应 HWND 的标签
 3. sys/overlay 销毁覆盖层
-4. core/matcher 保留标签以供窗口重开时继承
 ```
+（数据随窗口关闭自动清除，无持久化步骤）
 
 ## 状态管理
 
