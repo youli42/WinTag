@@ -6,12 +6,15 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, UpdateWindow,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowRect, RegisterClassW,
-    SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, HWND_TOPMOST, SWP_NOACTIVATE,
-    SW_SHOW, SW_HIDE, WINDOW_EX_STYLE, WM_PAINT, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowRect, RegisterClassW,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
+    HWND_TOPMOST, LWA_COLORKEY, SWP_NOACTIVATE, SW_SHOW, SW_HIDE, WINDOW_EX_STYLE,
+    WM_ERASEBKGND, WM_PAINT, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE, WNDCLASSW,
 };
+
+/// 透明色键（纯黑，RGB(0,0,0)）
+const COLOR_KEY: COLORREF = COLORREF(0x00000000);
 
 #[allow(dead_code)]
 pub struct Overlay {
@@ -60,6 +63,10 @@ impl Overlay {
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
 
+        if width <= 0 || height <= 0 {
+            anyhow::bail!("目标窗口尺寸无效: {}x{}", width, height);
+        }
+
         let ex_style = WINDOW_EX_STYLE(
             WS_EX_LAYERED.0
                 | WS_EX_TRANSPARENT.0
@@ -86,8 +93,10 @@ impl Overlay {
             )
         }?;
 
-        if hwnd.0.is_null() {
-            anyhow::bail!("创建覆盖层窗口失败");
+        // 设置透明色键：黑色像素变为透明
+        // SAFETY: hwnd 是有效窗口句柄
+        unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, 0, LWA_COLORKEY);
         }
 
         // SAFETY: 显示覆盖层窗口
@@ -110,6 +119,10 @@ impl Overlay {
 
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
+
+        if width <= 0 || height <= 0 {
+            return Ok(());
+        }
 
         // SAFETY: SetWindowPos 移动窗口，参数合法
         unsafe {
@@ -166,13 +179,27 @@ extern "system" fn overlay_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_ERASEBKGND => {
+            // 用黑色（透明色键）填充背景
+            // SAFETY: wparam 是 HDC
+            unsafe {
+                let hdc =
+                    windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut std::ffi::c_void);
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                let brush = CreateSolidBrush(COLOR_KEY);
+                let _ = FillRect(hdc, &rect, brush);
+                let _ = DeleteObject(brush);
+            }
+            LRESULT(1)
+        }
         WM_PAINT => {
             // SAFETY: 基本绘制操作
             unsafe {
                 let mut ps = Default::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                // 橙色 RGB(0xFF, 0xB7, 0x4D) -> COLORREF = 0x00_4DB7FF
-                let brush = CreateSolidBrush(COLORREF(0x00_4DB7FF));
+                // 橙色圆点标记 RBG(0xFF, 0xB7, 0x4D) -> COLORREF = 0x00_4DB7FF
+                let brush = CreateSolidBrush(COLORREF(0x0000_4DB7FF));
                 let mark_rect = RECT {
                     left: 8,
                     top: 8,

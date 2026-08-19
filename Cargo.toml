@@ -20,14 +20,3 @@ windows = { version = "0.58", features = [
 ] }
 anyhow = "1"
 thiserror = "1"
-
-[dependencies.egui]
-version = "0.31"
-
-[dependencies.winit]
-version = "0.30"
-
-[dependencies.eframe]
-version = "0.31"
-default-features = false
-features = ["default"]
