@@ -6,6 +6,7 @@ mod ui;
 use core::tag::{Tag, TagColor, TagStore};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use winit::platform::windows::EventLoopBuilderExtWindows;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, TranslateMessage, DispatchMessageW, MSG,
 };
@@ -88,6 +89,9 @@ fn handle_quick_tag(store: Arc<Mutex<TagStore>>) {
                     viewport: egui::ViewportBuilder::default()
                         .with_inner_size([400.0, 300.0])
                         .with_title("标记窗口"),
+                    event_loop_builder: Some(Box::new(|builder| {
+                        builder.with_any_thread(true);
+                    })),
                     ..Default::default()
                 };
 
@@ -125,6 +129,9 @@ fn handle_toggle_panel(store: Arc<Mutex<TagStore>>) {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([500.0, 400.0])
                 .with_title("WinTag - 概览面板"),
+            event_loop_builder: Some(Box::new(|builder| {
+                builder.with_any_thread(true);
+            })),
             ..Default::default()
         };
 

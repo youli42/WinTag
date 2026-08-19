@@ -3788,6 +3788,7 @@ dependencies = [
  "egui",
  "thiserror 1.0.69",
  "windows",
+ "winit",
 ]
 
 [[package]]
