@@ -260,7 +260,7 @@ extern "system" fn popup_wndproc(
                         }
                         println!("已标记窗口：{}", unsafe { &(*data).window_title });
                     }
-                    unsafe { let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)); }
+                    unsafe { let _ = DestroyWindow(hwnd); }
                 }
                 IDC_CANCEL_BUTTON => {
                     let hidden = unsafe { (*data).hidden_hwnd };
