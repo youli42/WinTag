@@ -20,6 +20,19 @@ pub struct Overlay {
     running: AtomicBool,
 }
 
+// SAFETY: HWND 是线程安全的指针，Overlay 仅在主线程操作
+unsafe impl Send for Overlay {}
+unsafe impl Sync for Overlay {}
+
+impl std::fmt::Debug for Overlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Overlay")
+            .field("hwnd", &self.hwnd.0)
+            .field("target_hwnd", &self.target_hwnd.0)
+            .finish()
+    }
+}
+
 #[allow(dead_code)]
 impl Overlay {
     #[allow(dead_code)]
