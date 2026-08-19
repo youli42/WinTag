@@ -7,15 +7,22 @@ use core::tag::{Tag, TagColor, TagStore};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use winit::platform::windows::EventLoopBuilderExtWindows;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, TranslateMessage, DispatchMessageW, MSG,
+    CreateWindowExW, DefWindowProcW, GetMessageW, RegisterClassW, TranslateMessage,
+    DispatchMessageW, CS_HREDRAW, CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 fn main() -> anyhow::Result<()> {
     println!("WinTag 启动中...");
 
-    // 注册全局热键
-    hotkey::register_all()?;
+    // 创建隐藏窗口（用于热键消息接收）
+    let hwnd = create_hidden_window()?;
+
+    // 注册全局热键到隐藏窗口
+    hotkey::register_all(hwnd)?;
     println!("热键已注册：");
     println!("  Ctrl+Shift+N — 快速标记当前窗口");
     println!("  Ctrl+Shift+M — 打开概览面板");
@@ -29,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         // SAFETY: GetMessageW 是标准 Windows 消息循环 API
-        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        let ret = unsafe { GetMessageW(&mut msg, hwnd, 0, 0) };
 
         if ret.0 == 0 {
             break;
@@ -40,13 +47,16 @@ fn main() -> anyhow::Result<()> {
         }
 
         // 检查热键消息
-        if let Some(hotkey) = hotkey::from_message(msg.message, msg.wParam.0, msg.lParam.0) {
-            match hotkey {
-                hotkey::Hotkey::QuickTag => {
-                    handle_quick_tag(Arc::clone(&store_clone));
-                }
-                hotkey::Hotkey::TogglePanel => {
-                    handle_toggle_panel(Arc::clone(&store_clone));
+        if msg.message == WM_HOTKEY {
+            let hotkey = hotkey::from_message(msg.message, msg.wParam.0, msg.lParam.0);
+            if let Some(hk) = hotkey {
+                match hk {
+                    hotkey::Hotkey::QuickTag => {
+                        handle_quick_tag(Arc::clone(&store_clone));
+                    }
+                    hotkey::Hotkey::TogglePanel => {
+                        handle_toggle_panel(Arc::clone(&store_clone));
+                    }
                 }
             }
             continue;
@@ -62,11 +72,101 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 创建隐藏窗口用于接收全局热键消息
+fn create_hidden_window() -> anyhow::Result<HWND> {
+    let class_name = widestring("WinTagHiddenWnd");
+
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(hidden_wndproc),
+        hInstance: HINSTANCE::default(),
+        lpszClassName: PCWSTR(class_name.as_ptr()),
+        ..Default::default()
+    };
+
+    // SAFETY: 注册自定义窗口类
+    unsafe {
+        let _ = RegisterClassW(&wc);
+    }
+
+    // SAFETY: 创建隐藏窗口，参数合法
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            PCWSTR(class_name.as_ptr()),
+            windows::core::w!("WinTag"),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+    }?;
+
+    Ok(hwnd)
+}
+
+/// 加载中文字体到 egui context
+fn load_chinese_fonts(ctx: &egui::Context) {
+    let font_paths = [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+    ];
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut loaded = false;
+
+    for path in &font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "system-cjk".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(data)),
+            );
+            loaded = true;
+            break;
+        }
+    }
+
+    if loaded {
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "system-cjk".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "system-cjk".to_owned());
+        ctx.set_fonts(fonts);
+    }
+}
+
+fn widestring(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 隐藏窗口的窗口过程
+extern "system" fn hidden_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: 默认窗口过程
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
 /// 处理快速标记热键
 fn handle_quick_tag(store: Arc<Mutex<TagStore>>) {
     match sys::window::get_foreground_window_info() {
         Ok(info) => {
-            // 检查是否已有标签
             let existing = {
                 let store = store.lock().unwrap();
                 store.get(&info.hwnd).cloned()
@@ -101,7 +201,8 @@ fn handle_quick_tag(store: Arc<Mutex<TagStore>>) {
                 let _ = eframe::run_native(
                     "wintag-quick-tag",
                     native_options,
-                    Box::new(|_cc| {
+                    Box::new(|cc| {
+                        load_chinese_fonts(&cc.egui_ctx);
                         Ok(Box::new(QuickTagApp {
                             popup,
                             store: store_clone,
@@ -138,7 +239,8 @@ fn handle_toggle_panel(store: Arc<Mutex<TagStore>>) {
         let _ = eframe::run_native(
             "wintag-panel",
             native_options,
-            Box::new(|_cc| {
+            Box::new(|cc| {
+                load_chinese_fonts(&cc.egui_ctx);
                 Ok(Box::new(PanelApp {
                     panel: ui::panel::Panel::new(),
                     store: store_clone,
@@ -258,15 +360,14 @@ impl eframe::App for PanelApp {
                                 ui.label(&tag.note);
                             }
                             ui.horizontal(|ui| {
-                                ui.label(format!("📌 {}", tag.window_title));
+                                ui.label(format!("窗口 {}", tag.window_title));
                                 ui.label(format!("({})", tag.process_name));
                             });
 
                             if ui.button("跳转到此窗口").clicked() {
                                 // SAFETY: 激活目标窗口
                                 unsafe {
-                                    let hwnd =
-                                        windows::Win32::Foundation::HWND(*hwnd as *mut std::ffi::c_void);
+                                    let hwnd = HWND(*hwnd as *mut std::ffi::c_void);
                                     let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
                                 }
                             }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, MOD_CONTROL, MOD_SHIFT, VK_N, VK_M,
 };
@@ -33,21 +34,23 @@ impl Hotkey {
     }
 }
 
-/// 注册所有全局热键
-pub fn register_all() -> Result<()> {
+/// 注册所有全局热键，挂载到指定窗口
+pub fn register_all(hwnd: HWND) -> Result<()> {
     for hotkey in &[Hotkey::QuickTag, Hotkey::TogglePanel] {
         // SAFETY: RegisterHotKey 注册全局热键，参数由常量定义
-        unsafe {
+        let result = unsafe {
             RegisterHotKey(
-                None,
+                hwnd,
                 hotkey.id(),
                 windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(
                     hotkey.modifiers(),
                 ),
                 hotkey.vk(),
             )
+        };
+        if let Err(e) = result {
+            anyhow::bail!("注册热键失败 (id={}): {}", hotkey.id(), e);
         }
-        .map_err(|e| anyhow::anyhow!("注册热键失败 (id={}): {}", hotkey.id(), e))?;
     }
     Ok(())
 }
