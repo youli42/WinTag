@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
 
 /// 标签颜色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +37,3 @@ pub struct Tag {
 
 /// 内存标签存储，以 HWND 为键
 pub type TagStore = HashMap<isize, Tag>;
-
-/// 全局标签存储引用（供覆盖层 WndProc 查找悬停标签）
-pub static TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
