@@ -1,2 +1,2 @@
-pub mod tag;
 pub mod matcher;
+pub mod tag;

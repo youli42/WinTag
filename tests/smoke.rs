@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use wintag::core::matcher;
 use wintag::core::tag::{Tag, TagColor, TagStore};
 use wintag::hotkey::{self, Hotkey};
 use wintag::sys::window;
-use std::collections::HashMap;
 
 // ============================================================
 // TagColor 测试
@@ -171,7 +171,7 @@ fn test_tag_store_remove() {
     let removed = store.remove(&12345);
     assert!(removed.is_some());
     assert!(store.is_empty());
-    assert!(store.get(&12345).is_none());
+    assert!(!store.contains_key(&12345));
 }
 
 // ============================================================
@@ -431,9 +431,27 @@ fn test_multiple_windows_flow() {
     let mut store: TagStore = HashMap::new();
 
     let windows = vec![
-        (0x1000, "main.rs - VS Code", "Code.exe", "修复登录 Bug", "处理空指针"),
-        (0x2000, "API 文档 - Chrome", "chrome.exe", "查 API 参数", "需要 Bearer token"),
-        (0x3000, "PowerShell", "WindowsTerminal.exe", "跑测试", "cargo test --all"),
+        (
+            0x1000,
+            "main.rs - VS Code",
+            "Code.exe",
+            "修复登录 Bug",
+            "处理空指针",
+        ),
+        (
+            0x2000,
+            "API 文档 - Chrome",
+            "chrome.exe",
+            "查 API 参数",
+            "需要 Bearer token",
+        ),
+        (
+            0x3000,
+            "PowerShell",
+            "WindowsTerminal.exe",
+            "跑测试",
+            "cargo test --all",
+        ),
         (0x4000, "Notion", "Notion.exe", "整理需求", ""),
         (0x5000, "Slack", "slack.exe", "回复消息", "确认发布时间"),
     ];
@@ -455,10 +473,7 @@ fn test_multiple_windows_flow() {
     assert_eq!(store.len(), 5);
 
     // 搜索含 "API" 的标签
-    let api_tags: Vec<_> = store
-        .values()
-        .filter(|t| t.title.contains("API"))
-        .collect();
+    let api_tags: Vec<_> = store.values().filter(|t| t.title.contains("API")).collect();
     assert_eq!(api_tags.len(), 1);
     assert_eq!(api_tags[0].window_title, "API 文档 - Chrome");
 

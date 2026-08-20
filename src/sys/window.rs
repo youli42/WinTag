@@ -71,10 +71,8 @@ fn get_process_name(pid: u32) -> Result<String> {
     }
 
     // SAFETY: 以只读权限打开进程，只查询信息
-    let handle = unsafe {
-        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
-    }
-    .context("无法打开进程")?;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+        .context("无法打开进程")?;
 
     let mut buf = [0u16; 260];
     // SAFETY: buf 已分配足够空间，handle 是有效进程句柄
@@ -97,10 +95,8 @@ fn get_process_path(pid: u32) -> Result<String> {
     }
 
     // SAFETY: 以只读权限打开进程
-    let handle = unsafe {
-        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid)
-    }
-    .context("无法打开进程")?;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+        .context("无法打开进程")?;
 
     let mut buf = [0u16; 260];
     let mut len = buf.len() as u32;
