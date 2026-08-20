@@ -84,6 +84,8 @@ cargo test
 - [架构设计](./doc/architecture.md)
 - [技术规格](./doc/technical-specs.md)
 - [开发计划](./doc/development-plan.md)
+- [问题与需求记录](./doc/issues-and-requirements.md)
+- [决策记录](./doc/decision-records.md)
 
 ## 许可证
 
