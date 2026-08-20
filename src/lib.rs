@@ -1,3 +1,4 @@
+pub mod common;
 pub mod core;
 pub mod hotkey;
 pub mod sys;
