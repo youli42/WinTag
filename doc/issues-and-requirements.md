@@ -44,6 +44,17 @@
   - 现状：弹窗无默认按钮（`BS_DEFPUSHBUTTON`），消息循环未走 `IsDialogMessage`，回车键无绑定动作。
   - 期望：回车触发保存（与确认按钮等价）。
 
+### 6. 无法为管理员权限（提权）窗口配置角标，且无对应报错与错误处理
+
+- **现象**：目标窗口以管理员身份运行（如管理员模式的记事本、终端、VS Code 等）时，无法为其配置角标；且整个过程无任何用户可见的报错或提示，表现为"按了快捷键但什么都没发生"或"确认后角标静默缺失"。
+- **现状**：WinTag 默认非提权运行，Windows UIPI（用户界面特权隔离）会拦截对提权窗口的跨特权操作，且现有失败路径全部只落控制台日志、无用户可见反馈：
+  - 标记流程第一步 `sys::window::get_foreground_window_info()` 中 `OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)` 对提权进程返回拒绝访问（access denied），整个调用以 `Err` 返回（见 `src/sys/window.rs` 第 74 行起）；
+  - `main.rs` 的 `handle_quick_tag` 对上述失败仅 `eprintln!("获取窗口信息失败")`（第 402-404 行），弹窗不出现，用户无感知；
+  - 即使绕过首步走到确认分支，`Overlay::create` 失败也仅在隐藏窗口 WndProc 中 `eprintln!("[覆盖层] 创建失败")`（第 212-214 行），角标静默缺失；
+  - WinEvent 钩子（`WINEVENT_OUTOFCONTEXT`）收不到提权窗口的事件（UIPI 过滤），即使覆盖层创建成功也无法跟随同步（该层面已登记于 [decision-records.md F4](./decision-records.md)）。
+- **期望**：检测到目标窗口为提权窗口时给出明确提示（如"该窗口以管理员身份运行，请以管理员身份运行 WinTag 后重试"）；或提供可用的降级路径；所有失败路径应有用户可见的错误处理，而非仅控制台日志。
+- **关联**：[decision-records.md F4 管理员权限窗口兼容](./decision-records.md)——F4 登记"WinEvent 事件被拦截"，本条登记"配置（标记+覆盖层创建）失败路径与缺失的错误处理"。
+
 ## 二、需求规划（未实现）
 
 ### R1. 自定义快捷键
