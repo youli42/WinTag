@@ -12,16 +12,17 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, PostMessageW, RegisterClassW, SendMessageW,
+    CreateWindowExW, DefWindowProcW, GetClientRect, PostMessageW, RegisterClassW, SendMessageW,
     SetForegroundWindow, ShowWindow, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
     CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU,
     SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_KEYDOWN,
-    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
@@ -419,6 +420,30 @@ extern "system" fn settings_wndproc(
                 (c.bg, c.fg)
             };
             ctlcolor_brush(lparam, bg, fg)
+        }
+        // WM_ERASEBKGND：窗口自身客户区背景。WM_CTLCOLOR* 只处理子控件配色，
+        // 客户区背景由 WM_ERASEBKGND 决定；默认 DefWindowProc 用白色类画刷擦除
+        // 背景（暗色主题下表现为白色窗口底色），此处按主题色填充并返回 1
+        // 告知系统背景已擦除，阻止默认白色填充。
+        WM_ERASEBKGND => {
+            // 主题状态未初始化（从未调用 set_theme）时回退系统默认擦除
+            let Some(colors) = theme_colors() else {
+                // SAFETY: DefWindowProcW 将未处理的 WM_ERASEBKGND 原样透传给系统
+                // 默认窗口过程，参数与消息上下文一致，无额外内存操作。
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            // SAFETY: wParam 携带客户区 HDC，仅在消息处理期间有效；
+            // FillRect 只填充本次消息对应的客户区矩形，无跨消息生命周期。
+            let hdc = HDC(wparam.0 as *mut c_void);
+            // SAFETY: GetClientRect 将客户区矩形写入栈上 RECT，调用期间有效。
+            let mut rc = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+            // SAFETY: rc 为栈上局部值，画刷句柄由 get_brush 进程级缓存持有，均有效。
+            unsafe {
+                let _ = FillRect(hdc, &rc, get_brush(colors.bg));
+            }
+            // 返回 1 表示背景已擦除，阻止 DefWindowProc 用白色类画刷填充
+            LRESULT(1)
         }
         WM_COMMAND => {
             // WM_COMMAND 的 wParam 低 16 位为控件 ID，高 16 位为通知码

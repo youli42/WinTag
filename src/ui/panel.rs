@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH,
     LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_INSERTCOLUMNW,
@@ -9,12 +9,12 @@ use windows::Win32::UI::Controls::{
     LVS_EX_HEADERDRAGDROP, LVS_REPORT, NMITEMACTIVATE, NM_DBLCLK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetDlgItem, GetWindowTextW, IsWindow, RegisterClassW,
-    SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_NOTIFY, WM_SIZE,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetDlgItem, GetWindowTextW, IsWindow,
+    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_NOTIFY,
+    WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring};
@@ -293,6 +293,30 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         // 重绘前向父窗口请求配色，统一按当前主题调色板着色。
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
             handle_ctlcolor(hwnd, msg, wparam, lparam)
+        }
+        // WM_ERASEBKGND：窗口自身客户区背景。WM_CTLCOLOR* 只处理子控件配色，
+        // 客户区背景由 WM_ERASEBKGND 决定；默认 DefWindowProc 用白色类画刷擦除
+        // 背景（暗色主题下表现为白色窗口底色），此处按主题色填充并返回 1
+        // 告知系统背景已擦除，阻止默认白色填充。
+        WM_ERASEBKGND => {
+            // 主题状态未初始化（从未调用 set_theme）时回退系统默认擦除
+            let Some(colors) = crate::ui::theme::theme_colors() else {
+                // SAFETY: DefWindowProcW 将未处理的 WM_ERASEBKGND 原样透传给系统
+                // 默认窗口过程，参数与消息上下文一致，无额外内存操作。
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            // SAFETY: wParam 携带客户区 HDC，仅在消息处理期间有效；
+            // FillRect 只填充本次消息对应的客户区矩形，无跨消息生命周期。
+            let hdc = HDC(wparam.0 as *mut std::ffi::c_void);
+            // SAFETY: GetClientRect 将客户区矩形写入栈上 RECT，调用期间有效。
+            let mut rc = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+            // SAFETY: rc 为栈上局部值，画刷句柄由 get_brush 进程级缓存持有，均有效。
+            unsafe {
+                let _ = FillRect(hdc, &rc, crate::ui::theme::get_brush(colors.bg));
+            }
+            // 返回 1 表示背景已擦除，阻止 DefWindowProc 用白色类画刷填充
+            LRESULT(1)
         }
         WM_CLOSE => {
             // SAFETY: 面板窗口存活期间 PanelData 有效（WM_DESTROY 才回收）。
