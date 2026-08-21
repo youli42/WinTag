@@ -3,7 +3,7 @@
 //! 本模块只依赖 windows-rs 与标准库，不依赖项目内其他模块
 //! （core / sys / ui / hotkey），供任意模块按需复用。当前提供：
 //!
-//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发
+//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发、设置窗口、主题变更
 //! - [`widestring`]：UTF-16 宽字符串转换
 //! - [`get_userdata`] / [`set_userdata`]：窗口用户数据（GWLP_USERDATA）读写
 //!
@@ -28,6 +28,16 @@ pub const WM_DESTROY_OVERLAY: u32 = WM_APP + 2;
 ///
 /// 用于将 `SetWinEventHook` 回调中捕获的事件转发到主线程消息循环统一处理。
 pub const WM_APP_WINEVENT: u32 = WM_APP + 3;
+
+/// 自定义消息：打开设置窗口
+///
+/// 由主线程通过 `PostMessage` 发送到隐藏窗口，请求创建并展示设置窗口。
+pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 4;
+
+/// 自定义消息：主题变更广播（重新应用主题）
+///
+/// 用于主题状态变化后向主线程广播，重新应用暗色/浅色主题到各窗口。
+pub const WM_APP_THEME_CHANGED: u32 = WM_APP + 5;
 
 /// 将字符串编码为以 NUL（`\0`）结尾的 UTF-16 宽字符串
 ///
