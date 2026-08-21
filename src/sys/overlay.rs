@@ -64,6 +64,25 @@ pub fn set_tag_store(store: Arc<Mutex<TagStore>>) {
     let _ = TAG_STORE_INNER.set(store);
 }
 
+/// 注入的 tooltip 主题配色（元组：(背景色, 前景色)，`COLORREF` 为 `0x00BBGGRR` 布局）
+///
+/// 通过 [`set_tooltip_theme`] 注入；未注入时 tooltip 回退默认白底黑字，
+/// 与注入前的行为完全一致。采用与 [`TAG_STORE_INNER`] 相同的 OnceLock 注入模式，
+/// 重复调用仅首次生效。
+///
+/// 说明：`OnceLock` 本身已保证"写一次、读多次"的线程安全语义，
+/// 值不可变，因此无需再包一层 `Mutex`（读取用 `.get()` 直接取引用，无需加锁）。
+static TOOLTIP_THEME: OnceLock<(COLORREF, COLORREF)> = OnceLock::new();
+
+/// 注入 tooltip 主题配色
+///
+/// 必须在任何 tooltip 显示之前调用（通常在程序启动、消息循环开始前）。
+/// 未调用本函数时 tooltip 保持默认白底黑字；重复调用仅首次生效
+/// （与 [`set_tag_store`] 一致的 OnceLock 语义）。
+pub fn set_tooltip_theme(bg: COLORREF, fg: COLORREF) {
+    let _ = TOOLTIP_THEME.set((bg, fg));
+}
+
 /// 透明覆盖层窗口
 ///
 /// 覆盖层是一个 `WS_EX_LAYERED` 穿透式透明窗口，绘制在目标窗口左上角
@@ -656,7 +675,13 @@ extern "system" fn tooltip_wndproc(
             unsafe {
                 let mut ps = Default::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                let brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
+                // 取注入的 tooltip 配色：已注入则用注入色；未注入（或锁中毒）时
+                // 回退默认白底黑字，行为与注入前完全一致。
+                let (bg, fg) = TOOLTIP_THEME
+                    .get()
+                    .copied()
+                    .unwrap_or((COLORREF(0x00FFFFFF), COLORREF(0x00000000)));
+                let brush = CreateSolidBrush(bg);
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let _ = FillRect(hdc, &rc, brush);
@@ -666,7 +691,7 @@ extern "system" fn tooltip_wndproc(
                 let len = GetWindowTextW(hwnd, &mut buf) as usize;
                 if len > 0 {
                     let _ = SetBkMode(hdc, TRANSPARENT);
-                    let _ = SetTextColor(hdc, COLORREF(0x00000000));
+                    let _ = SetTextColor(hdc, fg);
                     let mut tr = RECT {
                         left: 10,
                         top: 10,
