@@ -1,21 +1,24 @@
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH,
     LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_INSERTCOLUMNW,
     LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVS_EX_FULLROWSELECT,
-    LVS_REPORT, NMITEMACTIVATE, NM_DBLCLK,
+    LVS_EX_HEADERDRAGDROP, LVS_REPORT, NMITEMACTIVATE, NM_DBLCLK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetDlgItem, GetWindowTextW, IsWindow, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_NOTIFY, WM_SIZE,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring};
+use crate::core::settings::ThemeMode;
 use crate::core::tag::TagStore;
 
 const IDC_SEARCH_EDIT: i32 = 201;
@@ -127,6 +130,23 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 set_userdata(hwnd, data as *mut std::ffi::c_void);
             }
 
+            // 读取全局设置并应用暗色主题与圆角偏好
+            // global_settings 未注入（如独立测试环境）时回退默认设置（跟随系统 + 默认圆角）
+            let settings = crate::core::settings::global_settings()
+                .and_then(|s| s.lock().ok().map(|guard| *guard))
+                .unwrap_or_default();
+            let system_dark = crate::ui::theme::detect_system_dark();
+            let colors = crate::ui::theme::resolve_colors(settings.theme, system_dark);
+            // 先写入 THEME_STATE，确保后续 WM_CTLCOLOR* 消息能取到当前调色板
+            crate::ui::theme::set_theme(colors);
+            // 简化暗色判定：显式深色，或跟随系统且系统当前为深色，即视为暗色主题
+            let dark = settings.theme == ThemeMode::Dark
+                || (settings.theme == ThemeMode::System && system_dark);
+            // SAFETY: hwnd 为正在创建的面板窗口（WM_CREATE 期间有效）；
+            // DWM 属性调用失败（如 Win10 不支持圆角属性）时静默忽略返回值。
+            let _ = crate::ui::theme::apply_dark_mode(hwnd, dark);
+            let _ = crate::ui::theme::apply_corner_preference(hwnd, settings.corner);
+
             let instance = windows::Win32::Foundation::HINSTANCE::default();
 
             // 搜索框
@@ -182,14 +202,16 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
             };
 
-            // 整行选择
+            // 整行选择 + 表头拖拽（问题2：Manager 面板表头默认不显示）
+            // LVS_EX_HEADERDRAGDROP 会强制 ListView 创建表头控件（SysHeader32），
+            // 解决报表视图下表头依赖交互触发才显示的问题。
             // SAFETY: 向列表视图发送扩展样式消息，参数为编译期常量，无生命周期问题。
             unsafe {
                 let _ = SendMessageW(
                     list_view,
                     LVM_SETEXTENDEDLISTVIEWSTYLE,
                     WPARAM(0),
-                    LPARAM(LVS_EX_FULLROWSELECT as isize),
+                    LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP) as isize),
                 );
             }
 
@@ -267,6 +289,11 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             LRESULT(0)
         }
+        // WM_CTLCOLOR*：子控件（搜索框 EDIT / SysListView32 列表区 / 静态文本）
+        // 重绘前向父窗口请求配色，统一按当前主题调色板着色。
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
+            handle_ctlcolor(hwnd, msg, wparam, lparam)
+        }
         WM_CLOSE => {
             // SAFETY: 面板窗口存活期间 PanelData 有效（WM_DESTROY 才回收）。
             let data = unsafe { get_userdata::<PanelData>(hwnd) };
@@ -300,6 +327,45 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
     }
+}
+
+/// 处理 `WM_CTLCOLOR*` 消息：按主题调色板为子控件设置文字色与背景色
+///
+/// - `WM_CTLCOLORLISTBOX`：SysListView32 的列表区背景（ListView 向其父窗口发送）；
+/// - `WM_CTLCOLOREDIT`：搜索框（EDIT）背景；
+/// - `WM_CTLCOLORSTATIC`：静态文本背景。
+///
+/// 颜色取自 [`crate::ui::theme::theme_colors`]；主题状态未初始化（返回 `None`）时
+/// 回退 [`DefWindowProcW`] 走系统默认配色。
+///
+/// 已知局限：表头（SysHeader32）的颜色不通过 `WM_CTLCOLOR` 系列消息传递，
+/// 无法在此完全控制，接受系统默认外观。
+fn handle_ctlcolor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 主题状态未初始化（从未调用 set_theme）时回退系统默认绘制
+    let Some(colors) = crate::ui::theme::theme_colors() else {
+        // SAFETY: DefWindowProcW 将未处理的 WM_CTLCOLOR* 原样透传给系统默认
+        // 窗口过程，参数与消息上下文一致，无额外内存操作。
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    };
+
+    let (fg, bg) = match msg {
+        WM_CTLCOLOREDIT => (colors.edit_fg, colors.edit_bg),
+        WM_CTLCOLORLISTBOX => (colors.listview_fg, colors.listview_bg),
+        // WM_CTLCOLORSTATIC：静态文本按窗口前景/背景着色
+        _ => (colors.fg, colors.bg),
+    };
+
+    // SAFETY: wParam 携带子控件本次绘制使用的 HDC，仅在消息处理期间有效；
+    // SetTextColor/SetBkColor 只修改该 DC 的当前文本/背景状态，无跨消息生命周期。
+    let hdc = HDC(wparam.0 as *mut std::ffi::c_void);
+    unsafe {
+        let _ = SetTextColor(hdc, fg);
+        let _ = SetBkColor(hdc, bg);
+    }
+    // 返回背景色画刷句柄：控件以此绘制客户区背景。画刷经 get_brush 进程级
+    // 缓存持有、进程生命周期内不销毁，可安全作为 LRESULT 返回。
+    let brush = crate::ui::theme::get_brush(bg);
+    LRESULT(brush.0 as isize)
 }
 
 /// 处理列表项双击：跳转到对应窗口
