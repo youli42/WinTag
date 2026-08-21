@@ -1,17 +1,20 @@
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HDC};
-use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
+use windows::Win32::UI::Controls::EM_SETSEL;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetDlgCtrlID, GetDlgItem,
-    GetParent, GetWindowTextW, PostMessageW, RegisterClassW, SetForegroundWindow,
-    SetWindowLongPtrW, ShowWindow, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC, GWLP_WNDPROC, HMENU,
-    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_KEYDOWN, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE,
-    WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetClientRect, GetDlgCtrlID,
+    GetDlgItem, GetParent, GetWindowTextW, PostMessageW, RegisterClassW, SendMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC,
+    GWLP_WNDPROC, HMENU, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::common::{self, get_userdata, set_userdata, widestring};
@@ -401,6 +404,37 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
             LRESULT(0)
         }
+        // WM_ERASEBKGND：窗口自身客户区背景擦除
+        //
+        // WM_CTLCOLOR* 只处理子控件（编辑框/静态文本/按钮）的配色，窗口客户区的
+        // 背景由 WM_ERASEBKGND 决定；默认 DefWindowProc 用窗口类白色画刷擦除，
+        // 导致暗色主题下弹窗主体（标题/备注文本以外的空白区域）仍为白色。
+        // 此处按主题背景色填充客户区并返回 1（表示背景已擦除），阻止系统默认
+        // 白色填充（任务 T8）。
+        WM_ERASEBKGND => {
+            // 主题状态未初始化（从未调用 set_theme）时回退系统默认绘制
+            let Some(colors) = crate::ui::theme::theme_colors() else {
+                // SAFETY: DefWindowProcW 将未处理的 WM_ERASEBKGND 原样透传给系统
+                // 默认窗口过程，参数与消息上下文一致，无额外内存操作。
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            };
+            // SAFETY: GetClientRect 写入栈上 RECT（调用期间存活），hwnd 为本窗口
+            // 有效句柄；失败（理论不可达）时回退 DefWindowProcW 走系统默认绘制。
+            let mut rc = RECT::default();
+            if unsafe { GetClientRect(hwnd, &mut rc) }.is_err() {
+                // SAFETY: 同上方 DefWindowProcW 回退，参数与消息上下文一致。
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            // SAFETY: wParam 携带窗口客户区 HDC，仅在消息处理期间有效；画刷经
+            // get_brush 进程级缓存持有、进程生命周期内不销毁，FillRect 同步填充
+            // 后立即返回，无跨消息生命周期。
+            let hdc = HDC(wparam.0 as *mut std::ffi::c_void);
+            unsafe {
+                FillRect(hdc, &rc, crate::ui::theme::get_brush(colors.bg));
+            }
+            // 返回 1 表示背景已擦除，系统不再用默认画刷填充
+            LRESULT(1)
+        }
         // WM_CTLCOLOR*：子控件（标题/备注编辑框 EDIT / 静态文本 / 按钮）重绘前
         // 向父窗口请求配色，统一按当前主题调色板着色（任务 T7）。
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
@@ -570,6 +604,23 @@ unsafe extern "system" fn edit_subclass_proc(
 ) -> LRESULT {
     if msg == WM_KEYDOWN {
         let key = (wparam.0 & 0xFFFF) as u16;
+        // Ctrl+A：标准 Win32 EDIT 控件默认不支持 Ctrl+A 全选（只支持
+        // Shift+方向键等选择方式），故在此子类化过程中拦截实现（任务 T8）。
+        if key == VK_A.0 {
+            // SAFETY: GetKeyState 查询虚拟键状态，返回 i16 最高位为 1 表示按下
+            //（即负值）；无失败路径，可在任意线程调用。
+            let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            if ctrl_down {
+                // SAFETY: hwnd 为本编辑框有效句柄；EM_SETSEL 全选：wParam=起始
+                // 位置 0，lParam=-1 表示选中到文本末尾；SendMessageW 为线程安全
+                // 标准 API，仅修改本控件选区状态。
+                unsafe {
+                    let _ = SendMessageW(hwnd, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                }
+                // 拦截该按键，不再透传给 EDIT 原始窗口过程（防止输入字符 'a'）
+                return LRESULT(0);
+            }
+        }
         // SAFETY: GetDlgCtrlID 查询子控件 ID（创建时经 HMENU 传入）。
         let is_title = unsafe { GetDlgCtrlID(hwnd) } == IDC_TITLE_EDIT;
         if (is_title && key == VK_RETURN.0) || key == VK_ESCAPE.0 {
