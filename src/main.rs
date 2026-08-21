@@ -3,16 +3,18 @@ use wintag::hotkey;
 use wintag::sys;
 use wintag::ui;
 
+use core::settings::{Settings, ThemeMode};
 use core::tag::TagStore;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic, IsWindow,
     IsWindowVisible, RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
-    WINDOW_EX_STYLE, WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    WINDOW_EX_STYLE, WM_HOTKEY, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use wintag::common::{self, widestring};
@@ -47,6 +49,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 加载配置并注入全局设置（缺失/损坏时回退默认，见 core::settings::load）；
+    // 该 Arc 与设置页窗口共享同一实例，保存后经 WM_APP_THEME_CHANGED 广播重应用。
+    let settings: Arc<Mutex<Settings>> = Arc::new(Mutex::new(core::settings::load()));
+    core::settings::set_global_settings(Arc::clone(&settings));
+
     // 创建隐藏窗口（热键 + 覆盖层管理 + WinEvent 消息中转）
     let hwnd = create_hidden_window()?;
 
@@ -68,6 +75,38 @@ fn main() -> anyhow::Result<()> {
         let _ = PANEL_HWND.set(panel_hwnd.0 as isize);
     }
 
+    // 解析并注入主题：按配置主题 + 系统深浅色解析调色板并应用到隐藏窗口。
+    // 面板/设置窗口在各自 WM_CREATE 中读取同一全局调色板（theme_colors），
+    // 此处先 set_theme 保证创建期 WM_CTLCOLOR* 取到正确配色。
+    let cfg = settings.lock().ok().map(|guard| *guard).unwrap_or_default();
+    let system_dark = ui::theme::detect_system_dark();
+    let colors = ui::theme::resolve_colors(cfg.theme, system_dark);
+    ui::theme::set_theme(colors);
+    // 暗色判定：显式深色，或跟随系统且系统当前为深色
+    let dark = cfg.theme == ThemeMode::Dark || (cfg.theme == ThemeMode::System && system_dark);
+    // SAFETY: hwnd 为刚创建的隐藏窗口，窗口存活；DWM 属性调用失败
+    // （如旧版系统不支持圆角属性）时静默忽略返回值。
+    let _ = ui::theme::apply_dark_mode(hwnd, dark);
+    let _ = ui::theme::apply_corner_preference(hwnd, cfg.corner);
+
+    // 注入 tooltip 配色（OnceLock 一次性语义：须在任何 tooltip 显示前调用，
+    // 重复调用仅首次生效，tooltip 将沿用启动时注入的配色）
+    sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
+
+    // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）
+    let settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
+        settings: Arc::clone(&settings),
+        hidden_hwnd: hwnd.0 as isize,
+        visible: false,
+        theme_combo: HWND::default(),
+        corner_combo: HWND::default(),
+        theme_edit: HWND::default(),
+        corner_edit: HWND::default(),
+    });
+    if settings_hwnd == HWND::default() {
+        eprintln!("[设置] 设置窗口创建失败，热键仍可用（打开时自动重试创建）");
+    }
+
     // 安装 WinEvent 事件监听：绑定隐藏窗口为转发目标，事件经 WM_APP_WINEVENT 分发。
     // winevent_hooks 作为 main 局部变量存活至退出，Drop 时自动注销 hook。
     // （用普通命名而非下划线前缀：它被 is_degraded() 实际使用）
@@ -84,6 +123,7 @@ fn main() -> anyhow::Result<()> {
     println!("热键已注册：");
     println!("  Ctrl+Shift+N — 快速标记当前窗口");
     println!("  Ctrl+Shift+M — 打开概览面板");
+    println!("  Ctrl+Shift+S — 打开设置页面");
 
     // 兜底轮询定时器：捕获 WinEvent 事件丢失 / 最小化窗口可见性误判
     // SAFETY: SetTimer 在消息循环前调用，hwnd 为存活窗口；失败仅返回 0，忽略即可
@@ -120,6 +160,18 @@ fn main() -> anyhow::Result<()> {
                         println!("[热键] Ctrl+Shift+M 触发");
                         if let Some(ph) = PANEL_HWND.get() {
                             ui::panel::toggle_panel(HWND(*ph as *mut std::ffi::c_void));
+                        }
+                    }
+                    hotkey::Hotkey::OpenSettings => {
+                        println!("[热键] Ctrl+Shift+S 触发");
+                        // 设置窗口未创建时先懒创建（失败打印告警后静默）
+                        let shwnd = ensure_settings_window(hwnd.0 as isize);
+                        if shwnd != HWND::default() {
+                            ui::settings::toggle_settings(
+                                shwnd,
+                                hwnd.0 as isize,
+                                Arc::clone(&settings),
+                            );
                         }
                     }
                 }
@@ -245,6 +297,34 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let target_hwnd = wparam.0 as isize;
             let event = lparam.0 as u32;
             handle_winevent(target_hwnd, event);
+            LRESULT(0)
+        }
+        common::WM_APP_OPEN_SETTINGS => {
+            // 打开设置窗口请求：未创建时先懒创建，再切换显隐。
+            // 隐藏窗口句柄即本窗口（hwnd），供设置页保存后广播主题变更回传。
+            let shwnd = ensure_settings_window(hwnd.0 as isize);
+            if shwnd != HWND::default() {
+                // 取全局设置实例（未注入时回退默认实例，保证 toggle 不 panic）
+                let settings = core::settings::global_settings()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
+                ui::settings::toggle_settings(shwnd, hwnd.0 as isize, settings);
+            }
+            LRESULT(0)
+        }
+        common::WM_APP_THEME_CHANGED => {
+            // 设置页保存后广播：重新读取全局设置并应用到所有已知窗口
+            reapply_theme(hwnd);
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // 系统设置变更（如系统主题切换）：仅"跟随系统"模式需要重新检测，
+            // 其余模式由 WM_APP_THEME_CHANGED 覆盖，避免无谓的注册表读取。
+            let theme = core::settings::global_settings()
+                .and_then(|s| s.lock().ok().map(|guard| guard.theme))
+                .unwrap_or(ThemeMode::System);
+            if theme == ThemeMode::System {
+                reapply_theme(hwnd);
+            }
             LRESULT(0)
         }
         WM_TIMER => {
@@ -403,4 +483,80 @@ fn handle_quick_tag(store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
             eprintln!("获取窗口信息失败: {}", e);
         }
     }
+}
+
+/// 确保设置窗口已创建，返回其窗口句柄（懒创建）
+///
+/// 已创建（[`ui::settings::settings_hwnd`] 非 None）时直接复用；
+/// 未创建时用当前全局设置（未注入时回退默认实例）调用
+/// [`ui::settings::create_settings`] 创建（初始隐藏，由调用方切换显隐）。
+/// 创建失败返回默认（NULL）句柄，调用方自行决定是否忽略。
+fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
+    if let Some(sh) = ui::settings::settings_hwnd() {
+        return HWND(sh as *mut std::ffi::c_void);
+    }
+    let settings = core::settings::global_settings()
+        .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
+    ui::settings::create_settings(ui::settings::SettingsData {
+        settings,
+        hidden_hwnd,
+        visible: false,
+        theme_combo: HWND::default(),
+        corner_combo: HWND::default(),
+        theme_edit: HWND::default(),
+        corner_edit: HWND::default(),
+    })
+}
+
+/// 从全局设置重新解析主题并应用到所有已知窗口（主题变更统一入口）
+///
+/// 供 hidden_wndproc 处理 `WM_APP_THEME_CHANGED`（设置页保存后广播）与
+/// `WM_SETTINGCHANGE`（系统主题切换，跟随系统模式）时调用：
+/// 重读设置 → 重解析调色板 → 更新全局主题 → 对 hidden/panel/settings 窗口
+/// 重新应用 DWM 暗色与圆角属性并强制重绘（WM_CTLCOLOR* 换新配色）。
+/// 覆盖层 tooltip 配色为 OnceLock 一次性注入（启动时已定），新 tooltip
+/// 沿用启动色，无需额外处理。
+fn reapply_theme(hidden_hwnd: HWND) {
+    // 重读全局设置（未注入或锁中毒时回退默认）
+    let cfg = core::settings::global_settings()
+        .and_then(|s| s.lock().ok().map(|guard| *guard))
+        .unwrap_or_default();
+    let system_dark = ui::theme::detect_system_dark();
+    let colors = ui::theme::resolve_colors(cfg.theme, system_dark);
+    // 先更新全局调色板，确保后续 WM_CTLCOLOR* 重绘取到新配色
+    ui::theme::set_theme(colors);
+    // 暗色判定：显式深色，或跟随系统且系统当前为深色
+    let dark = cfg.theme == ThemeMode::Dark || (cfg.theme == ThemeMode::System && system_dark);
+
+    // 隐藏窗口：DWM 属性随主题切换即时更新
+    // SAFETY: hidden_hwnd 由调用方保证存活；DWM 调用失败仅返回布尔值，忽略。
+    let _ = ui::theme::apply_dark_mode(hidden_hwnd, dark);
+    let _ = ui::theme::apply_corner_preference(hidden_hwnd, cfg.corner);
+
+    // 概览面板（经 PANEL_HWND）：DWM 属性 + 强制重绘
+    if let Some(ph) = PANEL_HWND.get() {
+        let panel_hwnd = HWND(*ph as *mut std::ffi::c_void);
+        // SAFETY: panel_hwnd 由 create_panel 成功后写入 PANEL_HWND，窗口存活。
+        let _ = ui::theme::apply_dark_mode(panel_hwnd, dark);
+        let _ = ui::theme::apply_corner_preference(panel_hwnd, cfg.corner);
+        // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
+        unsafe {
+            let _ = InvalidateRect(panel_hwnd, None, FALSE);
+        }
+    }
+
+    // 设置窗口（经 settings_hwnd；未创建时跳过）
+    if let Some(sh) = ui::settings::settings_hwnd() {
+        let settings_hwnd = HWND(sh as *mut std::ffi::c_void);
+        // SAFETY: settings_hwnd 由 create_settings 成功后写入，窗口存活。
+        let _ = ui::theme::apply_dark_mode(settings_hwnd, dark);
+        let _ = ui::theme::apply_corner_preference(settings_hwnd, cfg.corner);
+        // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
+        unsafe {
+            let _ = InvalidateRect(settings_hwnd, None, FALSE);
+        }
+    }
+
+    // 重新注入 tooltip 配色（OnceLock 语义：重复调用仅首次生效，启动时已注入）
+    sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
 }
