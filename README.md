@@ -12,7 +12,7 @@
 
 ## 解决方案
 
-WinTag 在 Windows 窗口管理之上增加一层**元数据图层**，让用户随时了解每个窗口"正在执行什么命令、目的是什么"，通过自定义标签和便签，秒级恢复工作上下文。所有数据仅存在于当前会话，程序退出即清除。
+WinTag 在 Windows 窗口管理之上增加一层**元数据图层**，让用户随时了解每个窗口"正在执行什么命令、目的是什么"，通过自定义标签和便签，秒级恢复工作上下文。标签与便签数据仅存在于当前会话，程序退出即清除；UI 偏好（主题/圆角）持久化到配置文件（见下）。
 
 ## 核心功能
 
@@ -22,13 +22,17 @@ WinTag 在 Windows 窗口管理之上增加一层**元数据图层**，让用户
 | 标签与便签UI | 左上角悬浮标记，鼠标悬停展开便签（标题+备注），快捷键快速添加 | ✅ 已完成 |
 | 全局概览面板 | 快捷键呼出聚合列表，展示所有已标记窗口，双击跳转，搜索过滤 | ✅ 已完成 |
 | 覆盖层位置同步 | 窗口移动/缩放/最小化时覆盖层跟随与显隐（WinEvent 事件驱动 + 500ms 兜底轮询） | ✅ 已完成 |
+| 暗色模式 | 跟随系统/浅色/深色三档切换（Win32 原生 DWM 沉浸式暗色 + `WM_CTLCOLOR` 画刷） | ✅ 已完成 |
+| 设置页面 | `Ctrl+Shift+S` 呼出设置窗口，主题/圆角选择、实时预览、保存 | ✅ 已完成 |
+| 配置持久化 | UI 偏好保存至 `%APPDATA%\WinTag\config.toml`（TOML 格式），启动自动加载 | ✅ 已完成 |
+| 圆角 UI | 覆盖层/弹窗/面板窗口圆角（`DWMWA_WINDOW_CORNER_PREFERENCE`，Win11） | ✅ 已完成 |
 
 ## 技术栈
 
 - **语言**：Rust
 - **GUI 实现**：纯 Win32 原生窗口（windows-rs 0.58，无 egui/eframe）
-- **系统 API**：windows-rs (Win32)，含 `SetWinEventHook` 窗口事件监听、`SetProcessDpiAwarenessContext` 高 DPI 感知
-- **存储**：无持久化，仅会话内内存 HashMap 存储
+- **系统 API**：windows-rs (Win32)，含 `SetWinEventHook` 窗口事件监听、`SetProcessDpiAwarenessContext` 高 DPI 感知、DWM 沉浸式暗色与 `DwmSetWindowAttribute` 圆角
+- **存储**：标签数据仅会话内内存 HashMap；UI 偏好持久化至 `%APPDATA%\WinTag\config.toml`（`serde` + `toml` 序列化）
 
 ## 快速开始
 
@@ -49,12 +53,13 @@ cargo test
 | :--- | :--- |
 | `Ctrl+Shift+N` | 为当前活动窗口添加标签 |
 | `Ctrl+Shift+M` | 打开概览面板，查看所有已标记窗口 |
+| `Ctrl+Shift+S` | 打开设置页面（主题/圆角） |
 
 标记窗口后，目标窗口左上角会出现橙色圆点覆盖层，提示该窗口已被标记。
 
 ## 测试
 
-项目包含 37 个测试（30 个冒烟测试 + 7 个单元测试），覆盖核心数据层、热键逻辑与 WinEvent 事件分类：
+项目包含 48 个测试（30 个冒烟测试 + 18 个单元测试），覆盖核心数据层、配置持久化、主题解析、热键逻辑与 WinEvent 事件分类：
 
 ```pwsh
 cargo test
@@ -64,19 +69,16 @@ cargo test
 
 | 模块 | 测试数 | 内容 |
 | :--- | :--- | :--- |
-| TagColor | 2 | 颜色值、Debug/Clone |
-| Tag | 3 | 创建、克隆、Unicode、空备注 |
-| TagStore | 6 | 增删改查、覆盖、批量、边界值 |
-| Matcher | 6 | 完整 CRUD、可变修改、cleanup、空 store |
-| Hotkey | 7 | ID/VK/modifiers 常量、from_message 解析、from_id 往返 |
-| Window | 2 | 前台窗口信息获取、PID 一致性 |
-| WinEvent | 6 | 事件分类映射、转发过滤边界 |
-| 集成 | 2 | 完整标记→修改→删除流程、多窗口并行管理 |
-| 边界 | 3 | 空 store 操作、全清理、超大/极小 HWND |
+| core::settings | 5 | 默认值、serde 往返、损坏配置回退、保存/加载往返、中文标签 |
+| sys::win_event | 6 | 事件分类映射、转发过滤边界 |
+| ui::theme | 3 | 跟随系统解析、明暗调色板、画刷缓存 |
+| ui::settings | 2 | 主题/圆角下拉索引映射 |
+| hotkey | 2 | 热键 ID 往返、设置页热键常量 |
+| 冒烟测试 | 30 | 标签/存储/匹配 CRUD、热键解析、窗口信息、完整标记流程、边界值 |
 
 ## 项目状态
 
-✅ **MVP 核心功能已完成** — 窗口检测、标记/便签、概览面板、覆盖层位置同步、高 DPI 均已实现。边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）见 [doc/decision-records.md](./doc/decision-records.md) 的遗留项登记。
+✅ **MVP 核心功能已完成** — 窗口检测、标记/便签、概览面板、覆盖层位置同步、高 DPI、暗色模式（跟随系统/浅色/深色）、设置页面（`Ctrl+Shift+S`）、配置持久化（`%APPDATA%\WinTag\config.toml`）与圆角 UI（Win11）均已实现。边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）见 [doc/decision-records.md](./doc/decision-records.md) 的遗留项登记。
 
 ## 文档
 

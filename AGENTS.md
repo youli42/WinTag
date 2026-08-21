@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-WinTag 是 Windows 平台的外挂式窗口语义增强工具，使用 Rust 开发。通过 Win32 API 监听窗口事件并在目标窗口上绘制透明覆盖层来显示用户自定义标签和便签。所有数据仅存在于当前会话，程序退出即清除，无持久化存储。
+WinTag 是 Windows 平台的外挂式窗口语义增强工具，使用 Rust 开发。通过 Win32 API 监听窗口事件并在目标窗口上绘制透明覆盖层来显示用户自定义标签和便签。标签与便签数据仅存在于当前会话，程序退出即清除；UI 偏好（主题/圆角）持久化到 `%APPDATA%\WinTag\config.toml`（D9 授权打破纯会话原则，见 [doc/decision-records.md D10](./doc/decision-records.md)）。
 
 ## 构建与检查命令
 
@@ -42,11 +42,14 @@ src/
 ├── core/            # 核心数据管理层
 │   ├── mod.rs
 │   ├── tag.rs       # 标签数据结构定义（内存中，无持久化）
-│   └── matcher.rs   # 窗口句柄匹配逻辑
+│   ├── matcher.rs   # 窗口句柄匹配逻辑
+│   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml）
 ├── ui/              # 用户界面层
 │   ├── mod.rs
 │   ├── panel.rs     # 全局概览面板
-│   └── popup.rs     # 悬浮便签浮窗
+│   ├── popup.rs     # 悬浮便签浮窗
+│   ├── theme.rs     # 暗色主题与圆角（DWM 属性 + WM_CTLCOLOR 画刷缓存）
+│   └── settings.rs  # 设置页面窗口（主题/圆角选择、保存、WM_APP_THEME_CHANGED 广播）
 └── hotkey.rs        # 全局热键注册
 tests/
 └── smoke.rs         # 冒烟测试（30 个用例）
@@ -73,7 +76,17 @@ tests/
 - 使用 `WS_EX_LAYERED` + `WS_EX_TRANSPARENT` 创建穿透式透明窗口
 - 使用 `WS_EX_TOPMOST` 确保覆盖层在目标窗口之上
 - 覆盖层在主线程创建，由主消息循环处理绘制消息
-- 待实现：`EVENT_OBJECT_LOCATIONCHANGE` 事件同步位置、高 DPI 缩放
+- 位置同步已实现：`EVENT_OBJECT_LOCATIONCHANGE` 事件驱动 + 500ms 兜底轮询；高 DPI 适配已实现（`SetProcessDpiAwarenessContext` Per-Monitor V2，见 [决策记录 D5](./doc/decision-records.md)）
+
+### 配置持久化
+- UI 偏好（主题/圆角）持久化到 `%APPDATA%\WinTag\config.toml`（TOML，`serde` 序列化），由 `src/core/settings.rs` 提供 `load`/`save`；任何加载失败（缺失/损坏/缺字段）回退默认配置并打印警告，绝不 panic
+- 配置持久化打破"纯会话"原则，由 [决策记录 D9](./doc/decision-records.md) 授权、D10 落地：仅 UI 偏好持久化，标签/便签数据仍纯会话内
+- 全局设置经 `OnceLock<Arc<Mutex<Settings>>>` 单例 + 主线程注入，与 `GLOBAL_TAG_STORE` 模式一致
+
+### 主题注入（ui → sys）
+- 主题调色板由 `ui::theme::set_theme(ThemeColors)` 写入全局状态，各窗口在 `WM_CTLCOLOR*` 时经 `theme_colors()` 读取同一调色板
+- sys 层不反向依赖 ui：覆盖层 tooltip 配色经 `sys::overlay::set_tooltip_theme(bg, fg)` 由主线程注入（镜像 D6 的 `set_tag_store` 注入模式，见 [决策记录 D6](./doc/decision-records.md)）
+- 设置页保存后经 `WM_APP_THEME_CHANGED`（`WM_APP+5`）广播到主线程，主线程重新应用主题到各窗口，实时生效
 
 ### 安全性
 - 绝不向其他进程注入代码
@@ -81,10 +94,10 @@ tests/
 - 程序可能需要管理员权限以覆盖高权限窗口
 
 ### 数据管理
-- 所有数据仅存在于内存中，程序退出即清除
+- 标签/便签数据仅存在于内存中，程序退出即清除；唯一例外是 UI 偏好（主题/圆角）持久化到配置文件（见"配置持久化"）
 - 以窗口句柄（HWND）作为唯一标识，窗口关闭时自动移除标记
-- 无需持久化：系统重启后窗口已非同一窗口，且工作进度已清空，无继承意义
+- 标签数据无需持久化：系统重启后窗口已非同一窗口，且工作进度已清空，无继承意义
 
 ## 当前阶段
 
-项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步等细节待完善。详细设计文档见 `doc/` 目录。
+项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。详细设计文档见 `doc/` 目录。
