@@ -1,7 +1,7 @@
 use anyhow::Result;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, MOD_CONTROL, MOD_SHIFT, VK_M, VK_N,
+    RegisterHotKey, MOD_CONTROL, MOD_SHIFT, VK_M, VK_N, VK_S,
 };
 use windows::Win32::UI::WindowsAndMessaging::WM_HOTKEY;
 
@@ -12,6 +12,8 @@ pub enum Hotkey {
     QuickTag,
     /// Ctrl+Shift+M — 打开概览面板
     TogglePanel,
+    /// Ctrl+Shift+S — 打开设置页面
+    OpenSettings,
 }
 
 impl Hotkey {
@@ -19,6 +21,7 @@ impl Hotkey {
         match self {
             Hotkey::QuickTag => 1,
             Hotkey::TogglePanel => 2,
+            Hotkey::OpenSettings => 3,
         }
     }
 
@@ -32,6 +35,7 @@ impl Hotkey {
         match self {
             Hotkey::QuickTag => VK_N.0 as u32,
             Hotkey::TogglePanel => VK_M.0 as u32,
+            Hotkey::OpenSettings => VK_S.0 as u32,
         }
     }
 
@@ -46,13 +50,19 @@ impl Hotkey {
         if id == Hotkey::TogglePanel.id() {
             return Some(Hotkey::TogglePanel);
         }
+        if id == Hotkey::OpenSettings.id() {
+            return Some(Hotkey::OpenSettings);
+        }
         None
     }
 }
 
 /// 注册所有全局热键，挂载到指定窗口
+///
+/// 采用尽力而为策略：逐个注册热键，单个注册失败（如与其他程序冲突）
+/// 时打印警告并继续注册剩余热键，不中断程序运行。
 pub fn register_all(hwnd: HWND) -> Result<()> {
-    for hotkey in &[Hotkey::QuickTag, Hotkey::TogglePanel] {
+    for hotkey in &[Hotkey::QuickTag, Hotkey::TogglePanel, Hotkey::OpenSettings] {
         // SAFETY: RegisterHotKey 注册全局热键，参数由常量定义
         let result = unsafe {
             RegisterHotKey(
@@ -63,7 +73,7 @@ pub fn register_all(hwnd: HWND) -> Result<()> {
             )
         };
         if let Err(e) = result {
-            anyhow::bail!("注册热键失败 (id={}): {}", hotkey.id(), e);
+            eprintln!("[热键] 注册失败 (id={}): {}", hotkey.id(), e);
         }
     }
     Ok(())
@@ -84,9 +94,18 @@ mod tests {
     /// 遍历所有热键变体，验证 from_id 与 id 互为往返映射
     #[test]
     fn test_hotkey_from_id_roundtrip() {
-        for hk in [Hotkey::QuickTag, Hotkey::TogglePanel] {
+        for hk in [Hotkey::QuickTag, Hotkey::TogglePanel, Hotkey::OpenSettings] {
             assert_eq!(Hotkey::from_id(hk.id()), Some(hk));
         }
         assert_eq!(Hotkey::from_id(999), None);
+    }
+
+    /// 验证 OpenSettings 变体的常量值（id=3, Ctrl+Shift+S）
+    #[test]
+    fn test_hotkey_open_settings_constants() {
+        assert_eq!(Hotkey::OpenSettings.id(), 3);
+        assert_eq!(Hotkey::OpenSettings.vk(), VK_S.0 as u32);
+        assert_eq!(Hotkey::OpenSettings.modifiers(), 0x0006);
+        assert_eq!(Hotkey::from_id(3), Some(Hotkey::OpenSettings));
     }
 }
