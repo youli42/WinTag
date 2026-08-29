@@ -533,12 +533,14 @@ fn reapply_theme(hidden_hwnd: HWND) {
     let _ = ui::theme::apply_dark_mode(hidden_hwnd, dark);
     let _ = ui::theme::apply_corner_preference(hidden_hwnd, cfg.corner);
 
-    // 概览面板（经 PANEL_HWND）：DWM 属性 + 强制重绘
+    // 概览面板（经 PANEL_HWND）：DWM 属性 + ListView 主题刷新 + 强制重绘
     if let Some(ph) = PANEL_HWND.get() {
         let panel_hwnd = HWND(*ph as *mut std::ffi::c_void);
         // SAFETY: panel_hwnd 由 create_panel 成功后写入 PANEL_HWND，窗口存活。
         let _ = ui::theme::apply_dark_mode(panel_hwnd, dark);
         let _ = ui::theme::apply_corner_preference(panel_hwnd, cfg.corner);
+        // 刷新 ListView 主题（DarkMode_Explorer 热更新，问题 9.3/9.5）
+        ui::panel::reapply_listview_theme(panel_hwnd, dark);
         // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
         unsafe {
             let _ = InvalidateRect(panel_hwnd, None, FALSE);
@@ -557,6 +559,7 @@ fn reapply_theme(hidden_hwnd: HWND) {
         }
     }
 
-    // 重新注入 tooltip 配色（OnceLock 语义：重复调用仅首次生效，启动时已注入）
+    // 重新注入 tooltip 配色（Mutex 可热更新，主题切换后新 tooltip 即时采用新配色，
+    // 修复原先 OnceLock 一次性注入导致主题切换后 tooltip 沿用启动配色的遗留问题）
     sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
 }

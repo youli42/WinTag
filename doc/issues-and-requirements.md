@@ -19,7 +19,7 @@
 
 ### 2. Manager 窗口表头默认不显示
 
-> **状态**：✅ 已修复（提交 `5fa787c` fix(panel)）；⚠️ **更正（2026-08-21 实测反馈）**：`LVS_EX_HEADERDRAGDROP` 修复未完全生效，用户实测表头仍不显示，**问题重新开放**，见问题 9.3。
+> **状态**：✅ 已修复（提交 `5fa787c` + D11 `DarkMode_Explorer`）；⚠️ **更正（2026-08-21 实测反馈）**：`LVS_EX_HEADERDRAGDROP` 修复未完全生效；**2026-08-29 二次修复**：D11 经 `SetWindowTheme("DarkMode_Explorer")` + comctl32 v6 manifest 使表头 SysHeader32 暗色可见，问题关闭。
 
 - **现象**：Manager（概览面板）窗口中的表格表头默认不显示，需要点击后才显示。
 - **现状**：面板 ListView 未设置显式表头相关样式/状态，表头渲染依赖交互触发。
@@ -36,9 +36,9 @@
 
 ### 4. 悬浮角标内容过长被截断
 
+- **状态**：✅ 已修复（D11：tooltip 宽度自适应 + 圆角分层重绘）
 - **现象**：鼠标悬浮在角标（覆盖层圆点）上时，标题/备注过长会被截断，无法看到完整内容。
-- **现状**：tooltip 窗口固定宽度（300px），高度按 `DrawTextW` 测量动态调整，但内容超出宽度时被截断。
-- **期望**：长内容可完整展示（自动换行+限高、或加滚动、或加宽限制）。
+- **修复**：tooltip 宽度按内容自适应（`DrawTextW` 预量），上限 360px（原固定 300px 截断）；标题/备注分层排版（标题加粗 + 备注正文），圆角矩形 + 1px 边框。
 
 ### 5. 操作不便
 
@@ -67,10 +67,10 @@
 
 ### 7. 角标仍是方形，未做成三角形贴合角落
 
+- **状态**：✅ 已修复（D11：角标改 `UpdateLayeredWindow` 逐像素 alpha + 软件光栅圆边三角形）
 - **现象**：覆盖层角标显示为方形色块，没有做成三角形贴合窗口左上角。
-- **现状**：`src/sys/overlay.rs` 的 WM_PAINT 用 `FillRect(DOT_RECT)` 画 12x12 实心正方形（`DOT_RECT` 常量定义于 overlay.rs 约 28 行，绘制于约 403 行），未使用三角形绘制；关联需求 R2"标记图标改为三角形"（已在需求规划中登记）。
-- **期望**：角标改为左上角贴合窗口角落的三角形（需评估 GDI 路径绘制 `CreatePolygonRgn`/`BeginPath` 方案，注意当前覆盖层用 `WS_EX_LAYERED` + `LWA_COLORKEY` 色键透明）。
-- **关联**：R2
+- **修复**：`src/sys/badge.rs` 纯函数软件光栅化贴角圆边三角形（SDF 抗锯齿 + 1px 描边），`overlay.rs` 改用 `UpdateLayeredWindow(ULW_ALPHA)` 提交 32bpp 预乘 RGBA，替代原 `FillRect(DOT_RECT)` 实心方块 + `LWA_COLORKEY` 色键透明。
+- **关联**：R2（已完成）
 
 ### 8. 无法点击角标进行快捷编辑
 
@@ -82,37 +82,22 @@
 ### 9. 主题与页面问题（实测反馈）
 
 > 2026-08-21 用户实测反馈，一组 8 个子项（9.1-9.8），涉及设置页/概览面板/弹窗的主题化与布局。
+> **状态**：✅ 全部已修复（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + DarkMode_Explorer + 自绘按钮 + 布局重排）
 
-- **9.1 设置页面所有字体都是白色背景**：设置页静态文本（标签）带白色背景块。
-  - 现状：`src/ui/settings.rs` 的 `WM_CTLCOLORSTATIC` 分支（约 401 行起）返回主题画刷，但 `SetBkMode` 未设为透明或背景色设置不完整，导致静态文本背景仍为白色。
-  - 期望：静态文本背景设为透明或使用主题背景色。
-- **9.2 概览面板的表格背景还是纯白色**：ListView 列表区背景未变主题色。
-  - 现状：`src/ui/panel.rs` 已处理 `WM_CTLCOLORLISTBOX`（panel.rs 约 294-296 行），但 SysListView32 的绘制可能不走该消息（ListView 的客户区由自身/系统主题绘制），需评估 `SetClassLongPtr`/子类化或列表项自绘方案。
-  - 期望：ListView 列表区背景跟随主题色。
-- **9.3 概览面板的表头还是默认不显示**：**重要**——此前问题 2 登记已修复（`5fa787c` 加 `LVS_EX_HEADERDRAGDROP`），但用户实测表头仍不显示，问题 2 已重新开放（见问题 2 状态更正）。
-  - 现状：`LVS_EX_HEADERDRAGDROP` 不足以强制表头可见，需评估显式创建表头控件或检查 ListView 样式（`LVS_REPORT` + 表头创建时机）。
-  - 期望：表头默认可见。
-- **9.4 按钮都是亮色主题**：设置页/弹窗按钮仍为亮色。
-  - 现状：`WM_CTLCOLORBTN` 对标准按钮控件（`BS_PUSHBUTTON`）无效（按钮由系统主题绘制，这是 Win32 已知限制），需 `BS_OWNERDRAW` + `WM_DRAWITEM` 自绘或接受系统主题。
-  - 期望：按钮外观跟随暗色主题。
-- **9.5 侧边进度条还是亮色主题**：滚动条（scrollbar）仍为亮色。
-  - 现状：未对 ListView/EDIT 的滚动条做主题化，需 `WS_EX_SCROLLBAR` 自定义滚动条或 `SetWindowTheme` 处理。
-  - 期望：滚动条跟随暗色主题。
-- **9.6 设置页面和标记页面的布局无法跟随窗口缩放变化**：窗口大小变化时控件布局错乱，按钮可能移出可视/可点区域。
-  - 现状：`src/ui/settings.rs` 与 `src/ui/popup.rs` 的 WndProc **没有 `WM_SIZE` 处理**（只有 panel.rs 有 `WM_SIZE` 重排，panel.rs 约 242 行），控件位置为创建时硬编码（popup.rs 约 200-350 行）。
-  - 期望：窗口缩放时控件随布局重排。
-- **9.7 黑色主题背景过黑，亮色字体太亮**：期望灰黑色背景。
-  - 现状：`src/ui/theme.rs` 的 `dark_colors()` 暗色背景 `bg = 0x00201F1E`（theme.rs 约 84 行，近纯黑）过黑，需调整为灰黑（如 `0x002B2B2B` 或 `0x00303030` 一档），并相应调整前景色对比。
-  - 期望：暗色背景改为灰黑档，明暗对比更柔和。
-- **9.8 按钮/表格/输入框样式过时（Win7 以前风格）**：整体控件外观需要现代化（扁平、圆角、现代配色）。
-  - 现状：使用标准 Win32 控件默认外观，无视觉定制；需评估 `WM_DRAWITEM` 自绘、DWM 圆角、自定义配色等方案。
-  - 期望：控件外观现代化（扁平、圆角、现代配色）。
+- **9.1 设置页面所有字体都是白色背景**：✅ 已修复。comctl32 v6 manifest 使控件视觉样式生效，`apply_font_to_children` 注入全局字体，`WM_CTLCOLORSTATIC` 配色收尾。
+- **9.2 概览面板的表格背景还是纯白色**：✅ 已修复。ListView `SetWindowTheme("DarkMode_Explorer")` + `NM_CUSTOMDRAW` 行级着色（奇偶交替/选中态）。
+- **9.3 概览面板的表头还是默认不显示**：✅ 已修复。`DarkMode_Explorer` 主题使 SysHeader32 表头暗色可见，`LVS_EX_DOUBLEBUFFER` 消除闪烁。
+- **9.4 按钮都是亮色主题**：✅ 已修复。`src/ui/button.rs` 自绘圆角按钮（`BS_OWNERDRAW` + `WM_DRAWITEM`），accent/secondary 两档样式，hover/pressed 状态。
+- **9.5 侧边进度条还是亮色主题**：✅ 已修复（尽力而为）。`DarkMode_Explorer` 主题使 ListView 滚动条暗化；EDIT 滚动条随 manifest+v6 大部分生效。
+- **9.6 设置页面和标记页面的布局无法跟随窗口缩放变化**：✅ 已修复。popup/settings 加 `WM_GETMINMAXINFO` 固定尺寸（防缩放错乱）；panel 修 `WM_SIZE` 的 `SWP_NOMOVE` bug + 布局节奏；全部坐标经 `dp()` DPI 缩放。
+- **9.7 黑色主题背景过黑，亮色字体太亮**：✅ 已修复。`dark_colors()` 调整为灰黑档（bg `#202020`、fg `#E6E6E6`、edit/tooltip `#2F2F2F`），对比柔和。
+- **9.8 按钮/表格/输入框样式过时（Win7 以前风格）**：✅ 已修复。comctl32 v6 manifest + 自绘圆角按钮 + 扩展调色板 + DarkMode_Explorer，整体现代化（扁平、圆角、现代配色）。
 
 ### 10. 标记窗口页面中，标题、备注被挤成纵向排列
 
+- **状态**：✅ 已修复（D11：popup 布局重排 + DPI 缩放 + 固定尺寸）
 - **现象**：标记弹窗中标题输入框与备注输入框纵向挤在一起，布局拥挤。
-- **现状**：`src/ui/popup.rs` 创建控件时位置硬编码（约 200-350 行），弹窗 420x320 固定尺寸（popup.rs 约 99-100 行）下两输入框纵向堆叠。
-- **期望**：合理的上下布局（标签+输入框分行）或可调整布局。
+- **修复**：标题行改为标签+输入框同排；窗口/进程信息合并为一行 muted 小字；备注多行框占主体；按钮右下角 accent/secondary 自绘；坐标全部经 `dp()` DPI 缩放；`WM_GETMINMAXINFO` 固定尺寸（防 9.6 缩放错乱）。
 
 ## 二、需求规划（未实现）
 
@@ -123,7 +108,9 @@
 
 ### R2. 标记图标改为三角形
 
+- **状态**：✅ 已完成（D11）
 - 角标（覆盖层圆点）改为**左上角三角形**，与标记语义对应（当前为圆形）。
+- **实现**：`src/sys/badge.rs` 软件光栅圆边三角形（SDF 抗锯齿 + 1px 描边），`overlay.rs` 改 `UpdateLayeredWindow(ULW_ALPHA)` 逐像素 alpha 提交。
 
 ### R3.（未来）同一应用多标签页标记
 
@@ -172,3 +159,4 @@
 | 2026-08-21 | 问题 5.1（弹窗焦点不在编辑框）修复，弹窗激活并聚焦标题编辑框 | `b5d80df` fix(popup) |
 | 2026-08-21 | 问题 5.2（回车不能保存）修复，回车与确认按钮语义一致 | `b5d80df` fix(popup) |
 | 2026-08-21 | R1（自定义快捷键）配置表结构预留，设置页热键编辑 UI 待后续 | `170ce92` feat(settings) |
+| 2026-08-29 | UI 全面现代化（D11）：comctl32 v6 manifest + 全局字体 + DPI 缩放 + 扩展调色板 + DarkMode_Explorer + 自绘圆角按钮 + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow + 角标圆边三角形 + tooltip 圆角分层。关闭问题 2/4/7/9.1-9.8/10，完成 R2 | `feat(ui)` D11 |

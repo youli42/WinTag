@@ -175,6 +175,34 @@
 
 ---
 
+## D11：UI 全面现代化（comctl32 v6 manifest + 全局字体 + 自绘控件 + UpdateLayeredWindow 角标）
+
+- **决策**：以四项基础设施根治"丑"的系统性根因，沿用 D10 的纯 Win32 原生路线：
+  1. **comctl32 v6 视觉样式清单**（`build.rs` + `winresource` 嵌入 manifest）：使 EDIT/BUTTON/ListView/ComboBox 从 Win95 经典外观切到现代视觉样式，是 `SetWindowTheme("DarkMode_Explorer")` 能生效的前提；
+  2. **全局消息字体**（`SPI_GETNONCLIENTMETRICS` → `lfMessageFont` → `CreateFontIndirectW`，进程级 `OnceLock` 缓存 + `EnumChildWindows` + `WM_SETFONT`）：根治遗留 System 位图字体（中文粗糙），两档（常规/粗体）覆盖 tooltip 标题强调；
+  3. **扩展调色板**（`ThemeColors` 增 `accent`/`border`/`hover`/`selected`/`muted`/`listview_alt_bg`/`header_*`，暗色调柔和为灰黑档 #202020/#E6E6E6）：供自绘控件与列表行着色，新增 `blend()` 颜色混合纯函数；
+  4. **自绘圆角按钮**（`src/ui/button.rs`，`BS_OWNERDRAW` + `WM_DRAWITEM`）：`WM_CTLCOLORBTN` 无法改变标准按钮灰面子（Win32 已知限制），改自绘扁平圆角矩形，accent/secondary 两档 + hover/pressed 状态 + 键盘焦点框；
+  5. **ListView 完整暗色**（`SetWindowTheme("DarkMode_Explorer")` + `NM_CUSTOMDRAW` 行级着色 + `LVS_EX_DOUBLEBUFFER`）：表头 SysHeader32 与滚动条随之暗化，行奇偶交替/选中态着色，双缓冲消除拖动闪烁；
+  6. **DPI 缩放辅助**（`src/ui/layout.rs` `dp()`，`GetDpiForWindow` 96 基准）：全部硬编码像素坐标经 `dp()` 换算，高 DPI 屏控件不再过小；
+  7. **覆盖层 UpdateLayeredWindow + 角标软件光栅**（`src/sys/badge.rs` 纯函数 SDF 光栅圆边三角形 → `overlay.rs` `UpdateLayeredWindow(ULW_ALPHA)` 32bpp 预乘 RGBA 提交）：替代原 `FillRect(DOT_RECT)` 实心方块 + `LWA_COLORKEY` 色键透明，获得逐像素 alpha 抗锯齿，完成 R2；
+  8. **tooltip 圆角分层重绘**（`RoundRect` r=6 + 1px 边框 + 标题加粗/备注正文分层 + 宽度自适应上限 360px）：解决问题 4 固定 300px 截断；
+  9. **tooltip 主题热更新**（`TOOLTIP_THEME` 从 `OnceLock` 改 `Mutex`）：主题切换后新建 tooltip 即时采用新配色，修复原 OnceLock 一次性注入的遗留。
+- **背景**：实测反馈（问题 7、9.1-9.8、10、4）系统性指出 UI 粗糙——根因非单点配色，而是 manifest/字体/主题覆盖/角标形态/布局 bug 一批基础设施缺失。D10 的 `WM_CTLCOLOR*` 机制无法覆盖按钮灰面与 ListView 表头/列表体。
+- **备选方案**：
+  1. 引入 UI 框架（否决，与 D1 冲突，覆盖层区域级点击穿透仍无法表达）；
+  2. 仅调配色不改控件外观（否决，`WM_CTLCOLORBTN` 对标准按钮无效，根因仍在）；
+  3. 角标用 GDI `Polygon`（否决，无抗锯齿，边缘锯齿）。
+- **理由**：
+  1. manifest 是 Win32 控件现代化的前提（v6 才加载现代视觉样式 + 使 `SetWindowTheme` 生效），零运行时成本，仅构建期嵌入；
+  2. 全局字体经 `lfMessageFont` 取系统消息字体（中文即微软雅黑），与系统主题一致，无硬编码字体名风险；
+  3. 自绘按钮是唯一能彻底控制按钮外观的方案，`BS_OWNERDRAW` + `WM_DRAWITEM` 是 Win32 标准自绘路径，hover/pressed 经子类化跟踪 `TME_LEAVE`；
+  4. `DarkMode_Explorer` 是 Win11 ListView 暗色的事实标准（Win10 1809+ 生效，更旧降级不撕裂）；
+  5. 角标用软件光栅（SDF）而非 GDI 路径，因 GDI `Polygon` 无抗锯齿；`UpdateLayeredWindow` 是 `WS_EX_LAYERED` 窗口逐像素 alpha 的唯一标准路径；
+  6. `dp()` 缩放与 D5 的 Per-Monitor V2 感知配套，96 基准设计像素直观可读。
+- **影响与后续跟进**：① `winresource` 为新 dev-dependency（构建期，首次需网络；拉不到可外置 manifest 兜底）；② 暗色滚动条在 Win11 上随 manifest+主题大部分生效，属尽力而为项；③ 弹窗颜色仍硬编码 `TagColor::Orange`（五色选择 UI 不在本轮范围，留作后续）；④ `ui::button` 与 `ui::layout` 为新增模块，AGENTS.md 项目结构已同步；⑤ tooltip 主题改 `Mutex` 后 `set_tooltip_theme` 可重复调用，`reapply_theme` 链路已接入。
+
+---
+
 # 代码质量审计
 
 审计日期：2026-08-20。审计范围为 `src/` 下全部 14 个 `.rs` 文件，共 2561 行。审计在项目根目录执行。

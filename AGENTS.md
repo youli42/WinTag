@@ -35,10 +35,12 @@ cargo fmt
 src/
 ├── lib.rs           # 库入口，公开模块
 ├── main.rs          # 入口，消息循环、热键分发、覆盖层管理
+├── build.rs         # 构建脚本：嵌入 comctl32 v6 视觉样式 manifest（D11）
 ├── sys/             # 底层系统服务层 — Win32 API 调用
 │   ├── mod.rs
 │   ├── window.rs    # 窗口检测、句柄捕获、事件监听
-│   └── overlay.rs   # 透明覆盖层绘制与同步
+│   ├── badge.rs     # 角标软件光栅渲染纯函数（SDF 圆边三角形，D11）
+│   └── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha，D11）
 ├── core/            # 核心数据管理层
 │   ├── mod.rs
 │   ├── tag.rs       # 标签数据结构定义（内存中，无持久化）
@@ -46,9 +48,11 @@ src/
 │   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml）
 ├── ui/              # 用户界面层
 │   ├── mod.rs
-│   ├── panel.rs     # 全局概览面板
-│   ├── popup.rs     # 悬浮便签浮窗
-│   ├── theme.rs     # 暗色主题与圆角（DWM 属性 + WM_CTLCOLOR 画刷缓存）
+│   ├── panel.rs     # 全局概览面板（DarkMode_Explorer + NM_CUSTOMDRAW，D11）
+│   ├── popup.rs     # 悬浮便签浮窗（布局重排 + 自绘按钮，D11）
+│   ├── button.rs    # 自绘圆角按钮模块（BS_OWNERDRAW + WM_DRAWITEM，D11）
+│   ├── layout.rs    # DPI 缩放辅助（dp()，D11）
+│   ├── theme.rs     # 暗色主题与圆角 + 全局字体 + 扩展调色板（DWM + WM_CTLCOLOR + lfMessageFont，D11）
 │   └── settings.rs  # 设置页面窗口（主题/圆角选择、保存、WM_APP_THEME_CHANGED 广播）
 └── hotkey.rs        # 全局热键注册
 tests/
@@ -100,4 +104,4 @@ tests/
 
 ## 当前阶段
 
-项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。详细设计文档见 `doc/` 目录。
+项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；2026-08-29 完成 UI 全面现代化（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + 自绘圆角按钮 + ListView DarkMode_Explorer + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow 圆边三角形角标 + tooltip 圆角分层重绘）；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。详细设计文档见 `doc/` 目录。

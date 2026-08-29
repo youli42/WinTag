@@ -9,23 +9,39 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetClientRect, GetDlgCtrlID,
     GetDlgItem, GetParent, GetWindowTextW, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC,
-    GWLP_WNDPROC, HMENU, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC, GWLP_WNDPROC, HMENU,
+    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::common::{self, get_userdata, set_userdata, widestring};
 use crate::core::matcher;
 use crate::core::settings::ThemeMode;
 use crate::core::tag::{Tag, TagColor, TagStore};
+use crate::ui::button::{self, ButtonStyle};
+use crate::ui::layout::dp;
+use crate::ui::theme::apply_font_to_children;
 
 const IDC_TITLE_EDIT: i32 = 101;
 const IDC_NOTE_EDIT: i32 = 103;
 const IDC_OK_BUTTON: i32 = 104;
 const IDC_CANCEL_BUTTON: i32 = 105;
+
+/// 设计像素常量（96 DPI 基准），运行时经 [`dp`] 缩放
+const MARGIN: i32 = 12;
+const LABEL_W: i32 = 52;
+const CTRL_H: i32 = 26;
+const BTN_W: i32 = 88;
+const BTN_H: i32 = 30;
+const BTN_GAP: i32 = 8;
+const INFO_H: i32 = 20;
+const TITLE_ROW_Y: i32 = 44;
+const NOTE_ROW_Y: i32 = 80;
+const WIN_W: i32 = 420;
+const WIN_H: i32 = 320;
 
 /// 弹窗窗口的用户数据（随 `lpCreateParams` 传入，`WM_DESTROY` 时释放）
 struct PopupData {
@@ -82,8 +98,15 @@ pub fn create_popup(
         let _ = RegisterClassW(&wc);
     }
 
-    let style =
-        WINDOW_STYLE((WS_OVERLAPPEDWINDOW.0 & !((WS_SYSMENU | WS_BORDER).0)) | WS_VISIBLE.0);
+    // 窗口样式修正（问题 10 + 9.6）：
+    // - 恢复 WS_SYSMENU（保留关闭按钮）；去掉 WS_MINIMIZEBOX/WS_MAXIMIZEBOX
+    //   （原代码去掉 SYSMENU 却留着 MIN/MAX，标题栏无关闭按钮却有最小/最大化，外观怪异）；
+    // - 保留 WS_THICKFRAME（WS_OVERLAPPEDWINDOW 的可缩放边框）但通过
+    //   WM_GETMINMAXINFO 固定尺寸，防止控件位置错乱（9.6 原本靠布局自适应，
+    //   但固定尺寸是最简且不撕裂的方案）。
+    let style = WINDOW_STYLE(
+        (WS_OVERLAPPEDWINDOW.0 & !((WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0)) | WS_VISIBLE.0,
+    );
     let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0);
 
     // SAFETY: CreateWindowExW 为线程安全标准 API；失败时归还 data_ptr 所有权并打印错误，
@@ -96,8 +119,8 @@ pub fn create_popup(
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            420,
-            320,
+            WIN_W,
+            WIN_H,
             None,
             None,
             None,
@@ -196,8 +219,24 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 None => (pd.window_title.clone(), String::new()),
             };
 
-            // 信息文本
-            let info = format!("窗口：{}\r\n进程：{}", pd.window_title, pd.process_name);
+            // —— DPI 缩放后的布局坐标 ——
+            let m = dp(hwnd, MARGIN);
+            let label_w = dp(hwnd, LABEL_W);
+            let ctrl_h = dp(hwnd, CTRL_H);
+            let btn_w = dp(hwnd, BTN_W);
+            let btn_h = dp(hwnd, BTN_H);
+            let btn_gap = dp(hwnd, BTN_GAP);
+            let info_h = dp(hwnd, INFO_H);
+            let title_row_y = dp(hwnd, TITLE_ROW_Y);
+            let note_row_y = dp(hwnd, NOTE_ROW_Y);
+            let edit_x = m + label_w;
+            let edit_w = WIN_W - m - edit_x;
+            let client_h = WIN_H - dp(hwnd, 30); // 减去标题栏近似高度
+            let btn_row_y = client_h - m - btn_h;
+            let note_h = btn_row_y - btn_gap - note_row_y;
+
+            // —— 信息行：窗口 + 进程合并为一行 muted 小字（问题 10）——
+            let info = format!("窗口：{} · 进程：{}", pd.window_title, pd.process_name);
             let info_wide = widestring(&info);
             // SAFETY: info_wide 为 NUL 结尾宽字符串且存活于调用期间；CreateWindowExW 为
             // 线程安全标准 API，返回值忽略（静态文本控件创建失败不影响弹窗功能）。
@@ -207,10 +246,10 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     windows::core::w!("STATIC"),
                     PCWSTR(info_wide.as_ptr()),
                     child_style,
-                    10,
-                    10,
-                    380,
-                    40,
+                    m,
+                    m,
+                    WIN_W - 2 * m,
+                    info_h,
                     hwnd,
                     None,
                     instance,
@@ -218,18 +257,18 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 );
             }
 
-            // 标题标签
-            // SAFETY: 同信息文本，静态标签创建失败忽略。
+            // —— 标题行：标签 + 编辑框同排（问题 10：原"挤成纵排"修正）——
+            // SAFETY: 静态标签创建失败忽略。
             unsafe {
                 let _ = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     windows::core::w!("STATIC"),
                     windows::core::w!("标题："),
                     child_style,
-                    10,
-                    60,
-                    50,
-                    25,
+                    m,
+                    title_row_y,
+                    label_w,
+                    ctrl_h,
                     hwnd,
                     None,
                     instance,
@@ -247,10 +286,10 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     windows::core::w!("EDIT"),
                     PCWSTR(title_wide.as_ptr()),
                     title_ws,
-                    60,
-                    58,
-                    330,
-                    25,
+                    edit_x,
+                    title_row_y,
+                    edit_w,
+                    ctrl_h,
                     hwnd,
                     HMENU(IDC_TITLE_EDIT as *mut std::ffi::c_void),
                     instance,
@@ -270,18 +309,18 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
             }
 
-            // 备注标签
-            // SAFETY: 同信息文本，静态标签创建失败忽略。
+            // —— 备注行：标签 + 多行编辑框占主体 ——
+            // SAFETY: 静态标签创建失败忽略。
             unsafe {
                 let _ = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     windows::core::w!("STATIC"),
                     windows::core::w!("备注："),
                     child_style,
-                    10,
-                    100,
-                    50,
-                    25,
+                    m,
+                    note_row_y,
+                    label_w,
+                    ctrl_h,
                     hwnd,
                     None,
                     instance,
@@ -305,10 +344,10 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     windows::core::w!("EDIT"),
                     PCWSTR(note_wide.as_ptr()),
                     note_ws,
-                    10,
-                    130,
-                    380,
-                    100,
+                    m,
+                    note_row_y + ctrl_h + dp(hwnd, 4),
+                    WIN_W - 2 * m,
+                    note_h,
                     hwnd,
                     HMENU(IDC_NOTE_EDIT as *mut std::ffi::c_void),
                     instance,
@@ -323,46 +362,61 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 subclass_edit_for_keys(note_edit);
             }
 
-            // 确认按钮
-            let btn_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_PUSHBUTTON as u32);
-            // SAFETY: 按钮控件创建失败忽略，不影响其余子控件。
-            unsafe {
-                let _ = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    windows::core::w!("BUTTON"),
-                    windows::core::w!("确认"),
-                    btn_style,
-                    260,
-                    245,
-                    70,
-                    28,
-                    hwnd,
-                    HMENU(IDC_OK_BUTTON as *mut std::ffi::c_void),
-                    instance,
-                    None,
-                );
-            }
+            // —— 按钮行：右下 确认（accent）/取消（次要），自绘（9.4/9.8）——
+            let btn_row_x = WIN_W - m - (btn_w * 2 + btn_gap);
+            // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略即可
+            // （按钮不可用不影响弹窗其余功能，WM_COMMAND 仍走原 ID 路由）。
+            let _ = button::create_button(
+                hwnd,
+                IDC_OK_BUTTON,
+                "确认",
+                btn_row_x,
+                btn_row_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Accent,
+            );
+            let _ = button::create_button(
+                hwnd,
+                IDC_CANCEL_BUTTON,
+                "取消",
+                btn_row_x + btn_w + btn_gap,
+                btn_row_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Secondary,
+            );
 
-            // 取消按钮
-            // SAFETY: 按钮控件创建失败忽略，不影响其余子控件。
-            unsafe {
-                let _ = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    windows::core::w!("BUTTON"),
-                    windows::core::w!("取消"),
-                    btn_style,
-                    335,
-                    245,
-                    70,
-                    28,
-                    hwnd,
-                    HMENU(IDC_CANCEL_BUTTON as *mut std::ffi::c_void),
-                    instance,
-                    None,
-                );
-            }
+            // 全局消息字体注入所有子控件（EDIT/STATIC；按钮由 BS_OWNERDRAW
+            // 自绘时经 message_font() 选择字体）
+            apply_font_to_children(hwnd);
 
             LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // 固定弹窗尺寸（问题 9.6）：禁止缩放导致控件错乱
+            // SAFETY: lParam 指向 MINMAXINFO，WM_GETMINMAXINFO 期间有效；
+            // 覆盖 ptMaxSize 与 ptMinTrackSize/ptMaxTrackSize 锁定尺寸。
+            use windows::Win32::UI::WindowsAndMessaging::MINMAXINFO;
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            let w = dp(hwnd, WIN_W);
+            let h = dp(hwnd, WIN_H);
+            mmi.ptMaxSize.x = w;
+            mmi.ptMaxSize.y = h;
+            mmi.ptMinTrackSize.x = w;
+            mmi.ptMinTrackSize.y = h;
+            mmi.ptMaxTrackSize.x = w;
+            mmi.ptMaxTrackSize.y = h;
+            LRESULT(0)
+        }
+        WM_DRAWITEM => {
+            // 自绘按钮绘制请求（问题 9.4/9.8）：委托 ui::button 处理
+            if button::handle_draw_item(lparam) {
+                LRESULT(1)
+            } else {
+                // SAFETY: 非按钮的 WM_DRAWITEM 透传默认过程。
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as i32;

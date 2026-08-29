@@ -3,34 +3,40 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, ReleaseDC,
-    SetBkMode, SetTextColor, UpdateWindow, DT_CENTER, DT_VCENTER, DT_WORDBREAK, TRANSPARENT,
+    BeginPaint, CreateBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush, DeleteDC,
+    DeleteObject, DrawTextW, EndPaint, GetDC, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, ValidateRect, BLENDFUNCTION, DT_WORDBREAK, HGDIOBJ, PS_SOLID,
+    TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
-    GetWindowTextW, IsIconic, IsWindowVisible, RegisterClassW, SetLayeredWindowAttributes,
-    SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    LWA_COLORKEY, SWP_NOACTIVATE, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
+    GetWindowTextW, IsIconic, IsWindowVisible, RegisterClassW, SetWindowPos, ShowWindow,
+    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
+    SWP_NOACTIVATE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
     WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
+use super::badge::{render_badge, BadgeParams};
 use super::TagStore;
 use crate::common::{get_userdata, set_userdata, widestring};
 
-const COLOR_KEY: COLORREF = COLORREF(0x00000000);
-/// 圆点回退颜色（橙色，BGR 布局：B=0x4D, G=0xB7, R=0xFF，对应 RGBA [255, 183, 77, 255]）
-const FALLBACK_DOT_COLOR: COLORREF = COLORREF(0x0000_4DB7FF);
-const DOT_RECT: RECT = RECT {
-    left: 8,
-    top: 8,
-    right: 20,
-    bottom: 20,
-};
+/// 角标逻辑像素边长（贴窗口左上角的等腰直角三角形腰长）
+const BADGE_SIZE: i32 = 18;
+/// 角标在覆盖层窗口中的偏移（距窗口左上角）
+const BADGE_OFFSET: i32 = 2;
+/// 覆盖层窗口边长 = 三角形腰长 + 左右/上下各留 [`BADGE_OFFSET`] 透明边
+///
+/// 覆盖层窗口只覆盖角标这一小块（贴目标窗口左上角），而非整块目标窗口，
+/// 从而避免铺满窗口时吞掉目标窗口的点击（`HTTRANSPARENT` 无法穿透其他进程窗口）。
+const BADGE_WIN_SIZE: i32 = BADGE_SIZE + BADGE_OFFSET * 2;
+/// 圆点回退颜色（橙色，RGB [255, 183, 77]）
+const FALLBACK_DOT_RGBA: [u8; 4] = [255, 183, 77, 255];
+/// WM_MOUSELEAVE：TrackMouseEvent(TME_LEAVE) 触发的鼠标离开消息
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// 单个覆盖层的悬停状态
@@ -67,20 +73,20 @@ pub fn set_tag_store(store: Arc<Mutex<TagStore>>) {
 /// 注入的 tooltip 主题配色（元组：(背景色, 前景色)，`COLORREF` 为 `0x00BBGGRR` 布局）
 ///
 /// 通过 [`set_tooltip_theme`] 注入；未注入时 tooltip 回退默认白底黑字，
-/// 与注入前的行为完全一致。采用与 [`TAG_STORE_INNER`] 相同的 OnceLock 注入模式，
-/// 重复调用仅首次生效。
-///
-/// 说明：`OnceLock` 本身已保证"写一次、读多次"的线程安全语义，
-/// 值不可变，因此无需再包一层 `Mutex`（读取用 `.get()` 直接取引用，无需加锁）。
-static TOOLTIP_THEME: OnceLock<(COLORREF, COLORREF)> = OnceLock::new();
+/// 与注入前的行为完全一致。采用 `Mutex` 承载以支持主题切换后热更新
+/// （决策记录 D11：修复主题切换后 tooltip 沿用启动配色的遗留问题），
+/// 读取用 `lock().ok()` 取当前值。
+static TOOLTIP_THEME: OnceLock<Mutex<(COLORREF, COLORREF)>> = OnceLock::new();
 
 /// 注入 tooltip 主题配色
 ///
-/// 必须在任何 tooltip 显示之前调用（通常在程序启动、消息循环开始前）。
-/// 未调用本函数时 tooltip 保持默认白底黑字；重复调用仅首次生效
-/// （与 [`set_tag_store`] 一致的 OnceLock 语义）。
+/// 首次调用初始化 Mutex 存储；此后每次调用覆盖为最新配色，使主题切换后
+/// 新建的 tooltip 即时采用新配色。未调用本函数时 tooltip 保持默认白底黑字。
 pub fn set_tooltip_theme(bg: COLORREF, fg: COLORREF) {
-    let _ = TOOLTIP_THEME.set((bg, fg));
+    let state = TOOLTIP_THEME.get_or_init(|| Mutex::new((bg, fg)));
+    if let Ok(mut guard) = state.lock() {
+        *guard = (bg, fg);
+    }
 }
 
 /// 透明覆盖层窗口
@@ -166,6 +172,10 @@ impl Overlay {
             WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0,
         );
 
+        // 覆盖层窗口只占角标大小、贴在目标窗口左上角，而非铺满整个目标窗口。
+        // 铺满目标窗口会吞掉其点击（`HTTRANSPARENT` 无法穿透其他进程窗口）。
+        let side = BADGE_WIN_SIZE;
+
         // SAFETY: 传入已注册的窗口类名、有效样式与尺寸，父窗口/菜单/实例均不参与
         // （None）；创建失败（如资源不足）返回错误由 `?` 传播。
         let hwnd = unsafe {
@@ -176,8 +186,8 @@ impl Overlay {
                 WS_POPUP | WS_VISIBLE,
                 rect.left,
                 rect.top,
-                width,
-                height,
+                side,
+                side,
                 None,
                 None,
                 None,
@@ -197,10 +207,9 @@ impl Overlay {
             );
         }
 
-        // SAFETY: hwnd 为本函数刚创建且存活的窗口；SetLayeredWindowAttributes 设置透明
-        // 色键，ShowWindow/UpdateWindow 触发首次绘制，均为无害操作，失败忽略。
+        // SAFETY: hwnd 为本函数刚创建且存活的窗口；ShowWindow/UpdateWindow 触发
+        // 首次绘制（WM_PAINT 内经 UpdateLayeredWindow 提交预乘 RGBA）。
         unsafe {
-            let _ = SetLayeredWindowAttributes(hwnd, COLOR_KEY, 0, LWA_COLORKEY);
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
         }
@@ -214,7 +223,10 @@ impl Overlay {
         })
     }
 
-    /// 将覆盖层位置与尺寸同步到目标窗口当前可见区域（窗口移动/缩放时调用）
+    /// 将覆盖层位置同步到目标窗口当前可见区域的左上角（窗口移动/缩放时调用）
+    ///
+    /// 覆盖层窗口尺寸固定为角标大小（[`BADGE_WIN_SIZE`]），仅跟随目标窗口左上角位置；
+    /// 目标窗口缩放而左上角不变时无需重排（角标始终锚定该角）。
     ///
     /// 优先使用 DWM 扩展帧边界（[`DWMWA_EXTENDED_FRAME_BOUNDS`]）获取目标窗口的
     /// **可见区域**：该边界不含隐形 resize 边框，与用户视觉感知一致；在 Per-Monitor
@@ -261,9 +273,13 @@ impl Overlay {
             return Ok(());
         }
 
+        // 覆盖层窗口固定为角标大小（badge 窗口），仅跟随目标窗口左上角位置；
+        // 尺寸不再随目标缩放而变化。
+        let side = BADGE_WIN_SIZE;
+
         // 变更去重：与上次已应用的矩形一致时跳过 SetWindowPos；锁中毒时继续执行，
         // 保持与之前相同的定位行为（下次同步仍会重新去重）。
-        let current = (rect.left, rect.top, w, h);
+        let current = (rect.left, rect.top, side, side);
         if let Ok(mut last) = self.last_rect.lock() {
             if last.as_ref() == Some(&current) {
                 return Ok(());
@@ -279,8 +295,8 @@ impl Overlay {
                 HWND_TOPMOST,
                 rect.left,
                 rect.top,
-                w,
-                h,
+                side,
+                side,
                 SWP_NOACTIVATE,
             );
         }
@@ -373,6 +389,129 @@ impl Drop for Overlay {
 // 覆盖层窗口过程
 // ============================================================
 
+/// 点是否在角标三角形内部（命中测试，纯函数）
+///
+/// 三角形顶点（以左上角为原点）：A(0,0) B(size,0) C(0,size)。
+/// 内部判定：x≥0 且 y≥0 且 x+y ≤ size（斜边方程 x+y=size）。
+fn point_in_badge_triangle(cx: i32, cy: i32, size: i32) -> bool {
+    cx >= 0 && cy >= 0 && cx + cy <= size
+}
+
+/// 取角标 RGBA 颜色（标签色 → RGBA；缺失回退橙）
+fn tag_color_rgba(overlay_hwnd: HWND) -> [u8; 4] {
+    let target_hwnd = get_target_hwnd(overlay_hwnd);
+    if target_hwnd == 0 {
+        return FALLBACK_DOT_RGBA;
+    }
+    let Some(store) = TAG_STORE_INNER.get() else {
+        return FALLBACK_DOT_RGBA;
+    };
+    let Ok(store) = store.lock() else {
+        return FALLBACK_DOT_RGBA;
+    };
+    let Some(tag) = store.get(&target_hwnd) else {
+        return FALLBACK_DOT_RGBA;
+    };
+    tag.color.as_rgba()
+}
+
+/// 取角标描边色（依当前主题：暗色用浅描边、亮色用深描边）
+fn badge_stroke_rgba() -> [u8; 4] {
+    crate::ui::theme::theme_colors()
+        .map(|c| {
+            // 取主题 border 色 BGR → RGBA
+            let r = (c.border.0 >> 16) & 0xFF;
+            let g = (c.border.0 >> 8) & 0xFF;
+            let b = c.border.0 & 0xFF;
+            [r as u8, g as u8, b as u8, 255]
+        })
+        .unwrap_or([60, 60, 60, 255])
+}
+
+/// 渲染角标并经 `UpdateLayeredWindow` 提交到覆盖层窗口（逐像素 alpha 抗锯齿）
+fn update_layered_badge(hwnd: HWND) {
+    let side = BADGE_WIN_SIZE;
+    let fill = tag_color_rgba(hwnd);
+    let stroke = badge_stroke_rgba();
+    // 先渲染纯三角形缓冲（腰长 BADGE_SIZE，贴左上角），再拷贝进全窗口缓冲，
+    // 使三角形相对窗口左上角偏移 BADGE_OFFSET 像素、四周留透明边。
+    let tri = render_badge(BadgeParams {
+        size: BADGE_SIZE,
+        fill,
+        stroke,
+    });
+    let mut rgba = vec![0u8; (side * side) as usize * 4];
+    for y in 0..BADGE_SIZE {
+        let src = (y * BADGE_SIZE) as usize * 4;
+        let dst = (((y + BADGE_OFFSET) * side + BADGE_OFFSET) as usize) * 4;
+        let len = BADGE_SIZE as usize * 4;
+        rgba[dst..dst + len].copy_from_slice(&tri[src..src + len]);
+    }
+
+    // SAFETY: CreateBitmap 创建 32bpp DIB，数据由 rgba 提供；返回 HBITMAP。
+    // rgba 在调用期间存活，CreateBitmap 内部完成像素拷贝。
+    let hbmp = unsafe {
+        CreateBitmap(
+            side,
+            side,
+            1,
+            32,
+            Some(rgba.as_ptr() as *const std::ffi::c_void),
+        )
+    };
+    if hbmp.is_invalid() {
+        return;
+    }
+
+    // SAFETY: CreateCompatibleDC 创建内存 DC；SelectObject 选入 HBITMAP；
+    // 用完后删除（先 SelectObject 恢复原对象）。均在本函数内成对完成。
+    let mem_dc = unsafe { CreateCompatibleDC(None) };
+    if mem_dc.is_invalid() {
+        // SAFETY: hbmp 刚创建，无效 DC 路径下仅删 bitmap。
+        unsafe {
+            let _ = DeleteObject(hbmp);
+        }
+        return;
+    }
+    let old_bmp = unsafe { SelectObject(mem_dc, hbmp) };
+
+    // 目标位置/尺寸由 create/sync_position 设定，此处不传 pt_dst（保持窗口原位置），
+    // 避免 UpdateLayeredWindow 将窗口重定位到 `pt_dst` 所指"屏幕坐标"从而挪走窗口。
+    let sz = SIZE { cx: side, cy: side };
+    let pt_src = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: 0, // AC_SRC_OVER
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1, // AC_SRC_ALPHA（预乘）
+    };
+
+    // SAFETY: hwnd 为覆盖层窗口存活句柄；UpdateLayeredWindow 提交内存 DC 内容
+    // 为窗口的分层像素，ULW_ALPHA 启用逐像素 alpha 混合；失败静默忽略
+    // （下次 WM_PAINT 会重试）。mem_dc 为 CreateCompatibleDC 返回的 HDC。
+    let _ = unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            None,
+            Some(&sz),
+            mem_dc,
+            Some(&pt_src),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )
+    };
+
+    // 清理：恢复原对象 → 删 bitmap → 删内存 DC
+    // SAFETY: 成对清理，无跨消息生命周期。
+    unsafe {
+        let _ = SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(hbmp);
+        let _ = DeleteDC(mem_dc);
+    }
+}
+
 extern "system" fn overlay_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -381,32 +520,24 @@ extern "system" fn overlay_wndproc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => {
-            // SAFETY: hwnd 由系统在消息分发时传入且有效；WM_ERASEBKGND 的 wParam
-            // 约定为窗口 DC（HDC）；GDI 对象创建后立即使用并删除，避免泄漏。
-            unsafe {
-                let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut std::ffi::c_void);
-                let mut rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rect);
-                let brush = CreateSolidBrush(COLOR_KEY);
-                let _ = FillRect(hdc, &rect, brush);
-                let _ = DeleteObject(brush);
-            }
+            // UpdateLayeredWindow 模式下背景由 WM_PAINT 的 UpdateLayeredWindow 整面覆盖，
+            // 无需 GDI 擦除；返回 1 阻止默认擦除。
             LRESULT(1)
         }
         WM_PAINT => {
-            // SAFETY: hwnd 由系统传入且有效；BeginPaint 仅可在 WM_PAINT 中调用，
-            // 与 EndPaint 成对；画刷使用后立即删除。
+            // 渲染贴角圆边三角形 → 32bpp 预乘 RGBA → UpdateLayeredWindow 提交
+            // （决策记录 D11：替代原色键透明 FillRect 方块，获得逐像素 alpha 抗锯齿）
+            update_layered_badge(hwnd);
+            // 通知系统 WM_PAINT 已处理（分层窗口经 UpdateLayeredWindow 绘制，
+            // 不走 BeginPaint/EndPaint 路径，但仍需返回 0 告知已处理）
+            // SAFETY: ValidateRect 标记整个客户区为有效，阻止重复 WM_PAINT。
             unsafe {
-                let mut ps = Default::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                let brush = CreateSolidBrush(tag_color_ref(hwnd));
-                let _ = FillRect(hdc, &DOT_RECT, brush);
-                let _ = DeleteObject(brush);
-                let _ = EndPaint(hwnd, &ps);
+                let _ = ValidateRect(hwnd, None);
             }
             LRESULT(0)
         }
         WM_NCHITTEST => {
+            // 命中测试：仅角标三角形内部可点击（HTCLIENT），其余区域穿透（HTTRANSPARENT）
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let mut wr = RECT::default();
@@ -414,11 +545,9 @@ extern "system" fn overlay_wndproc(
             unsafe {
                 let _ = GetWindowRect(hwnd, &mut wr);
             }
-            let cx = x - wr.left;
-            let cy = y - wr.top;
-            if (DOT_RECT.left..DOT_RECT.right).contains(&cx)
-                && (DOT_RECT.top..DOT_RECT.bottom).contains(&cy)
-            {
+            let cx = x - wr.left - BADGE_OFFSET;
+            let cy = y - wr.top - BADGE_OFFSET;
+            if point_in_badge_triangle(cx, cy, BADGE_SIZE) {
                 LRESULT(HTCLIENT as isize)
             } else {
                 LRESULT(HTTRANSPARENT as isize)
@@ -531,10 +660,11 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
 
     let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
     let style = WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0);
+    // 分层排版：标题与备注以 \n 分隔，tooltip_wndproc 分别绘制（标题加粗）
     let text = if note.is_empty() {
         title.clone()
     } else {
-        format!("{}  -  {}", title, note)
+        format!("{}\n{}", title, note)
     };
 
     let mut pt = POINT::default();
@@ -570,31 +700,32 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
             set_userdata(overlay_hwnd, tooltip_hwnd.0);
         }
 
+        // 宽度自适应 + 高度自适应：DrawTextW 预量，宽度上限 360px（解决问题 4 截断）
         // SAFETY: tooltip_hwnd 刚创建且存活；GetDC/ReleaseDC 成对调用；
-        // DrawTextW 测量文本高度，SetWindowPos 调整尺寸，失败均忽略。
+        // DrawTextW 测量文本，SetWindowPos 调整尺寸，失败均忽略。
         unsafe {
             let hdc = GetDC(tooltip_hwnd);
+            // 先按 340px 内容宽（360 减四边 10px 边距）测量高度
             let mut rc = RECT {
                 left: 0,
                 top: 0,
-                right: 280,
+                right: 340,
                 bottom: 0,
             };
-            let _ = DrawTextW(
-                hdc,
-                &mut wide,
-                &mut rc,
-                DT_CENTER | DT_WORDBREAK | DT_VCENTER,
-            );
+            let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_WORDBREAK);
+            let content_w = (rc.right - rc.left).max(120);
+            let content_h = (rc.bottom - rc.top).max(20);
             let _ = ReleaseDC(tooltip_hwnd, hdc);
-            let height = (rc.bottom - rc.top).max(20) + 20;
+            // 实际窗口尺寸 = 内容宽高 + 四边 10px 内边距 + 1px 边框
+            let win_w = content_w + 20 + 2;
+            let win_h = content_h + 20 + 2;
             let _ = SetWindowPos(
                 tooltip_hwnd,
                 HWND_TOPMOST,
                 pt.x - 10,
                 pt.y + 16,
-                300,
-                height,
+                win_w,
+                win_h,
                 SWP_NOACTIVATE,
             );
         }
@@ -635,29 +766,6 @@ fn get_target_hwnd(overlay_hwnd: HWND) -> isize {
         .unwrap_or(0)
 }
 
-/// 取覆盖层圆点绘制颜色（Win32 `COLORREF`，`0x00BBGGRR` 布局）
-///
-/// 从注入的标签存储中查找覆盖层对应目标窗口的标签颜色：
-/// - 存储已注入且查到标签 → 取 `Tag::color.as_rgba()` 的 RGB 通道转换为 BGR；
-/// - 存储未注入、目标窗口未知或标签缺失 → 回退橙色（[`FALLBACK_DOT_COLOR`]）。
-fn tag_color_ref(overlay_hwnd: HWND) -> COLORREF {
-    let target_hwnd = get_target_hwnd(overlay_hwnd);
-    if target_hwnd == 0 {
-        return FALLBACK_DOT_COLOR;
-    }
-    let Some(store) = TAG_STORE_INNER.get() else {
-        return FALLBACK_DOT_COLOR;
-    };
-    let Ok(store) = store.lock() else {
-        return FALLBACK_DOT_COLOR;
-    };
-    let Some(tag) = store.get(&target_hwnd) else {
-        return FALLBACK_DOT_COLOR;
-    };
-    let [r, g, b, _] = tag.color.as_rgba();
-    COLORREF(((r as u32) << 16) | ((g as u32) << 8) | b as u32)
-}
-
 // ============================================================
 // 工具提示窗口过程
 // ============================================================
@@ -670,35 +778,106 @@ extern "system" fn tooltip_wndproc(
 ) -> LRESULT {
     match msg {
         WM_PAINT => {
-            // SAFETY: hwnd 由系统传入且有效；BeginPaint/EndPaint 成对；GDI 对象及时删除；
-            // buf 为栈上 512 元素缓冲，GetWindowTextW 返回长度有界，不会越界访问。
+            // 圆角矩形 + 1px 边框 + 标题/备注分层（决策记录 D11，解决问题 4 + 观感）
+            // SAFETY: hwnd 由系统传入且有效；BeginPaint/EndPaint 成对；GDI 对象及时删除。
             unsafe {
                 let mut ps = Default::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                // 取注入的 tooltip 配色：已注入则用注入色；未注入（或锁中毒）时
-                // 回退默认白底黑字，行为与注入前完全一致。
+
+                // 取注入的 tooltip 配色（Mutex 可热更新）：已注入用注入色，
+                // 未注入/锁中毒回退默认白底黑字
                 let (bg, fg) = TOOLTIP_THEME
                     .get()
-                    .copied()
+                    .and_then(|m| m.lock().ok().map(|g| *g))
                     .unwrap_or((COLORREF(0x00FFFFFF), COLORREF(0x00000000)));
-                let brush = CreateSolidBrush(bg);
+                // 描边色取主题 border（未注入时用中灰）
+                let border = crate::ui::theme::theme_colors()
+                    .map(|c| c.border)
+                    .unwrap_or(COLORREF(0x00808080));
+
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
-                let _ = FillRect(hdc, &rc, brush);
-                let _ = DeleteObject(brush);
 
+                // —— 圆角背景 + 1px 边框 ——
+                let fill = CreateSolidBrush(bg);
+                let pen = CreatePen(PS_SOLID, 1, border);
+                let old_pen = SelectObject(hdc, pen);
+                let old_brush = SelectObject(hdc, fill);
+                let radius = 6;
+                let _ = RoundRect(
+                    hdc,
+                    rc.left,
+                    rc.top,
+                    rc.right - 1,
+                    rc.bottom - 1,
+                    radius,
+                    radius,
+                );
+                let _ = SelectObject(hdc, old_brush);
+                let _ = SelectObject(hdc, old_pen);
+                let _ = DeleteObject(fill);
+                let _ = DeleteObject(pen);
+
+                // —— 文字分层：标题（粗体）+ 备注（常规），以 \n 分隔 ——
                 let mut buf = [0u16; 512];
                 let len = GetWindowTextW(hwnd, &mut buf) as usize;
                 if len > 0 {
+                    let text = String::from_utf16_lossy(&buf[..len]);
+                    let mut parts = text.splitn(2, '\n');
+                    let title = parts.next().unwrap_or("");
+                    let note = parts.next().unwrap_or("");
+
                     let _ = SetBkMode(hdc, TRANSPARENT);
                     let _ = SetTextColor(hdc, fg);
-                    let mut tr = RECT {
-                        left: 10,
-                        top: 10,
-                        right: rc.right - 10,
-                        bottom: rc.bottom - 10,
+
+                    let margin = 10;
+                    let mut y = margin;
+                    let content_right = rc.right - margin;
+
+                    // 标题（粗体字体）
+                    let bold = crate::ui::theme::message_font_bold();
+                    let old_font = if !bold.is_invalid() {
+                        SelectObject(hdc, bold)
+                    } else {
+                        HGDIOBJ(std::ptr::null_mut())
                     };
-                    let _ = DrawTextW(hdc, &mut buf[..len], &mut tr, DT_WORDBREAK);
+                    if !title.is_empty() {
+                        let mut title_wide: Vec<u16> =
+                            title.encode_utf16().chain(std::iter::once(0)).collect();
+                        let mut tr = RECT {
+                            left: margin,
+                            top: y,
+                            right: content_right,
+                            bottom: rc.bottom - margin,
+                        };
+                        let _ = DrawTextW(hdc, &mut title_wide, &mut tr, DT_WORDBREAK);
+                        y = tr.bottom + 4;
+                    }
+                    if !old_font.is_invalid() {
+                        let _ = SelectObject(hdc, old_font);
+                    }
+
+                    // 备注（常规字体）
+                    if !note.is_empty() {
+                        let msg_font = crate::ui::theme::message_font();
+                        let old_font2 = if !msg_font.is_invalid() {
+                            SelectObject(hdc, msg_font)
+                        } else {
+                            HGDIOBJ(std::ptr::null_mut())
+                        };
+                        let mut note_wide: Vec<u16> =
+                            note.encode_utf16().chain(std::iter::once(0)).collect();
+                        let mut nr = RECT {
+                            left: margin,
+                            top: y,
+                            right: content_right,
+                            bottom: rc.bottom - margin,
+                        };
+                        let _ = DrawTextW(hdc, &mut note_wide, &mut nr, DT_WORDBREAK);
+                        if !old_font2.is_invalid() {
+                            let _ = SelectObject(hdc, old_font2);
+                        }
+                    }
                 }
                 let _ = EndPaint(hwnd, &ps);
             }

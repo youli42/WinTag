@@ -17,19 +17,21 @@ use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, ShowWindow, BS_DEFPUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU,
-    SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    SetForegroundWindow, ShowWindow, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
+    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MINMAXINFO, SW_HIDE, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
     WS_VSCROLL,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
 use crate::core::settings::{global_settings, CornerPreference, Settings, ThemeMode};
+use crate::ui::button::{self, ButtonStyle};
+use crate::ui::layout::dp;
 use crate::ui::theme::{
-    apply_corner_preference, apply_dark_mode, detect_system_dark, get_brush, light_colors,
-    theme_colors,
+    apply_corner_preference, apply_dark_mode, apply_font_to_children, detect_system_dark,
+    get_brush, light_colors, theme_colors,
 };
 
 /// 控件 ID 常量（子控件消息路由用）
@@ -37,6 +39,17 @@ const IDC_THEME_COMBO: i32 = 201;
 const IDC_CORNER_COMBO: i32 = 202;
 const IDC_SAVE_BUTTON: i32 = 205;
 const IDC_CANCEL_BUTTON: i32 = 206;
+
+/// 设计像素常量（96 DPI 基准）
+const MARGIN: i32 = 20;
+const LABEL_W: i32 = 80;
+const CTRL_H: i32 = 26;
+const ROW_GAP: i32 = 48;
+const BTN_W: i32 = 88;
+const BTN_H: i32 = 30;
+const BTN_GAP: i32 = 8;
+const WIN_W: i32 = 460;
+const WIN_H: i32 = 280;
 
 /// 设置窗口的用户数据：设置存储引用、隐藏窗口句柄与可见状态
 ///
@@ -107,8 +120,8 @@ pub fn create_settings(data: SettingsData) -> HWND {
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            600,
-            420,
+            WIN_W,
+            WIN_H,
             None,
             None,
             None,
@@ -209,6 +222,21 @@ extern "system" fn settings_wndproc(
             let instance = HINSTANCE::default();
             let child_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0);
 
+            // —— DPI 缩放后的布局坐标 ——
+            let m = dp(hwnd, MARGIN);
+            let label_w = dp(hwnd, LABEL_W);
+            let ctrl_h = dp(hwnd, CTRL_H);
+            let row1_y = m + dp(hwnd, 8);
+            let row2_y = row1_y + ctrl_h + dp(hwnd, ROW_GAP);
+            let combo_x = m + label_w;
+            let combo_w = WIN_W - m - combo_x;
+            let client_h = WIN_H - dp(hwnd, 30);
+            let btn_w = dp(hwnd, BTN_W);
+            let btn_h = dp(hwnd, BTN_H);
+            let btn_gap = dp(hwnd, BTN_GAP);
+            let btn_row_y = client_h - m - btn_h;
+            let btn_row_x = WIN_W - m - (btn_w * 2 + btn_gap);
+
             // —— 主题模式标签 ——
             // SAFETY: 静态标签创建失败忽略，不影响其余子控件。
             unsafe {
@@ -217,10 +245,10 @@ extern "system" fn settings_wndproc(
                     windows::core::w!("STATIC"),
                     windows::core::w!("主题模式"),
                     child_style,
-                    20,
-                    30,
-                    90,
-                    25,
+                    m,
+                    row1_y,
+                    label_w,
+                    ctrl_h,
                     hwnd,
                     None,
                     instance,
@@ -240,10 +268,10 @@ extern "system" fn settings_wndproc(
                     windows::core::w!("COMBOBOX"),
                     windows::core::w!(""),
                     combo_style,
-                    120,
-                    26,
-                    460,
-                    200,
+                    combo_x,
+                    row1_y,
+                    combo_w,
+                    dp(hwnd, 200),
                     hwnd,
                     HMENU(IDC_THEME_COMBO as *mut c_void),
                     instance,
@@ -279,10 +307,10 @@ extern "system" fn settings_wndproc(
                     windows::core::w!("STATIC"),
                     windows::core::w!("窗口圆角"),
                     child_style,
-                    20,
-                    80,
-                    90,
-                    25,
+                    m,
+                    row2_y,
+                    label_w,
+                    ctrl_h,
                     hwnd,
                     None,
                     instance,
@@ -299,10 +327,10 @@ extern "system" fn settings_wndproc(
                     windows::core::w!("COMBOBOX"),
                     windows::core::w!(""),
                     combo_style,
-                    120,
-                    76,
-                    460,
-                    200,
+                    combo_x,
+                    row2_y,
+                    combo_w,
+                    dp(hwnd, 200),
                     hwnd,
                     HMENU(IDC_CORNER_COMBO as *mut c_void),
                     instance,
@@ -335,44 +363,28 @@ extern "system" fn settings_wndproc(
                 }
             }
 
-            // —— 保存按钮（默认按钮，回车键语义与保存一致）——
-            let btn_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_DEFPUSHBUTTON as u32);
-            // SAFETY: 按钮控件创建失败忽略，不影响其余子控件。
-            unsafe {
-                let _ = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    windows::core::w!("BUTTON"),
-                    windows::core::w!("保存"),
-                    btn_style,
-                    400,
-                    370,
-                    85,
-                    30,
-                    hwnd,
-                    HMENU(IDC_SAVE_BUTTON as *mut c_void),
-                    instance,
-                    None,
-                );
-            }
-
-            // —— 取消按钮 ——
-            // SAFETY: 按钮控件创建失败忽略，不影响其余子控件。
-            unsafe {
-                let _ = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    windows::core::w!("BUTTON"),
-                    windows::core::w!("取消"),
-                    btn_style,
-                    495,
-                    370,
-                    85,
-                    30,
-                    hwnd,
-                    HMENU(IDC_CANCEL_BUTTON as *mut c_void),
-                    instance,
-                    None,
-                );
-            }
+            // —— 按钮行：右下 保存（accent）/取消（次要），自绘（9.4/9.8）——
+            // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略。
+            let _ = button::create_button(
+                hwnd,
+                IDC_SAVE_BUTTON,
+                "保存",
+                btn_row_x,
+                btn_row_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Accent,
+            );
+            let _ = button::create_button(
+                hwnd,
+                IDC_CANCEL_BUTTON,
+                "取消",
+                btn_row_x + btn_w + btn_gap,
+                btn_row_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Secondary,
+            );
 
             // 保存子控件句柄到用户数据（供 toggle/WM_COMMAND 复用）
             // SAFETY: data 指针有效（见上方校验），仅覆盖下拉框句柄；
@@ -381,6 +393,9 @@ extern "system" fn settings_wndproc(
                 (*data).theme_combo = theme_combo;
                 (*data).corner_combo = corner_combo;
             }
+
+            // 全局消息字体注入所有子控件（STATIC/COMBOBOX；按钮自绘时选用 message_font）
+            apply_font_to_children(hwnd);
 
             // 应用当前主题与圆角偏好（从全局设置读取，未注入时用默认值）
             let current = current_settings();
@@ -425,6 +440,30 @@ extern "system" fn settings_wndproc(
         // 客户区背景由 WM_ERASEBKGND 决定；默认 DefWindowProc 用白色类画刷擦除
         // 背景（暗色主题下表现为白色窗口底色），此处按主题色填充并返回 1
         // 告知系统背景已擦除，阻止默认白色填充。
+        WM_GETMINMAXINFO => {
+            // 固定设置窗口尺寸（问题 9.6）：禁止缩放导致控件错乱
+            // SAFETY: lParam 指向 MINMAXINFO，WM_GETMINMAXINFO 期间有效；
+            // 覆盖 ptMaxSize 与 ptMin/MaxTrackSize 锁定尺寸。
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            let w = dp(hwnd, WIN_W);
+            let h = dp(hwnd, WIN_H);
+            mmi.ptMaxSize.x = w;
+            mmi.ptMaxSize.y = h;
+            mmi.ptMinTrackSize.x = w;
+            mmi.ptMinTrackSize.y = h;
+            mmi.ptMaxTrackSize.x = w;
+            mmi.ptMaxTrackSize.y = h;
+            LRESULT(0)
+        }
+        WM_DRAWITEM => {
+            // 自绘按钮绘制请求（问题 9.4/9.8）：委托 ui::button 处理
+            if button::handle_draw_item(lparam) {
+                LRESULT(1)
+            } else {
+                // SAFETY: 非按钮的 WM_DRAWITEM 透传默认过程。
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_ERASEBKGND => {
             // 主题状态未初始化（从未调用 set_theme）时回退系统默认擦除
             let Some(colors) = theme_colors() else {

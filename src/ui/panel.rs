@@ -3,26 +3,39 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVS_EX_FULLROWSELECT,
-    LVS_EX_HEADERDRAGDROP, LVS_REPORT, NMITEMACTIVATE, NM_DBLCLK,
+    InitCommonControlsEx, CDDS_ITEMPREPAINT, CDRF_DODEFAULT, CDRF_NEWFONT, ICC_LISTVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_HEADERDRAGDROP, LVS_REPORT, NMITEMACTIVATE, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_DBLCLK,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, GetDlgItem, GetWindowTextW, IsWindow,
     RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_NOTIFY,
-    WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, MINMAXINFO, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring};
 use crate::core::settings::ThemeMode;
 use crate::core::tag::TagStore;
+use crate::ui::layout::dp;
+use crate::ui::theme::{apply_font_to_children, theme_colors};
 
 const IDC_SEARCH_EDIT: i32 = 201;
 const IDC_LIST_VIEW: i32 = 202;
+
+/// 设计像素常量（96 DPI 基准），运行时经 [`dp`] 缩放为物理像素
+const MARGIN: i32 = 12;
+const SEARCH_H: i32 = 28;
+const SEARCH_GAP: i32 = 8;
+const WIN_W: i32 = 640;
+const WIN_H: i32 = 480;
+const MIN_W: i32 = 520;
+const MIN_H: i32 = 360;
 
 /// 面板窗口的用户数据：标签存储引用与当前可见状态
 ///
@@ -91,8 +104,8 @@ pub fn create_panel(data: Arc<Mutex<TagStore>>) -> HWND {
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            600,
-            450,
+            WIN_W,
+            WIN_H,
             None,
             None,
             None,
@@ -149,6 +162,11 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
             let instance = windows::Win32::Foundation::HINSTANCE::default();
 
+            // DPI 缩放后的布局常量
+            let m = dp(hwnd, MARGIN);
+            let search_h = dp(hwnd, SEARCH_H);
+            let list_y = m + search_h + dp(hwnd, SEARCH_GAP);
+
             // 搜索框
             let search_ws = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | ES_AUTOHSCROLL as u32);
             // SAFETY: 创建 EDIT 子控件（ID = IDC_SEARCH_EDIT）；
@@ -159,10 +177,11 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     windows::core::w!("EDIT"),
                     windows::core::w!(""),
                     search_ws,
-                    10,
-                    10,
+                    m,
+                    m,
+                    // 宽度占满减左右边距；WM_SIZE 会按实际宽度校正
                     300,
-                    25,
+                    search_h,
                     hwnd,
                     windows::Win32::UI::WindowsAndMessaging::HMENU(
                         IDC_SEARCH_EDIT as *mut std::ffi::c_void,
@@ -182,8 +201,9 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     windows::core::w!("SysListView32"),
                     windows::core::w!(""),
                     lv_style,
-                    10,
-                    45,
+                    m,
+                    list_y,
+                    // 初始尺寸由 WM_SIZE 校正
                     560,
                     350,
                     hwnd,
@@ -202,16 +222,21 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
             };
 
-            // 整行选择 + 表头拖拽（问题2：Manager 面板表头默认不显示）
-            // LVS_EX_HEADERDRAGDROP 会强制 ListView 创建表头控件（SysHeader32），
-            // 解决报表视图下表头依赖交互触发才显示的问题。
+            // 暗色时设 DarkMode_Explorer 主题（Win11：表头 SysHeader32 与滚动条随之暗化）；
+            // 亮色恢复 Explorer。需 comctl32 v6 manifest（build.rs 嵌入）才能生效。
+            apply_listview_theme(list_view, dark);
+
+            // 整行选择 + 表头拖拽 + 双缓冲（消除拖动闪烁，问题 9.8）
             // SAFETY: 向列表视图发送扩展样式消息，参数为编译期常量，无生命周期问题。
             unsafe {
                 let _ = SendMessageW(
                     list_view,
                     LVM_SETEXTENDEDLISTVIEWSTYLE,
                     WPARAM(0),
-                    LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP) as isize),
+                    LPARAM(
+                        (LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP | LVS_EX_DOUBLEBUFFER)
+                            as isize,
+                    ),
                 );
             }
 
@@ -237,36 +262,30 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 }
             }
 
+            // 全局消息字体注入所有子控件（搜索框 + 列表视图）
+            apply_font_to_children(hwnd);
+
+            // 首次布局：触发 WM_SIZE 校正搜索框/列表实际尺寸位置
+            // SAFETY: GetClientRect 写入栈上 RECT；无副作用。
+            let mut rc = RECT::default();
+            let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+            layout_children(hwnd, rc.right - rc.left, rc.bottom - rc.top);
+
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            // 限制窗口最小尺寸（问题 9.6），防止缩放到控件不可用
+            // SAFETY: lParam 指向 MINMAXINFO，WM_GETMINMAXINFO 期间有效；
+            // 仅覆盖 ptMinTrackSize 字段，其余保持系统默认。
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            mmi.ptMinTrackSize.x = dp(hwnd, MIN_W);
+            mmi.ptMinTrackSize.y = dp(hwnd, MIN_H);
             LRESULT(0)
         }
         WM_SIZE => {
             let width = (lparam.0 & 0xFFFF) as i32;
             let height = ((lparam.0 >> 16) & 0xFFFF) as i32;
-
-            // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
-            if let Ok(search_edit) = unsafe { GetDlgItem(hwnd, IDC_SEARCH_EDIT) } {
-                // SAFETY: SetWindowPos 调整子控件尺寸位置，参数均为栈上局部值。
-                unsafe {
-                    let _ =
-                        SetWindowPos(search_edit, HWND_TOP, 0, 0, width - 20, 25, SWP_NOACTIVATE);
-                }
-            }
-            // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
-            if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
-                // SAFETY: SetWindowPos 调整子控件尺寸位置，参数均为栈上局部值。
-                unsafe {
-                    let _ = SetWindowPos(
-                        list_view,
-                        HWND_TOP,
-                        0,
-                        0,
-                        width - 20,
-                        height - 55,
-                        SWP_NOACTIVATE,
-                    );
-                }
-            }
-
+            layout_children(hwnd, width, height);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -281,11 +300,17 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         }
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY 的 lParam 指向通知结构，所有通知结构首字段均为
-            // NMHDR，故先解引用 NMITEMACTIVATE 读取 hdr 是安全的；仅当 code 为
-            // NM_DBLCLK（列表视图双击）时才进一步读取 iItem 字段。
+            // NMHDR，故先解引用 NMITEMACTIVATE 读取 hdr；按 hdr.code 分流：
+            // NM_DBLCLK → 双击跳转；NM_CUSTOMDRAW → 行级着色（问题 9.2/9.3）。
             let nm = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
-            if nm.hdr.code == NM_DBLCLK && nm.hdr.idFrom == IDC_LIST_VIEW as usize {
-                handle_list_dblclk(hwnd, nm.iItem);
+            match nm.hdr.code {
+                NM_DBLCLK if nm.hdr.idFrom == IDC_LIST_VIEW as usize => {
+                    handle_list_dblclk(hwnd, nm.iItem);
+                }
+                NM_CUSTOMDRAW if nm.hdr.idFrom == IDC_LIST_VIEW as usize => {
+                    return handle_list_customdraw(lparam);
+                }
+                _ => {}
             }
             LRESULT(0)
         }
@@ -390,6 +415,112 @@ fn handle_ctlcolor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // 缓存持有、进程生命周期内不销毁，可安全作为 LRESULT 返回。
     let brush = crate::ui::theme::get_brush(bg);
     LRESULT(brush.0 as isize)
+}
+
+/// 子控件布局（WM_SIZE / WM_CREATE 末尾统一调用）
+///
+/// 修正原 WM_SIZE 的 bug（SetWindowPos 缺 SWP_NOMOVE，控件被吸到 (0,0)），
+/// 恢复四边 MARGIN 内边距：搜索框顶部对齐、列表占剩余空间。
+fn layout_children(hwnd: HWND, width: i32, height: i32) {
+    let m = dp(hwnd, MARGIN);
+    let search_h = dp(hwnd, SEARCH_H);
+    let list_y = m + search_h + dp(hwnd, SEARCH_GAP);
+    let content_w = (width - 2 * m).max(1);
+
+    // 搜索框：保持原位置（m, m），仅调整宽度
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    if let Ok(search_edit) = unsafe { GetDlgItem(hwnd, IDC_SEARCH_EDIT) } {
+        // SAFETY: SetWindowPos 带 SWP_NOMOVE 保留原位置（m,m），仅改尺寸；
+        // 不传 SWP_NOSIZE 即允许改尺寸。SWP_NOZORDER 保留原 Z 序。
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+        unsafe {
+            let _ = SetWindowPos(
+                search_edit,
+                HWND_TOP,
+                0,
+                0,
+                content_w,
+                search_h,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+    }
+    // 列表：占搜索框下方到客户区底边
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
+        let list_h = (height - list_y - m).max(1);
+        // SAFETY: SWP_NOMOVE 保留原位置（m, list_y），仅改尺寸。
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+        unsafe {
+            let _ = SetWindowPos(
+                list_view,
+                HWND_TOP,
+                0,
+                0,
+                content_w,
+                list_h,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
+            );
+        }
+    }
+}
+
+/// 设置 ListView 的视觉主题（问题 9.2/9.3/9.5）
+///
+/// 暗色时设 `DarkMode_Explorer`：SysHeader32 表头与滚动条随之暗化
+/// （Win11 必然生效，Win10 1809+ 生效，更旧降级为 WM_CTLCOLOR 行为，
+/// 不撕裂）。亮色恢复 `Explorer`。需 comctl32 v6 manifest 才能生效。
+fn apply_listview_theme(list_view: HWND, dark: bool) {
+    let theme = if dark {
+        widestring("DarkMode_Explorer")
+    } else {
+        widestring("Explorer")
+    };
+    // SAFETY: SetWindowTheme 为线程安全标准 API；theme 为本函数内 NUL 结尾
+    // 宽字符串，调用期间存活；失败（系统不支持）静默忽略，降级为默认外观。
+    unsafe {
+        let _ = windows::Win32::UI::Controls::SetWindowTheme(
+            list_view,
+            PCWSTR(theme.as_ptr()),
+            PCWSTR::null(),
+        );
+    }
+}
+
+/// 处理 ListView 自定义绘制（NM_CUSTOMDRAW，问题 9.2/9.3）
+///
+/// 按主题调色板为列表行着色：
+/// - 奇偶行交替底色（listview_bg / listview_alt_bg）；
+/// - 选中行用 selected 色；
+/// - 文字统一 listview_fg；
+/// - 返回 CDRF_NEWFONT 告知使用新字体（配合双缓冲消除闪烁）。
+fn handle_list_customdraw(lparam: LPARAM) -> LRESULT {
+    // SAFETY: NM_CUSTOMDRAW 的 lParam 指向 NMLVCUSTOMDRAW，WM_NOTIFY 期间有效。
+    let lvcd = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
+    let stage = lvcd.nmcd.dwDrawStage;
+    // CDDS_PREPAINT → 返回 CDRF_NOTIFYITEMDRAW 请求逐行通知（默认行为）
+    // CDDS_ITEMPREPAINT → 在此设置每行底色与文字色
+    if (stage.0 & CDDS_ITEMPREPAINT.0) != 0 {
+        let colors = theme_colors().unwrap_or_else(crate::ui::theme::light_colors);
+        let idx = lvcd.nmcd.dwItemSpec;
+        // 判断选中态：ListView 选中行由 LVIS_SELECTED 标记，nmcd.uItemState
+        // 已反映（custom draw 期间系统会置位）
+        let selected =
+            (lvcd.nmcd.uItemState.0 & windows::Win32::UI::Controls::CDIS_SELECTED.0) != 0;
+        if selected {
+            lvcd.clrTextBk = colors.selected;
+            lvcd.clrText = colors.listview_fg;
+        } else if idx % 2 == 1 {
+            lvcd.clrTextBk = colors.listview_alt_bg;
+            lvcd.clrText = colors.listview_fg;
+        } else {
+            lvcd.clrTextBk = colors.listview_bg;
+            lvcd.clrText = colors.listview_fg;
+        }
+        LRESULT(CDRF_NEWFONT as isize)
+    } else {
+        LRESULT(CDRF_DODEFAULT as isize)
+    }
 }
 
 /// 处理列表项双击：跳转到对应窗口
@@ -561,6 +692,18 @@ fn refresh_list(hwnd: HWND) {
                 }
             }
         }
+    }
+}
+
+/// 重新应用主题到面板的 ListView（供 main.rs reapply_theme 调用）
+///
+/// 主题切换后 ListView 的 DarkMode_Explorer 需重新设置才能让表头/滚动条
+/// 跟随新主题（问题 9.3/9.5 的热更新）。取 IDC_LIST_VIEW 子控件并刷新主题。
+pub fn reapply_listview_theme(panel_hwnd: HWND, dark: bool) {
+    // SAFETY: panel_hwnd 由调用方保证存活；GetDlgItem 按子控件 ID 查询，
+    // 失败时返回 Err 被忽略。
+    if let Ok(list_view) = unsafe { GetDlgItem(panel_hwnd, IDC_LIST_VIEW) } {
+        apply_listview_theme(list_view, dark);
     }
 }
 
