@@ -68,6 +68,10 @@ pub struct Settings {
     /// 角标上是否显示标题文字（R6；缺省 true，旧配置文件缺字段时按显示回退）
     #[serde(default = "default_true")]
     pub show_badge_title: bool,
+    /// 角标是否始终置顶（R19；缺省 true，旧配置文件缺字段时按置顶回退）。
+    /// 关闭后角标跟随目标窗口 z 序：被其他窗口盖住时随之隐藏。
+    #[serde(default = "default_true")]
+    pub badge_always_top: bool,
 }
 
 impl Default for Settings {
@@ -77,6 +81,7 @@ impl Default for Settings {
             theme: ThemeMode::System,
             corner: CornerPreference::Default,
             show_badge_title: true,
+            badge_always_top: true,
         }
     }
 }
@@ -168,6 +173,7 @@ mod tests {
                 theme,
                 corner: CornerPreference::Default,
                 show_badge_title: true,
+                badge_always_top: true,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -182,6 +188,7 @@ mod tests {
                 theme: ThemeMode::System,
                 corner,
                 show_badge_title: false,
+                badge_always_top: false,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -192,6 +199,7 @@ mod tests {
             theme: ThemeMode::Dark,
             corner: CornerPreference::Round,
             show_badge_title: false,
+            badge_always_top: false,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: Settings = toml::from_str(&s).unwrap();
@@ -205,6 +213,7 @@ mod tests {
         assert_eq!(d.theme, ThemeMode::System);
         assert_eq!(d.corner, CornerPreference::Default);
         assert!(d.show_badge_title);
+        assert!(d.badge_always_top);
     }
 
     /// 测试 (c)：损坏/缺必需字段/空内容均解析失败 → load 走默认回退路径
@@ -227,6 +236,16 @@ mod tests {
         assert!(parsed.show_badge_title, "缺省字段应回退为显示标题");
     }
 
+    /// 测试 (c3)：旧版配置缺 badge_always_top 字段可解析，回退 true（R19 兼容）
+    #[test]
+    fn test_parse_legacy_config_missing_badge_always_top() {
+        let legacy = "theme = \"Dark\"\ncorner = \"Round\"\nshow_badge_title = false\n";
+        let parsed: Settings = parse_str(legacy).unwrap();
+        assert_eq!(parsed.theme, ThemeMode::Dark);
+        assert!(!parsed.show_badge_title);
+        assert!(parsed.badge_always_top, "缺省字段应回退为始终置顶");
+    }
+
     /// 测试 (d)：save→load 往返 —— 写入临时路径，验证文件内容含枚举关键值并可读回
     #[test]
     fn test_save_load_roundtrip() {
@@ -237,6 +256,7 @@ mod tests {
             theme: ThemeMode::Dark,
             corner: CornerPreference::SmallRound,
             show_badge_title: true,
+            badge_always_top: false,
         };
         cfg.save_to(&path).unwrap();
 

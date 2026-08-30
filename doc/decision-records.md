@@ -402,3 +402,33 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 **登记说明**：F1 为需求文档明确功能（重构前已存在缺口，非本次回归）；F2/F3/F4 为技术规格声明的边缘处理；F5 为本次审计新发现；F6 为开发计划未勾选项。均在本次重构范围之外，重构目标（位置同步/DPI/跳转/预填/清理/健壮性）不受影响。
 
 **更新（2026-08-21）**：F5（热键冲突处理）与 F6（用户配置）已随 T9 收尾落地，表中状态已更新；遗留项收敛为 F1（窗口激活闪烁反馈）、F2（全屏应用降级）、F3（托盘图标）、F4（管理员权限窗口兼容）。
+
+## D19：角标置顶可选化——新增 `badge_always_top` 设置（2026-08-30）
+
+- **问题**：覆盖层自创建起即带 `WS_EX_TOPMOST`（`overlay.rs` 创建 ex-style），且 `sync_position` 每次同步（事件驱动 + 500ms 兜底轮询）用 `SetWindowPos(HWND_TOPMOST)` 重申置顶（D14 修复角标被遮挡时引入）。置顶带意味着角标浮在**所有**窗口之上，而非仅目标窗口之上——标记窗口一多，被其他窗口盖住的那些目标的角标仍然悬浮在最上层，屏幕上到处都是标志，用户不可控。
+- **决策**：新增设置项"角标始终置顶"（R19，`Settings.badge_always_top`，缺省 `true` 保持现状，旧配置缺字段经 serde default 回退为置顶）：
+  1. **关闭后的 z 序方案**：`sync_position` 改用 **insert-after**——`SetWindowPos` 的 `hWndInsertAfter` 传目标窗口句柄而非 `HWND_TOPMOST`，把覆盖层插到目标窗口正上方一格。目标被其他窗口盖住时角标随之被遮挡；目标重新激活时 z 序自然回到目标之上。创建时的 ex-style 同步按开关拼接 `WS_EX_TOPMOST`；tooltip 窗口（悬停标题/备注）跟随同一开关，关闭时插到角标窗口正上方（盖住角标本体但非全局置顶）。
+  2. **注入链路**（完全镜像 `show_badge_title`/`SHOW_TITLE`）：`sys::overlay::set_badge_always_top(AtomicBool)` 由主线程启动时与 `reapply_theme`（设置保存广播 `WM_APP_THEME_CHANGED` 后）注入；`reapply_theme` 同时对 `OVERLAY_STORE` 中所有已存在覆盖层执行 `refresh()` + `sync_position()`，设置切换即时生效（否则需等下一次位置事件或 500ms 轮询才收敛）。
+  3. **设置页**：新增 `BS_AUTOCHECKBOX`"角标始终置顶"（IDC_TOP_CHECK，复用 R6 复选框行距），保存/回显与标题显示开关同路径。
+- **备选方案**：
+  1. 关闭时移除 `WS_EX_TOPMOST` 后不再重申置顶（否决：普通窗口激活时天然盖过覆盖层，角标极易被目标自身激活压住而"消失"，重蹈 D14 修复前的缺陷）；
+  2. 关闭时隐藏被遮挡的角标（否决：需要逐帧遮挡检测，复杂且行为不可预期；insert-after 由窗口管理器原生维护 z 序，零额外成本）。
+- **教训**：D14 的"每次同步重申置顶"修复了本程序内部的遮挡问题，但把副作用（全局置顶带）当成了唯一正确行为；需求评审时应区分"z 序相对目标正确"与"全局最高"两个目标。
+
+---
+
+## D20：修复 `badge_always_top` 关闭后角标被目标窗口自身挡住（2026-08-31）
+
+- **问题**：取消"角标始终置顶"后，角标被目标窗口**自身**挡住（不可见）；在 `WM_CREATE_OVERLAY` 创建后立即补调 `sync_position()` 的修复无效。
+- **根因**：
+  1. **`SetWindowPos` 的 `hWndInsertAfter` 方向用反了**——其语义是"被移动窗口跟在它**之后（背后）**"（MSDN：`hWndInsertAfter` = "The window to precede the positioned window in the Z order"；`HWND_BOTTOM` 备注亦出现 "after any non-topmost window"）。旧代码把**目标窗口句柄**传作 `insert_after`，于是覆盖层被排到目标背后，角标即被目标自身遮挡。创建后补调的 `sync_position()` 因为执行的正是这个错误重排，所以不生效（甚至因新窗口原本在带顶反而更快被压下去）。
+  2. **z 带不匹配**：覆盖层的 `WS_EX_TOPMOST` 只在**创建时**按当时开关拼接，开关来回切换不会更新已有覆盖层的样式。跟随模式下非 topmost 覆盖层永远进不了 topmost 带（按带边界钳制），被压到非 topmost 带顶端、恰好落在目标之下。
+  3. **陈旧样式残留**：`reapply_theme` 切换开关时只调 `sync_position()`，**从不移除**已存在覆盖层遗留的 `WS_EX_TOPMOST`，导致取消置顶后角标仍悬浮最上层（置顶未真正关闭），或随目标 z 带错乱被遮挡。
+- **修正**（`sys/overlay.rs`）：`sync_position` 的"跟随目标"分支改为两步——① 先按目标窗口的 topmost 状态**对齐覆盖层 z 带**（目标 topmost 则补设 `HWND_TOPMOST`，否则用 `HWND_NOTOPMOST` 清掉残留样式）；② 把插入点改为目标**前邻窗口** `GetWindow(target, GW_HWNDPREV)`（返回 NULL/失败 → `HWND_TOP`，即目标处于带顶时置于带顶），从而把覆盖层插到目标**正前方一格**。tooltip 使用同一逻辑（对齐到角标窗口带位 + 插到角标前邻），统一修复同类"被角标挡在背后"的缺陷。置顶模式（`HWND_TOPMOST`）行为不变。
+- **实现中遇到的 bug**：
+  1. windows-rs 0.58 的 `GetWindow` 返回 `Result<HWND, Error>` 而非裸 `HWND`，且前置窗口不存在时值域为 NULL；用 `.ok().filter(|h| !h.0.is_null()).unwrap_or(HWND_TOP)` 兜底（`HWND_TOP` 即 NULL）。
+  2. clippy `-D warnings` 报 `let_and_return`：块尾应返回表达式，勿先 `let` 再返回。
+  3. tooltip 插入代码位于已存在的 `unsafe` 块内，内层再包 `unsafe` 触发 `unused_unsafe` 警告，需移除冗余嵌套；新增 `SWP_NOMOVE` 导入。
+- **验证**：`cargo build` / `cargo clippy -- -D warnings` / `cargo fmt -- --check` 全部通过；`cargo test` 67 用例（37 单元 + 30 冒烟）全绿。
+
+---

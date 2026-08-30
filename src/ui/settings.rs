@@ -47,6 +47,7 @@ use crate::ui::theme::{
 const IDC_THEME_COMBO: i32 = 201;
 const IDC_CORNER_COMBO: i32 = 202;
 const IDC_TITLE_CHECK: i32 = 203;
+const IDC_TOP_CHECK: i32 = 204;
 const IDC_SAVE_BUTTON: i32 = 205;
 const IDC_CANCEL_BUTTON: i32 = 206;
 
@@ -85,6 +86,8 @@ pub struct SettingsData {
     pub corner_edit: HWND,
     /// "角标显示标题"复选框句柄（`WM_CREATE` 后有效，R6）
     pub title_check: HWND,
+    /// "角标始终置顶"复选框句柄（`WM_CREATE` 后有效，R19）
+    pub top_check: HWND,
 }
 
 /// 创建设置窗口（初始隐藏）
@@ -245,6 +248,7 @@ extern "system" fn settings_wndproc(
             let row1_y = m + dp(hwnd, 8);
             let row2_y = row1_y + ctrl_h + dp(hwnd, ROW_GAP);
             let row3_y = row2_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
+            let row4_y = row3_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
             let combo_x = m + label_w;
             let combo_w = WIN_W - m - combo_x;
             let client_h = WIN_H - dp(hwnd, 30);
@@ -427,6 +431,32 @@ extern "system" fn settings_wndproc(
                 }
             };
 
+            // —— 角标始终置顶复选框（R19：关闭后角标跟随目标窗口 z 序）——
+            // SAFETY: 创建 AUTOCHECKBOX 子控件（ID = IDC_TOP_CHECK）；
+            // 失败时返回默认句柄并打印告警，保存时按未勾选处理。
+            let top_check = match unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("BUTTON"),
+                    windows::core::w!("角标始终置顶"),
+                    check_style,
+                    combo_x,
+                    row4_y,
+                    combo_w,
+                    ctrl_h,
+                    hwnd,
+                    HMENU(IDC_TOP_CHECK as *mut c_void),
+                    instance,
+                    None,
+                )
+            } {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("创建置顶复选框失败: {e}");
+                    HWND::default()
+                }
+            };
+
             // —— 按钮行：右下 保存（accent）/取消（次要），自绘（9.4/9.8）——
             // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略。
             let _ = button::create_button(
@@ -457,6 +487,7 @@ extern "system" fn settings_wndproc(
                 (*data).theme_combo = theme_combo;
                 (*data).corner_combo = corner_combo;
                 (*data).title_check = title_check;
+                (*data).top_check = top_check;
             }
 
             // 全局消息字体注入所有子控件（STATIC/COMBOBOX；按钮自绘时选用 message_font）
@@ -840,6 +871,16 @@ fn refresh_selections(hwnd: HWND) {
             }),
             LPARAM(0),
         );
+        let _ = SendMessageW(
+            (*data).top_check,
+            BM_SETCHECK,
+            WPARAM(if current.badge_always_top {
+                BST_CHECKED.0 as usize
+            } else {
+                BST_UNCHECKED.0 as usize
+            }),
+            LPARAM(0),
+        );
     }
 }
 
@@ -868,10 +909,13 @@ fn save_and_hide(hwnd: HWND) {
     let corner_idx = unsafe { SendMessageW(pd.corner_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
     let show_title = unsafe { SendMessageW(pd.title_check, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0
         == BST_CHECKED.0 as isize;
+    let badge_top = unsafe { SendMessageW(pd.top_check, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0
+        == BST_CHECKED.0 as isize;
     let new_settings = Settings {
         theme: theme_from_index(theme_idx as i32),
         corner: corner_from_index(corner_idx as i32),
         show_badge_title: show_title,
+        badge_always_top: badge_top,
     };
 
     // 更新内存中的设置并写盘（锁中毒时跳过，避免 panic 传播）

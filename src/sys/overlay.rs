@@ -17,12 +17,14 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, PostMessageW, RegisterClassW,
-    SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic,
+    IsWindowVisible, PostMessageW, RegisterClassW, SetWindowPos, ShowWindow, UpdateLayeredWindow,
+    CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE, GW_HWNDPREV, HTCLIENT, HTTRANSPARENT, HWND_NOTOPMOST,
+    HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, ULW_ALPHA,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 use super::badge::{render_badge, render_rounded_rect, truncate_title, BadgeParams};
@@ -62,6 +64,27 @@ static SHOW_TITLE: AtomicBool = AtomicBool::new(true);
 /// 注入标题条显示开关（R6：设置页"角标显示标题"）
 pub fn set_show_title(enabled: bool) {
     SHOW_TITLE.store(enabled, Ordering::Relaxed);
+}
+
+/// 角标始终置顶开关（R19 设置项 `badge_always_top` 的 sys 层注入镜像）
+///
+/// 开启（默认）：覆盖层带 `WS_EX_TOPMOST` 且每次同步重申 `HWND_TOPMOST`，
+/// 浮在所有窗口之上（含被其他窗口盖住的目标窗口）。
+/// 关闭：覆盖层跟随目标窗口 z 序——`sync_position` 改用
+/// "插到目标窗口正上方一格"（insert-after）的方式重排，被其他窗口盖住时
+/// 随目标一起被遮挡，不再悬浮在最上层。
+/// 由主线程经 [`set_badge_always_top`] 注入（启动时 + 设置保存广播后），
+/// 与 [`SHOW_TITLE`] 相同的依赖方向约束（ui → core → sys）。
+static BADGE_ALWAYS_TOP: AtomicBool = AtomicBool::new(true);
+
+/// 注入角标始终置顶开关（R19：设置页"角标始终置顶"）
+pub fn set_badge_always_top(enabled: bool) {
+    BADGE_ALWAYS_TOP.store(enabled, Ordering::Relaxed);
+}
+
+/// 返回角标是否始终置顶（供 tooltip 创建与同步逻辑共用）
+fn badge_always_top() -> bool {
+    BADGE_ALWAYS_TOP.load(Ordering::Relaxed)
 }
 
 /// 注入的隐藏窗口句柄（消息中转目标）
@@ -225,9 +248,15 @@ impl Overlay {
             anyhow::bail!("目标窗口尺寸无效: {}x{}", width, height);
         }
 
-        let ex_style = WINDOW_EX_STYLE(
-            WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0,
-        );
+        // R19：置顶开关闭时不带 WS_EX_TOPMOST（后续 sync_position 按目标窗口
+        // 重排 z 序；创建时开关可能刚被主线程注入，此处以当前值拼接即可）
+        let topmost = if badge_always_top() {
+            WS_EX_TOPMOST.0
+        } else {
+            0
+        };
+        let ex_style =
+            WINDOW_EX_STYLE(WS_EX_LAYERED.0 | topmost | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
 
         // 覆盖层窗口只占角标区大小、贴在目标窗口左上角，而非铺满整个目标窗口。
         // 铺满目标窗口会吞掉其点击（`HTTRANSPARENT` 无法穿透其他进程窗口）；
@@ -297,7 +326,8 @@ impl Overlay {
     /// 可见性守卫：目标窗口最小化（`IsIconic`）或不可见（`!IsWindowVisible`）时
     /// **自动隐藏覆盖层**——这是 500ms 兜底轮询与事件丢失场景下的可见性校正路径，
     /// 确保目标最小化/隐藏后覆盖层不会悬浮残留；目标恢复可见后由 [`show`] 恢复。
-    /// 每次同步都执行 `SetWindowPos`（不按位置去重），顺带重申 `HWND_TOPMOST`，
+    /// 每次同步都执行 `SetWindowPos`（不按位置去重）并重排 z 序：
+    /// 始终置顶模式重申 `HWND_TOPMOST`，跟随目标模式插到目标窗口正上方一格，
     /// 保证覆盖层 z 序永远压在目标窗口之上。
     pub fn sync_position(&self) -> Result<()> {
         // SAFETY: self.target_hwnd 由本 Overlay 持有且窗口存活；IsIconic/IsWindowVisible
@@ -336,17 +366,68 @@ impl Overlay {
         }
 
         // 覆盖层窗口仅跟随目标窗口左上角位置；尺寸由绘制自适应（SWP_NOSIZE）。
-        // 每次同步都执行 SetWindowPos（含重申 HWND_TOPMOST）：若按位置去重早退，
-        // 目标窗口被激活压住覆盖层（同属 topmost 带时后者在前）后 z 序永远无法
-        // 恢复，角标就此被遮挡不再显示。事件合并（win_event.rs）+ 500ms 轮询
-        // 已节制调用频率，单次 SetWindowPos 开销可忽略。
+        // 每次同步都执行 SetWindowPos：若按位置去重早退，目标窗口被激活压住
+        // 覆盖层（同属 topmost 带时后者在前）后 z 序永远无法恢复，角标就此
+        // 被遮挡不再显示。事件合并（win_event.rs）+ 500ms 轮询已节制调用频率，
+        // 单次 SetWindowPos 开销可忽略。
+        // z 序（R19）：
+        // - 始终置顶（默认）：insertAfter = HWND_TOPMOST，每次同步重申置顶；
+        // - 跟随目标：与目标窗口同一 z 带、插到目标**正前方一格**。
+        //
+        // 注意 SetWindowPos 的 hWndInsertAfter 语义是「被移动窗口跟在它之后（背后）」，
+        // 所以「插到目标正上方」必须把 hWndInsertAfter 设为目标的前邻窗口
+        // （GW_HWNDPREV），而非目标本身——否则会把覆盖层排到目标背后、被目标自身挡住。
+        // 目标前邻为 NULL（目标处于其 z 带顶端）时用 HWND_TOP（== NULL，置于带顶）。
+        //
+        // 带位一致性：创建时的 WS_EX_TOPMOST 仅按当时开关拼接，置顶开关来回切换不会
+        // 改动已有覆盖层的样式；这里按「目标是否 topmost」对齐覆盖层带位，既保证
+        // 「跟随目标」语义（目标被其他窗口盖住时角标随之被遮挡），也避免表头遗留的
+        // topmost 样式让角标在取消置顶后仍悬浮最上层。
+        let target_topmost = unsafe {
+            (GetWindowLongPtrW(self.target_hwnd, GWL_EXSTYLE) as isize & WS_EX_TOPMOST.0 as isize)
+                != 0
+        };
+        let want_topmost = badge_always_top() || target_topmost;
+        let overlay_topmost = unsafe {
+            (GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as isize & WS_EX_TOPMOST.0 as isize) != 0
+        };
+        if want_topmost != overlay_topmost {
+            // 切换 z 带（不改位置/尺寸）：HWND_TOPMOST / HWND_NOTOPMOST 自动置/清
+            // WS_EX_TOPMOST 并在带内排序。失败忽略，下次同步会重试。
+            // SAFETY: self.hwnd 由本 Overlay 独占持有且存活；SWP_NOMOVE|SWP_NOSIZE 仅动 z 序。
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    if want_topmost {
+                        HWND_TOPMOST
+                    } else {
+                        HWND_NOTOPMOST
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+        let insert_after = if badge_always_top() {
+            HWND_TOPMOST
+        } else {
+            // SAFETY: self.target_hwnd 由本 Overlay 持有且窗口存活；GetWindow 为只读
+            // z 序查询，失败（Err/返回 NULL）时用 HWND_TOP 兜底（置于其带顶）。
+            unsafe { GetWindow(self.target_hwnd, GW_HWNDPREV) }
+                .ok()
+                .filter(|h| !h.0.is_null())
+                .unwrap_or(HWND_TOP)
+        };
         // SAFETY: self.hwnd 与 self.target_hwnd 由本 Overlay 持有且窗口存活；
-        // SetWindowPos 仅调整位置并重申置顶（SWP_NOSIZE 保留绘制自适应尺寸），
+        // SetWindowPos 仅调整位置并重排 z 序（SWP_NOSIZE 保留绘制自适应尺寸），
         // 失败忽略（下次同步会重试）。
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
-                HWND_TOPMOST,
+                insert_after,
                 rect.left,
                 rect.top,
                 0,
@@ -1054,7 +1135,15 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
 
     ensure_tooltip_class();
 
-    let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
+    // R19：tooltip 的 z 序跟随角标开关——置顶模式保持 TOPMOST（悬停信息
+    // 永远可见）；跟随目标模式不带 TOPMOST，插到角标窗口正上方一格，
+    // 保证至少盖住角标本体，同时随目标窗口一起被其他窗口遮挡。
+    let topmost_ex = if badge_always_top() {
+        WS_EX_TOPMOST.0
+    } else {
+        0
+    };
+    let ex_style = WINDOW_EX_STYLE(topmost_ex | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
     let style = WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0);
     // 分层排版：标题与备注以 \n 分隔，tooltip_wndproc 分别绘制（标题加粗）
     let text = if note.is_empty() {
@@ -1155,9 +1244,49 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
                     }
                 }
             }
+            // z 序与创建时 ex_style 一致（R19）：置顶 → TOPMOST；跟随目标 →
+            // 工具提示应盖住角标本体（而非被它挡在背后），故「插到角标窗口
+            // 正上方」须以角标前邻窗口（GW_HWNDPREV）为插入点；并把 tooltip 的
+            // z 带对齐到角标窗口（跟随模式下角标可能随顶部目标位于 topmost 带，
+            // 非 topmost 的 tooltip 进不了同带）。与 sync_position 的带位对齐逻辑一致。
+            let overlay_topmost = {
+                (GetWindowLongPtrW(overlay_hwnd, GWL_EXSTYLE) as isize & WS_EX_TOPMOST.0 as isize)
+                    != 0
+            };
+            let want_topmost = badge_always_top() || overlay_topmost;
+            let tooltip_topmost = {
+                (GetWindowLongPtrW(tooltip_hwnd, GWL_EXSTYLE) as isize & WS_EX_TOPMOST.0 as isize)
+                    != 0
+            };
+            if want_topmost != tooltip_topmost {
+                // 切换 tooltip z 带（仅 z 序，不动位置/尺寸）。
+                // tooltip_hwnd 为刚创建且存活的窗口；SWP_NOMOVE|SWP_NOSIZE
+                // 仅调整带位，失败忽略（悬停为临时窗口，下次悬停会重建）。
+                let _ = SetWindowPos(
+                    tooltip_hwnd,
+                    if want_topmost {
+                        HWND_TOPMOST
+                    } else {
+                        HWND_NOTOPMOST
+                    },
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+            let insert_after = if badge_always_top() {
+                HWND_TOPMOST
+            } else {
+                GetWindow(overlay_hwnd, GW_HWNDPREV)
+                    .ok()
+                    .filter(|h| !h.0.is_null())
+                    .unwrap_or(HWND_TOP)
+            };
             let _ = SetWindowPos(
                 tooltip_hwnd,
-                HWND_TOPMOST,
+                insert_after,
                 tx,
                 ty,
                 win_w,

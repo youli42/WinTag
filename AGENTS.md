@@ -40,12 +40,12 @@ src/
 │   ├── mod.rs
 │   ├── window.rs    # 窗口检测、句柄捕获、事件监听
 │   ├── badge.rs     # 角标/标题条软件光栅渲染纯函数（SDF 圆边三角形 + 圆角矩形 + 标题截断，D11/D12）
-│   └── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha，BGRA 字节序，D17；D12 起含可选圆角标题条，开关经 set_show_title 注入；D14 首绘异步化 + 每次同步重申置顶；D16 单击经 WM_APP_EDIT_TAG 请求编辑；D18 tooltip 分字体 DT_CALCRECT 量测、DrawTextW 返回值推进备注行）
+│   └── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha，BGRA 字节序，D17；D12 起含可选圆角标题条，开关经 set_show_title 注入；D14 首绘异步化 + 每次同步重申置顶；D16 单击经 WM_APP_EDIT_TAG 请求编辑；D18 tooltip 分字体 DT_CALCRECT 量测、DrawTextW 返回值推进备注行；D19 置顶可选化——badge_always_top 关闭时 insert-after 目标窗口跟随其 z 序；D20 修正——SetWindowPos 的 hWndInsertAfter 会把窗口排到其背后，须插到目标前邻 GW_HWNDPREV + 对齐 z 带，tooltip 同逻辑）
 ├── core/            # 核心数据管理层
 │   ├── mod.rs
 │   ├── tag.rs       # 标签数据结构定义（内存中，无持久化）
 │   ├── matcher.rs   # 窗口句柄匹配逻辑
-│   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml；含 show_badge_title，R6）
+│   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml；含 show_badge_title，R6；badge_always_top，R19/D19）
 ├── ui/              # 用户界面层
 │   ├── mod.rs
 │   ├── panel.rs     # 全局概览面板（DarkMode_Explorer；D12 改 SysTreeView32 可展开树形列表 + 单击置前目标窗口；D13 标签变更自动刷新 WM_APP_TAGS_CHANGED + MIN_W 300；D14 默认纵向 400×640）；D15 根项「标题 | 窗口名称」同行、展开显示完整多行备注
@@ -53,7 +53,7 @@ src/
 │   ├── button.rs    # 自绘圆角按钮模块（BS_OWNERDRAW + WM_DRAWITEM，D11）
 │   ├── layout.rs    # DPI 缩放辅助（dp()，D11）
 │   ├── theme.rs     # 暗色主题与圆角 + 全局字体 + 扩展调色板（DWM + WM_CTLCOLOR + lfMessageFont，D11；统一主题管理器 sync_window_theme/apply_control_theme + 下拉框 DarkMode_Explorer 变体，D17）
-│   └── settings.rs  # 设置页面窗口（主题/圆角选择、角标显示标题开关、保存、WM_APP_THEME_CHANGED 广播；下拉框 CBS_OWNERDRAWFIXED 自绘 + WM_CTLCOLOR* 以 wParam 为 HDC，D18）
+│   └── settings.rs  # 设置页面窗口（主题/圆角选择、角标显示标题开关、保存、WM_APP_THEME_CHANGED 广播；下拉框 CBS_OWNERDRAWFIXED 自绘 + WM_CTLCOLOR* 以 wParam 为 HDC，D18；角标始终置顶开关，D19）
 └── hotkey.rs        # 全局热键注册
 tests/
 └── smoke.rs         # 冒烟测试（30 个用例）

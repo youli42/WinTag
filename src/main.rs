@@ -96,6 +96,7 @@ fn main() -> anyhow::Result<()> {
     // reapply_theme 在设置保存广播后重新注入，新内容即时采用新配色/开关）
     sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
     sys::overlay::set_show_title(cfg.show_badge_title);
+    sys::overlay::set_badge_always_top(cfg.badge_always_top);
 
     // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）
     let settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
@@ -107,6 +108,7 @@ fn main() -> anyhow::Result<()> {
         theme_edit: HWND::default(),
         corner_edit: HWND::default(),
         title_check: HWND::default(),
+        top_check: HWND::default(),
     });
     if settings_hwnd == HWND::default() {
         eprintln!("[设置] 设置窗口创建失败，热键仍可用（打开时自动重试创建）");
@@ -267,6 +269,12 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     // 的 refresh() 恢复路径一致）：确保首次 UpdateLayeredWindow
                                     // 内容生效，角标立即可见。
                                     overlay.refresh();
+                                    // 立即建立 z 序：覆盖层带 WS_EX_TOPMOST 但未调用
+                                    // sync_position 时，若目标窗口同属 topmost 带且被激活，
+                                    // 会压住覆盖层导致角标被遮挡。此处重申 HWND_TOPMOST（或
+                                    // insert-after 目标窗口）消除创建后到首次事件/轮询间
+                                    // 的 z 序空窗期。
+                                    let _ = overlay.sync_position();
                                     v.insert(overlay);
                                     println!("[覆盖层] 创建成功: HWND={}", target_hwnd);
                                 }
@@ -573,6 +581,7 @@ fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
         theme_edit: HWND::default(),
         corner_edit: HWND::default(),
         title_check: HWND::default(),
+        top_check: HWND::default(),
     })
 }
 
@@ -637,10 +646,14 @@ fn reapply_theme(hidden_hwnd: HWND) {
     // 重新注入标题条显示开关（R6），并强制所有已存在的覆盖层重绘：
     // 主题切换后角标描边色 / 标题条配色即时更新，开关切换即时生效。
     sys::overlay::set_show_title(cfg.show_badge_title);
+    // R19：角标置顶开关注入，并对已存在的覆盖层立刻重排 z 序（新覆盖层
+    // 创建时读取开关，旧覆盖层依赖事件/500ms 轮询也会自行收敛，此处即时生效）
+    sys::overlay::set_badge_always_top(cfg.badge_always_top);
     if let Some(store) = OVERLAY_STORE.get() {
         if let Ok(overlays) = store.lock() {
             for overlay in overlays.values() {
                 overlay.refresh();
+                let _ = overlay.sync_position();
             }
         }
     }
