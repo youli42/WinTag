@@ -25,11 +25,14 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, HGDIOBJ, NULL_PEN, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODT_BUTTON};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetClassLongPtrW, GetWindowTextW, SetWindowLongPtrW, BS_OWNERDRAW,
-    GCLP_WNDPROC, GWLP_WNDPROC, HMENU, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETFOCUS, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+    CreateWindowExW, GetClassLongPtrW, GetParent, GetWindowTextW, PostMessageW, SetWindowLongPtrW,
+    BS_OWNERDRAW, GCLP_WNDPROC, GWLP_WNDPROC, HMENU, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_SETFOCUS, WS_CHILD,
+    WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::ui::theme::{blend, message_font, theme_colors};
@@ -354,6 +357,22 @@ unsafe extern "system" fn button_subclass_proc(
             // SAFETY: InvalidateRect 仅标记重绘区域。
             unsafe {
                 let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
+        WM_KEYDOWN => {
+            // Tab / Esc 转发父窗口（R7）：焦点落在按钮上时 Tab 继续流转、
+            // Esc 触发取消（父窗口 WM_KEYDOWN 统一处理）。标准 BUTTON 类
+            // 过程会吞掉这两个键，非对话框窗口下不转发则焦点卡死在按钮上。
+            let key = (wparam.0 & 0xFFFF) as u16;
+            if key == VK_TAB.0 || key == VK_ESCAPE.0 {
+                // SAFETY: GetParent 返回创建时指定的父窗口；PostMessageW 为线程
+                // 安全标准 API，异步投递避免在子控件窗口过程内连锁处理消息。
+                if let Ok(parent) = unsafe { GetParent(hwnd) } {
+                    unsafe {
+                        let _ = PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+                    }
+                }
+                return LRESULT(0);
             }
         }
         WM_NCDESTROY => {

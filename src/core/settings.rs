@@ -51,6 +51,13 @@ impl CornerPreference {
     }
 }
 
+/// 返回 `true`（供 `show_badge_title` 的 serde 缺省值使用）
+///
+/// 旧版 config.toml 缺少该字段时按"显示标题"回退（R6 默认行为）。
+fn default_true() -> bool {
+    true
+}
+
 /// 应用设置（内存中配置数据模型，可序列化为 TOML）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
@@ -58,14 +65,18 @@ pub struct Settings {
     pub theme: ThemeMode,
     /// 窗口圆角偏好
     pub corner: CornerPreference,
+    /// 角标上是否显示标题文字（R6；缺省 true，旧配置文件缺字段时按显示回退）
+    #[serde(default = "default_true")]
+    pub show_badge_title: bool,
 }
 
 impl Default for Settings {
-    /// 默认配置：跟随系统主题 + 默认圆角
+    /// 默认配置：跟随系统主题 + 默认圆角 + 角标显示标题
     fn default() -> Self {
         Settings {
             theme: ThemeMode::System,
             corner: CornerPreference::Default,
+            show_badge_title: true,
         }
     }
 }
@@ -156,6 +167,7 @@ mod tests {
             let cfg = Settings {
                 theme,
                 corner: CornerPreference::Default,
+                show_badge_title: true,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -169,6 +181,7 @@ mod tests {
             let cfg = Settings {
                 theme: ThemeMode::System,
                 corner,
+                show_badge_title: false,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -178,21 +191,23 @@ mod tests {
         let cfg = Settings {
             theme: ThemeMode::Dark,
             corner: CornerPreference::Round,
+            show_badge_title: false,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: Settings = toml::from_str(&s).unwrap();
         assert_eq!(back, cfg);
     }
 
-    /// 测试 (b)：Default 值正确（theme=System, corner=Default）
+    /// 测试 (b)：Default 值正确（theme=System, corner=Default, show_badge_title=true）
     #[test]
     fn test_default_values() {
         let d = Settings::default();
         assert_eq!(d.theme, ThemeMode::System);
         assert_eq!(d.corner, CornerPreference::Default);
+        assert!(d.show_badge_title);
     }
 
-    /// 测试 (c)：损坏/缺字段/空内容均解析失败 → load 走默认回退路径
+    /// 测试 (c)：损坏/缺必需字段/空内容均解析失败 → load 走默认回退路径
     #[test]
     fn test_parse_corrupt_fallback() {
         assert!(parse_str("this is not toml {{{").is_err());
@@ -200,6 +215,16 @@ mod tests {
         assert!(parse_str("theme = \"Dark\"").is_err());
         // 空内容也解析失败（结构体字段无缺省值）
         assert!(parse_str("").is_err());
+    }
+
+    /// 测试 (c2)：旧版配置缺 show_badge_title 字段可解析，回退 true（R6 兼容）
+    #[test]
+    fn test_parse_legacy_config_missing_show_badge_title() {
+        let legacy = "theme = \"Dark\"\ncorner = \"Round\"\n";
+        let parsed: Settings = parse_str(legacy).unwrap();
+        assert_eq!(parsed.theme, ThemeMode::Dark);
+        assert_eq!(parsed.corner, CornerPreference::Round);
+        assert!(parsed.show_badge_title, "缺省字段应回退为显示标题");
     }
 
     /// 测试 (d)：save→load 往返 —— 写入临时路径，验证文件内容含枚举关键值并可读回
@@ -211,6 +236,7 @@ mod tests {
         let cfg = Settings {
             theme: ThemeMode::Dark,
             corner: CornerPreference::SmallRound,
+            show_badge_title: true,
         };
         cfg.save_to(&path).unwrap();
 

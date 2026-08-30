@@ -27,3 +27,5 @@ Desktop.ini
 
 # AI 
 /.omo/**/*
+# AI 会话缓存
+.zcode/

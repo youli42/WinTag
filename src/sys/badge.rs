@@ -148,6 +148,92 @@ pub fn render_badge(params: BadgeParams) -> Vec<u8> {
     buf
 }
 
+/// 截断标题为最多 `max_chars` 个字符，超出部分以省略号结尾（纯函数）
+///
+/// 按 Unicode 字符（`char`）计数，中文与英文等价对待；不足 `max_chars`
+/// 时原样返回克隆。供覆盖层标题条显示截断使用（需求：默认显示 5 个字，
+/// 多的用省略号表示）。
+pub fn truncate_title(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+/// 渲染圆角矩形为预乘 RGBA 字节缓冲（纯函数，SDF 抗锯齿）
+///
+/// `width`/`height` 为矩形逻辑像素尺寸，`radius` 为四角圆角半径
+/// （自动夹取到不超过宽高一半）；`fill` 为填充色，`stroke` 为 1px
+/// 边界描边混色。与 [`render_badge`] 同款：逐像素计算到圆角矩形边界
+/// 的符号距离，边界 1px 过渡带实现抗锯齿。
+///
+/// 返回 `width * height * 4` 字节的预乘 RGBA 缓冲（行优先、从上到下）。
+pub fn render_rounded_rect(
+    width: i32,
+    height: i32,
+    radius: i32,
+    fill: [u8; 4],
+    stroke: [u8; 4],
+) -> Vec<u8> {
+    let w = width.max(0) as usize;
+    let h = height.max(0) as usize;
+    let mut buf = vec![0u8; w * h * 4];
+    if w == 0 || h == 0 {
+        return buf;
+    }
+
+    let fw = width as f32;
+    let fh = height as f32;
+    // 圆角半径夹取：不超过宽高一半
+    let r = (radius as f32).clamp(0.0, fw.min(fh) / 2.0);
+    let half_w = fw / 2.0;
+    let half_h = fh / 2.0;
+    let inner_w = half_w - r;
+    let inner_h = half_h - r;
+
+    for y in 0..h {
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            // 标准 round-box SDF：q 为超出内接矩形的分量，dist<0 在内部
+            let qx = (px - half_w).abs() - inner_w;
+            let qy = (py - half_h).abs() - inner_h;
+            let out_x = qx.max(0.0);
+            let out_y = qy.max(0.0);
+            let dist = (out_x * out_x + out_y * out_y).sqrt() + (qx.max(qy)).min(0.0) - r;
+
+            // 覆盖率：内部 1.0，边界 1px 过渡带线性衰减
+            let coverage = (1.0 - dist).clamp(0.0, 1.0);
+            if coverage <= 0.0 {
+                continue;
+            }
+
+            // 描边混色：距边界 1.5px 内侧向边界渐变混入 stroke 色
+            let stroke_mix = if dist < 0.0 && dist > -1.5 {
+                (dist + 1.5) / 1.5
+            } else if dist >= 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+
+            let idx = (y * w + x) * 4;
+            let r_ch = fill[0] as f32 * (1.0 - stroke_mix) + stroke[0] as f32 * stroke_mix;
+            let g_ch = fill[1] as f32 * (1.0 - stroke_mix) + stroke[1] as f32 * stroke_mix;
+            let b_ch = fill[2] as f32 * (1.0 - stroke_mix) + stroke[2] as f32 * stroke_mix;
+            let alpha = (coverage * 255.0).round() as u8;
+            let premul = coverage;
+            buf[idx] = (r_ch * premul) as u8;
+            buf[idx + 1] = (g_ch * premul) as u8;
+            buf[idx + 2] = (b_ch * premul) as u8;
+            buf[idx + 3] = alpha;
+        }
+    }
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +304,47 @@ mod tests {
             stroke: [0, 0, 0, 255],
         });
         assert_eq!(buf.len(), 18 * 18 * 4);
+    }
+
+    /// 截断：不超过上限原样返回；超出取前 N 字符 + 省略号
+    #[test]
+    fn truncate_title_limits_and_ellipsizes() {
+        assert_eq!(truncate_title("短", 5), "短");
+        assert_eq!(truncate_title("五字标题哦", 5), "五字标题哦");
+        assert_eq!(truncate_title("五字标题哦超出", 5), "五字标题哦…");
+        assert_eq!(truncate_title("abcdefgh", 5), "abcde…");
+        // 中文按字符计，不等同字节数
+        assert_eq!(truncate_title("窗口标题测试超长", 5), "窗口标题测…");
+        // 空串与 0 上限
+        assert_eq!(truncate_title("", 5), "");
+        assert_eq!(truncate_title("任意", 0), "…");
+    }
+
+    /// 圆角矩形：内部实心、外部透明、边界抗锯齿
+    #[test]
+    fn rounded_rect_interior_exterior_antialias() {
+        let buf = render_rounded_rect(60, 16, 8, [47, 47, 47, 255], [60, 60, 60, 255]);
+        let alpha_at = |x: usize, y: usize| buf[(y * 60 + x) * 4 + 3];
+        // 内部（远离边界）实心
+        assert!(alpha_at(30, 8) > 200);
+        // 外部透明
+        assert_eq!(alpha_at(0, 0), 0, "左上圆角外应为透明");
+        // 边界附近存在抗锯齿过渡带（圆角外的对角区域）
+        let corner = alpha_at(1, 1);
+        assert!(corner < 255, "圆角过渡带应部分覆盖");
+        // 缓冲长度
+        assert_eq!(buf.len(), 60 * 16 * 4);
+    }
+
+    /// 圆角矩形：size=0 / radius 夹取不 panic
+    #[test]
+    fn rounded_rect_edge_cases() {
+        assert!(render_rounded_rect(0, 10, 3, [0, 0, 0, 255], [0, 0, 0, 255]).is_empty());
+        assert!(render_rounded_rect(10, 0, 3, [0, 0, 0, 255], [0, 0, 0, 255]).is_empty());
+        // radius 超过宽高一半被夹取，不 panic 且产出合法缓冲
+        let buf = render_rounded_rect(20, 20, 99, [255, 0, 0, 255], [0, 0, 0, 255]);
+        assert_eq!(buf.len(), 20 * 20 * 4);
+        // 中心像素应实心（胶囊形状）
+        assert!(buf[(10 * 20 + 10) * 4 + 3] > 200);
     }
 }

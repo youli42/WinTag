@@ -1,25 +1,27 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{FillRect, ScreenToClient, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, CDDS_ITEMPREPAINT, CDRF_DODEFAULT, CDRF_NEWFONT, ICC_LISTVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_GETITEMW, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_HEADERDRAGDROP, LVS_REPORT, NMITEMACTIVATE, NMLVCUSTOMDRAW, NM_CUSTOMDRAW, NM_DBLCLK,
+    InitCommonControlsEx, HTREEITEM, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NM_CLICK,
+    NM_DBLCLK, TVE_EXPAND, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVHT_ONITEM,
+    TVHT_ONITEMBUTTON, TVIF_HANDLE, TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW,
+    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND,
+    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
+    TVM_SETTEXTCOLOR, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetDlgItem, GetWindowTextW, IsWindow,
-    RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP, MINMAXINFO, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, GetDlgItem, GetWindowTextW,
+    IsIconic, IsWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP,
+    MINMAXINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NOTIFY,
+    WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use crate::common::{get_userdata, set_userdata, widestring};
+use crate::common::{get_userdata, set_userdata, widestring, WM_APP_TAGS_CHANGED};
 use crate::core::settings::ThemeMode;
 use crate::core::tag::TagStore;
 use crate::ui::layout::dp;
@@ -32,9 +34,10 @@ const IDC_LIST_VIEW: i32 = 202;
 const MARGIN: i32 = 12;
 const SEARCH_H: i32 = 28;
 const SEARCH_GAP: i32 = 8;
-const WIN_W: i32 = 640;
-const WIN_H: i32 = 480;
-const MIN_W: i32 = 520;
+const WIN_W: i32 = 400;
+const WIN_H: i32 = 640;
+/// 最小宽度：列表宽度随窗口收缩仍可读，允许拖窄到紧凑列表形态
+const MIN_W: i32 = 300;
 const MIN_H: i32 = 360;
 
 /// 面板窗口的用户数据：标签存储引用与当前可见状态
@@ -84,7 +87,7 @@ pub fn create_panel(data: Arc<Mutex<TagStore>>) -> HWND {
     // 初始化通用控件
     let icc = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES,
+        dwICC: ICC_TREEVIEW_CLASSES,
     };
     // SAFETY: InitCommonControlsEx 使用栈上 INITCOMMONCONTROLSEX，调用期间有效；
     // 返回值忽略，控件类未加载时后续创建会失败并在对应分支打印告警。
@@ -191,16 +194,24 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 );
             }
 
-            // 列表视图
-            let lv_style = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | LVS_REPORT);
+            // 可展开树形列表：每个标签一个根项（lParam = 目标窗口句柄），
+            // 点击行首 [+] 展开显示备注/窗口/进程详情
+            let tree_style = WINDOW_STYLE(
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | TVS_HASBUTTONS
+                    | TVS_HASLINES
+                    | TVS_LINESATROOT
+                    | TVS_SHOWSELALWAYS,
+            );
             let list_view = unsafe {
-                // SAFETY: 创建 SysListView32 子控件（ID = IDC_LIST_VIEW），
-                // 样式为普通报表视图；失败时返回默认句柄并打印告警。
+                // SAFETY: 创建 SysTreeView32 子控件（ID = IDC_LIST_VIEW）；
+                // 失败时返回默认句柄并打印告警。
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
-                    windows::core::w!("SysListView32"),
+                    windows::core::w!("SysTreeView32"),
                     windows::core::w!(""),
-                    lv_style,
+                    tree_style,
                     m,
                     list_y,
                     // 初始尺寸由 WM_SIZE 校正
@@ -215,52 +226,20 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 )
             };
             let list_view = match list_view {
-                Ok(lv) => lv,
+                Ok(tv) => tv,
                 Err(e) => {
-                    eprintln!("创建列表视图失败: {e}");
+                    eprintln!("创建树形列表失败: {e}");
                     HWND::default()
                 }
             };
 
-            // 暗色时设 DarkMode_Explorer 主题（Win11：表头 SysHeader32 与滚动条随之暗化）；
-            // 亮色恢复 Explorer。需 comctl32 v6 manifest（build.rs 嵌入）才能生效。
-            apply_listview_theme(list_view, dark);
+            // 暗色时设 DarkMode_Explorer 主题（滚动条随之暗化）；亮色恢复 Explorer。
+            // 同时按主题调色板设置背景/文字/连线色。需 comctl32 v6 manifest
+            // （build.rs 嵌入）才能生效。
+            apply_tree_theme(list_view, dark);
 
-            // 整行选择 + 表头拖拽 + 双缓冲（消除拖动闪烁，问题 9.8）
-            // SAFETY: 向列表视图发送扩展样式消息，参数为编译期常量，无生命周期问题。
-            unsafe {
-                let _ = SendMessageW(
-                    list_view,
-                    LVM_SETEXTENDEDLISTVIEWSTYLE,
-                    WPARAM(0),
-                    LPARAM(
-                        (LVS_EX_FULLROWSELECT | LVS_EX_HEADERDRAGDROP | LVS_EX_DOUBLEBUFFER)
-                            as isize,
-                    ),
-                );
-            }
-
-            // 添加列
-            let columns = [("标题", 120), ("备注", 160), ("窗口", 160), ("进程", 100)];
-            for (i, (name, width)) in columns.iter().enumerate() {
-                let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-                let mut col = LVCOLUMNW {
-                    mask: LVCF_TEXT | LVCF_WIDTH,
-                    pszText: windows::core::PWSTR(wide.as_ptr() as *mut _),
-                    cx: *width,
-                    ..Default::default()
-                };
-                // SAFETY: col 与 wide 在 SendMessageW 调用期间存活，
-                // LVM_INSERTCOLUMNW 在消息返回前完成拷贝。
-                unsafe {
-                    let _ = SendMessageW(
-                        list_view,
-                        LVM_INSERTCOLUMNW,
-                        WPARAM(i),
-                        LPARAM(std::ptr::addr_of_mut!(col) as isize),
-                    );
-                }
-            }
+            // 首次填充树形列表
+            refresh_tree(hwnd);
 
             // 全局消息字体注入所有子控件（搜索框 + 列表视图）
             apply_font_to_children(hwnd);
@@ -293,25 +272,32 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
             if id == IDC_SEARCH_EDIT && code == EN_CHANGE {
-                refresh_list(hwnd);
+                refresh_tree(hwnd);
             }
 
             LRESULT(0)
         }
         WM_NOTIFY => {
-            // SAFETY: WM_NOTIFY 的 lParam 指向通知结构，所有通知结构首字段均为
-            // NMHDR，故先解引用 NMITEMACTIVATE 读取 hdr；按 hdr.code 分流：
-            // NM_DBLCLK → 双击跳转；NM_CUSTOMDRAW → 行级着色（问题 9.2/9.3）。
-            let nm = unsafe { &*(lparam.0 as *const NMITEMACTIVATE) };
-            match nm.hdr.code {
-                NM_DBLCLK if nm.hdr.idFrom == IDC_LIST_VIEW as usize => {
-                    handle_list_dblclk(hwnd, nm.iItem);
+            // SAFETY: WM_NOTIFY 的 lParam 指向通知结构，NM_CLICK/NM_DBLCLK 首字段均为
+            // NMHDR，故按 NMHDR 读取 code/idFrom 分流；单击/双击根项 → 置前对应窗口。
+            let nm = unsafe { &*(lparam.0 as *const NMHDR) };
+            if nm.idFrom == IDC_LIST_VIEW as usize {
+                match nm.code {
+                    NM_CLICK => handle_tree_click(hwnd),
+                    NM_DBLCLK => {
+                        handle_tree_click(hwnd);
+                        // 返回非 0：抑制树视图双击默认的展开/收起切换
+                        return LRESULT(1);
+                    }
+                    _ => {}
                 }
-                NM_CUSTOMDRAW if nm.hdr.idFrom == IDC_LIST_VIEW as usize => {
-                    return handle_list_customdraw(lparam);
-                }
-                _ => {}
             }
+            LRESULT(0)
+        }
+        WM_APP_TAGS_CHANGED => {
+            // 便签弹窗保存标签后广播（经主线程转发）：刷新树形列表，
+            // 保留已展开根项的状态，避免自动刷新打断用户的展开浏览
+            refresh_tree(hwnd);
             LRESULT(0)
         }
         // WM_CTLCOLOR*：子控件（搜索框 EDIT / SysListView32 列表区 / 静态文本）
@@ -380,15 +366,13 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
 /// 处理 `WM_CTLCOLOR*` 消息：按主题调色板为子控件设置文字色与背景色
 ///
-/// - `WM_CTLCOLORLISTBOX`：SysListView32 的列表区背景（ListView 向其父窗口发送）；
 /// - `WM_CTLCOLOREDIT`：搜索框（EDIT）背景；
-/// - `WM_CTLCOLORSTATIC`：静态文本背景。
+/// - `WM_CTLCOLORSTATIC`：静态文本背景；
+/// - `WM_CTLCOLORLISTBOX`：兼容保留（旧列表视图分支，树形列表改用
+///   `TVM_SETBKCOLOR` 着色，不再发送此消息）。
 ///
 /// 颜色取自 [`crate::ui::theme::theme_colors`]；主题状态未初始化（返回 `None`）时
 /// 回退 [`DefWindowProcW`] 走系统默认配色。
-///
-/// 已知局限：表头（SysHeader32）的颜色不通过 `WM_CTLCOLOR` 系列消息传递，
-/// 无法在此完全控制，接受系统默认外观。
 fn handle_ctlcolor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // 主题状态未初始化（从未调用 set_theme）时回退系统默认绘制
     let Some(colors) = crate::ui::theme::theme_colors() else {
@@ -465,12 +449,13 @@ fn layout_children(hwnd: HWND, width: i32, height: i32) {
     }
 }
 
-/// 设置 ListView 的视觉主题（问题 9.2/9.3/9.5）
+/// 设置树形列表的视觉主题与配色（问题 9.2/9.3/9.5 的树形版）
 ///
-/// 暗色时设 `DarkMode_Explorer`：SysHeader32 表头与滚动条随之暗化
-/// （Win11 必然生效，Win10 1809+ 生效，更旧降级为 WM_CTLCOLOR 行为，
-/// 不撕裂）。亮色恢复 `Explorer`。需 comctl32 v6 manifest 才能生效。
-fn apply_listview_theme(list_view: HWND, dark: bool) {
+/// 暗色时设 `DarkMode_Explorer`：滚动条与展开按钮随之暗化（Win11 必然生效，
+/// Win10 1809+ 生效，更旧降级为纯配色，不撕裂）；亮色恢复 `Explorer`。
+/// 同时按主题调色板设置背景 / 文字 / 连线色（替代 ListView 的 NM_CUSTOMDRAW
+/// 行级着色：树形列表统一背景 + 选中高亮）。需 comctl32 v6 manifest 才能生效。
+fn apply_tree_theme(list_view: HWND, dark: bool) {
     let theme = if dark {
         widestring("DarkMode_Explorer")
     } else {
@@ -485,53 +470,35 @@ fn apply_listview_theme(list_view: HWND, dark: bool) {
             PCWSTR::null(),
         );
     }
-}
-
-/// 处理 ListView 自定义绘制（NM_CUSTOMDRAW，问题 9.2/9.3）
-///
-/// 按主题调色板为列表行着色：
-/// - 奇偶行交替底色（listview_bg / listview_alt_bg）；
-/// - 选中行用 selected 色；
-/// - 文字统一 listview_fg；
-/// - 返回 CDRF_NEWFONT 告知使用新字体（配合双缓冲消除闪烁）。
-fn handle_list_customdraw(lparam: LPARAM) -> LRESULT {
-    // SAFETY: NM_CUSTOMDRAW 的 lParam 指向 NMLVCUSTOMDRAW，WM_NOTIFY 期间有效。
-    let lvcd = unsafe { &mut *(lparam.0 as *mut NMLVCUSTOMDRAW) };
-    let stage = lvcd.nmcd.dwDrawStage;
-    // CDDS_PREPAINT → 返回 CDRF_NOTIFYITEMDRAW 请求逐行通知（默认行为）
-    // CDDS_ITEMPREPAINT → 在此设置每行底色与文字色
-    if (stage.0 & CDDS_ITEMPREPAINT.0) != 0 {
-        let colors = theme_colors().unwrap_or_else(crate::ui::theme::light_colors);
-        let idx = lvcd.nmcd.dwItemSpec;
-        // 判断选中态：ListView 选中行由 LVIS_SELECTED 标记，nmcd.uItemState
-        // 已反映（custom draw 期间系统会置位）
-        let selected =
-            (lvcd.nmcd.uItemState.0 & windows::Win32::UI::Controls::CDIS_SELECTED.0) != 0;
-        if selected {
-            lvcd.clrTextBk = colors.selected;
-            lvcd.clrText = colors.listview_fg;
-        } else if idx % 2 == 1 {
-            lvcd.clrTextBk = colors.listview_alt_bg;
-            lvcd.clrText = colors.listview_fg;
-        } else {
-            lvcd.clrTextBk = colors.listview_bg;
-            lvcd.clrText = colors.listview_fg;
-        }
-        LRESULT(CDRF_NEWFONT as isize)
-    } else {
-        LRESULT(CDRF_DODEFAULT as isize)
+    let colors = theme_colors().unwrap_or_else(crate::ui::theme::light_colors);
+    // SAFETY: 颜色消息参数为值类型，SendMessageW 同步返回后参数生命周期结束。
+    unsafe {
+        let _ = SendMessageW(
+            list_view,
+            TVM_SETBKCOLOR,
+            WPARAM(0),
+            LPARAM(colors.listview_bg.0 as isize),
+        );
+        let _ = SendMessageW(
+            list_view,
+            TVM_SETTEXTCOLOR,
+            WPARAM(0),
+            LPARAM(colors.listview_fg.0 as isize),
+        );
+        let _ = SendMessageW(
+            list_view,
+            TVM_SETLINECOLOR,
+            WPARAM(0),
+            LPARAM(colors.border.0 as isize),
+        );
     }
 }
 
-/// 处理列表项双击：跳转到对应窗口
+/// 处理树形列表单击 / 双击根项：将对应窗口置前（需求：点击置顶对应软件）
 ///
-/// 从双击行的 `lParam` 中取出窗口句柄，经 [`IsWindow`] 校验有效性：
-/// - 有效：将目标窗口置前到前台（`SetForegroundWindow` + `SetWindowPos` 置顶）；
-/// - 无效（窗口已关闭）：从标签存储移除对应条目并刷新列表。
-fn handle_list_dblclk(hwnd: HWND, item_index: i32) {
-    if item_index < 0 {
-        return;
-    }
+/// 光标位置经 `TVM_HITTEST` 定位树项；仅根项（无父项，即标签本体）且命中
+/// 项本体（图标/文字）时触发置前——命中 [+] 展开按钮时交给树控件处理展开。
+fn handle_tree_click(hwnd: HWND) {
     // SAFETY: 面板窗口由 create_panel 创建，窗口存活期间 PanelData 有效。
     let data = unsafe { get_userdata::<PanelData>(hwnd) };
     if data.is_null() {
@@ -542,35 +509,88 @@ fn handle_list_dblclk(hwnd: HWND, item_index: i32) {
         return;
     };
 
-    // 读取选中行的 lParam（插入列表时写入的是目标窗口句柄）
-    let mut item = LVITEMW {
-        mask: LVIF_PARAM,
-        iItem: item_index,
+    // 光标位置 → 树内命中测试（客户端坐标）
+    let mut pt = POINT::default();
+    // SAFETY: GetCursorPos/ScreenToClient 均为坐标查询，pt 为栈上缓冲。
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = ScreenToClient(list_view, &mut pt);
+    }
+    let mut ht = TVHITTESTINFO {
+        pt,
         ..Default::default()
     };
-    // SAFETY: item 为栈上变量，SendMessageW 消息返回前保持存活；
-    // LVM_GETITEMW 返回时向 item.lParam 写入目标窗口句柄。
-    let ret = unsafe {
+    // SAFETY: ht 为栈上变量，TVM_HITTEST 返回前完成写入。
+    unsafe {
+        let _ = SendMessageW(
+            list_view,
+            TVM_HITTEST,
+            WPARAM(0),
+            LPARAM(std::ptr::addr_of_mut!(ht) as isize),
+        );
+    }
+    if ht.hItem.0 == 0 {
+        return;
+    }
+    // 命中 [+] 展开按钮：交给树控件切换展开，不触发置前
+    if (ht.flags.0 & TVHT_ONITEMBUTTON.0) != 0 {
+        return;
+    }
+    // 仅命中项本体（图标/文字）时触发
+    if (ht.flags.0 & TVHT_ONITEM.0) == 0 {
+        return;
+    }
+    // 仅根项（标签本体）触发：有父项的是详情子项
+    // SAFETY: hItem 为 TVM_HITTEST 返回的有效句柄，TVM_GETNEXTITEM 只读查询。
+    let parent = unsafe {
         SendMessageW(
             list_view,
-            LVM_GETITEMW,
-            WPARAM(item_index as usize),
-            LPARAM(std::ptr::addr_of_mut!(item) as isize),
+            TVM_GETNEXTITEM,
+            WPARAM(TVGN_PARENT as usize),
+            LPARAM(ht.hItem.0),
         )
     };
-    if ret.0 == 0 {
-        // 项不存在或已失效：刷新列表兜底
-        refresh_list(hwnd);
+    if parent.0 != 0 {
         return;
+    }
+
+    activate_target(hwnd, data, list_view, ht.hItem);
+}
+
+/// 将根项对应的目标窗口置前（临时置顶：提到最前并聚焦，不常驻顶层）
+///
+/// 从根项 `lParam` 取目标窗口句柄，经 [`IsWindow`] 校验：
+/// - 有效：最小化时先恢复（`SW_RESTORE`），再 `SetForegroundWindow` +
+///   `SetWindowPos` 置顶；
+/// - 无效（窗口已关闭）：从标签存储移除对应条目并刷新列表。
+fn activate_target(hwnd: HWND, data: *mut PanelData, list_view: HWND, hitem: HTREEITEM) {
+    // 读取根项的 lParam（插入树时写入的是目标窗口句柄）
+    let mut item = TVITEMW {
+        mask: TVIF_PARAM,
+        hItem: hitem,
+        ..Default::default()
+    };
+    // SAFETY: item 为栈上变量，TVM_GETITEMW 返回前完成写入。
+    unsafe {
+        let _ = SendMessageW(
+            list_view,
+            TVM_GETITEMW,
+            WPARAM(0),
+            LPARAM(std::ptr::addr_of_mut!(item) as isize),
+        );
     }
 
     let target = HWND(item.lParam.0 as *mut std::ffi::c_void);
 
     // SAFETY: IsWindow 为只读查询，校验目标窗口是否仍存活，无副作用。
     if unsafe { IsWindow(target) }.as_bool() {
-        // SAFETY: 目标窗口已通过 IsWindow 校验存活；SetForegroundWindow 将窗口
-        // 前置到前台（由用户双击授权），SetWindowPos 置顶但不抢占输入焦点。
+        // SAFETY: 目标窗口已通过 IsWindow 校验存活；最小化时先恢复窗口，
+        // 再 SetForegroundWindow 置前（由用户单击授权），SetWindowPos 置顶
+        // 但不抢占输入焦点。临时置前：切到其他软件后不驻留最上层。
         unsafe {
+            if IsIconic(target).as_bool() {
+                let _ = ShowWindow(target, SW_RESTORE);
+            }
             let _ = SetForegroundWindow(target);
             let _ = SetWindowPos(
                 target,
@@ -588,11 +608,19 @@ fn handle_list_dblclk(hwnd: HWND, item_index: i32) {
         if let Some(mut store) = unsafe { (*data).tag_store.lock().ok() } {
             store.remove(&(target.0 as isize));
         }
-        refresh_list(hwnd);
+        refresh_tree(hwnd);
     }
 }
 
-fn refresh_list(hwnd: HWND) {
+/// 按搜索条件重建树形列表
+///
+/// 每个标签一个根项（文本 = "标题 | 窗口名称"，`lParam` = 目标窗口句柄），
+/// 根项下挂备注详情子项（R15）："备注：" 标签行 + 备注完整内容——TreeView
+/// 项为单行，多行备注逐行拆为独立子项才能完整显示（备注为空时显示"（无）"）。
+/// 重建前记录已展开根项（按目标窗口句柄），重建后恢复展开状态，供标签变更
+/// 广播触发的自动刷新不打断浏览。搜索匹配字段与旧列表视图一致：标题 / 备注 /
+/// 窗口标题 / 进程名。
+fn refresh_tree(hwnd: HWND) {
     // SAFETY: 面板窗口生命周期内 PanelData 有效（create_panel 创建，WM_DESTROY 回收）。
     let data = unsafe { get_userdata::<PanelData>(hwnd) };
     if data.is_null() {
@@ -622,9 +650,13 @@ fn refresh_list(hwnd: HWND) {
         return;
     };
 
-    // SAFETY: 向列表视图发送清空消息，参数为编译期常量。
+    // 重建前记录已展开根项对应的目标窗口句柄（TVM_DELETEITEM 会失效旧项句柄）
+    let expanded = collect_expanded_targets(list_view);
+
+    // 清空整棵树（TVI_ROOT 表示根）
+    // SAFETY: 向树视图发送清空消息，参数为编译期常量 TVI_ROOT。
     unsafe {
-        let _ = SendMessageW(list_view, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+        let _ = SendMessageW(list_view, TVM_DELETEITEM, WPARAM(0), LPARAM(TVI_ROOT.0));
     }
 
     let mut entries: Vec<_> = store
@@ -639,71 +671,144 @@ fn refresh_list(hwnd: HWND) {
         .collect();
     entries.sort_by(|a, b| a.1.title.cmp(&b.1.title));
 
-    for (idx, (hwnd, tag)) in entries.iter().enumerate() {
-        let title_wide: Vec<u16> = tag.title.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT,
-            iItem: idx as i32,
-            iSubItem: 0,
-            pszText: windows::core::PWSTR(title_wide.as_ptr() as *mut _),
-            cchTextMax: title_wide.len() as i32,
-            lParam: LPARAM(**hwnd),
-            ..Default::default()
+    for (target_hwnd, tag) in entries {
+        // 根项：标题与窗口名称同行（R15）；树控件自动裁剪过长文本，无需截断
+        let root_text = format!("{} | {}", tag.title, tag.window_title);
+        let title_wide: Vec<u16> = root_text.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut root = TVINSERTSTRUCTW {
+            hParent: TVI_ROOT,
+            hInsertAfter: TVI_LAST,
+            Anonymous: TVINSERTSTRUCTW_0 {
+                item: TVITEMW {
+                    mask: TVIF_TEXT | TVIF_PARAM,
+                    pszText: windows::core::PWSTR(title_wide.as_ptr() as *mut _),
+                    cchTextMax: title_wide.len() as i32,
+                    lParam: LPARAM(*target_hwnd),
+                    ..Default::default()
+                },
+            },
         };
 
-        // SAFETY: item 与 title_wide 在 SendMessageW 调用期间存活，
-        // LVM_INSERTITEMW 在消息返回前完成数据拷贝。
+        // SAFETY: root 与 title_wide 在 SendMessageW 调用期间存活，
+        // TVM_INSERTITEMW 在消息返回前完成数据拷贝。
         let inserted = unsafe {
             SendMessageW(
                 list_view,
-                LVM_INSERTITEMW,
+                TVM_INSERTITEMW,
                 WPARAM(0),
-                LPARAM(std::ptr::addr_of_mut!(item) as isize),
+                LPARAM(std::ptr::addr_of_mut!(root) as isize),
             )
         };
+        if inserted.0 == 0 {
+            continue;
+        }
+        let parent = HTREEITEM(inserted.0);
 
-        if inserted.0 >= 0 {
-            let row = inserted.0;
+        // 详情子项："备注：" 标签行 + 备注完整内容（R15）。TreeView 项为单行，
+        // 多行备注必须逐行拆为独立子项才能完整显示；空备注显示占位"（无）"。
+        let mut child_texts: Vec<String> = vec!["备注：".to_string()];
+        if tag.note.is_empty() {
+            child_texts.push("（无）".to_string());
+        } else {
+            child_texts.extend(tag.note.lines().map(str::to_string));
+        }
+        for text in child_texts {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut child = TVINSERTSTRUCTW {
+                hParent: parent,
+                hInsertAfter: TVI_LAST,
+                Anonymous: TVINSERTSTRUCTW_0 {
+                    item: TVITEMW {
+                        mask: TVIF_TEXT,
+                        pszText: windows::core::PWSTR(wide.as_ptr() as *mut _),
+                        cchTextMax: wide.len() as i32,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: child 与 wide 在 SendMessageW 调用期间存活。
+            unsafe {
+                let _ = SendMessageW(
+                    list_view,
+                    TVM_INSERTITEMW,
+                    WPARAM(0),
+                    LPARAM(std::ptr::addr_of_mut!(child) as isize),
+                );
+            }
+        }
 
-            let sub_texts = [
-                (1, &tag.note),
-                (2, &tag.window_title),
-                (3, &tag.process_name),
-            ];
-
-            for (col, text) in &sub_texts {
-                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                let mut sub = LVITEMW {
-                    mask: LVIF_TEXT,
-                    iItem: row as i32,
-                    iSubItem: *col,
-                    pszText: windows::core::PWSTR(wide.as_ptr() as *mut _),
-                    cchTextMax: wide.len() as i32,
-                    ..Default::default()
-                };
-                // SAFETY: sub 与 wide 在 SendMessageW 调用期间存活。
-                unsafe {
-                    let _ = SendMessageW(
-                        list_view,
-                        LVM_SETITEMTEXTW,
-                        WPARAM(row as usize),
-                        LPARAM(std::ptr::addr_of_mut!(sub) as isize),
-                    );
-                }
+        // 恢复重建前该根项的展开状态（按目标窗口句柄匹配）
+        if expanded.contains(target_hwnd) {
+            // SAFETY: parent 为本次插入返回的有效项句柄，TVM_EXPAND 仅切换展开态。
+            unsafe {
+                let _ = SendMessageW(
+                    list_view,
+                    TVM_EXPAND,
+                    WPARAM(TVE_EXPAND.0 as usize),
+                    LPARAM(parent.0),
+                );
             }
         }
     }
 }
 
-/// 重新应用主题到面板的 ListView（供 main.rs reapply_theme 调用）
+/// 收集树中所有已展开根项的目标窗口句柄（lParam）
 ///
-/// 主题切换后 ListView 的 DarkMode_Explorer 需重新设置才能让表头/滚动条
-/// 跟随新主题（问题 9.3/9.5 的热更新）。取 IDC_LIST_VIEW 子控件并刷新主题。
-pub fn reapply_listview_theme(panel_hwnd: HWND, dark: bool) {
+/// 从根项起沿兄弟链遍历（`TVGN_ROOT` → `TVGN_NEXT`），逐项读取
+/// `TVIS_EXPANDED` 状态，供 [`refresh_tree`] 重建后恢复展开状态。
+fn collect_expanded_targets(list_view: HWND) -> HashSet<isize> {
+    let mut expanded = HashSet::new();
+    // SAFETY: TVM_GETNEXTW/TVGN_* 为只读遍历，参数为常量或消息返回的项句柄；
+    // 树控件存活（GetDlgItem 已确认），返回 0 表示遍历结束。
+    let mut item = unsafe {
+        SendMessageW(
+            list_view,
+            TVM_GETNEXTITEM,
+            WPARAM(TVGN_ROOT as usize),
+            LPARAM(0),
+        )
+    };
+    while item.0 != 0 {
+        let mut tvi = TVITEMW {
+            mask: TVIF_HANDLE | TVIF_STATE | TVIF_PARAM,
+            hItem: HTREEITEM(item.0),
+            stateMask: TVIS_EXPANDED,
+            ..Default::default()
+        };
+        // SAFETY: tvi 为栈上局部值，TVM_GETITEMW 在消息返回前完成数据拷贝。
+        unsafe {
+            let _ = SendMessageW(
+                list_view,
+                TVM_GETITEMW,
+                WPARAM(0),
+                LPARAM(std::ptr::addr_of_mut!(tvi) as isize),
+            );
+        }
+        if tvi.state.0 & TVIS_EXPANDED.0 != 0 {
+            expanded.insert(tvi.lParam.0);
+        }
+        // SAFETY: 同上，TVGN_NEXT 沿兄弟链推进，返回 0 时退出循环。
+        item = unsafe {
+            SendMessageW(
+                list_view,
+                TVM_GETNEXTITEM,
+                WPARAM(TVGN_NEXT as usize),
+                LPARAM(item.0),
+            )
+        };
+    }
+    expanded
+}
+
+/// 重新应用主题到面板的树形列表（供 main.rs reapply_theme 调用）
+///
+/// 主题切换后树形列表的 DarkMode_Explorer 需重新设置才能让滚动条/展开按钮
+/// 跟随新主题。取 IDC_LIST_VIEW 子控件并刷新主题与配色。
+pub fn reapply_tree_theme(panel_hwnd: HWND, dark: bool) {
     // SAFETY: panel_hwnd 由调用方保证存活；GetDlgItem 按子控件 ID 查询，
     // 失败时返回 Err 被忽略。
     if let Ok(list_view) = unsafe { GetDlgItem(panel_hwnd, IDC_LIST_VIEW) } {
-        apply_listview_theme(list_view, dark);
+        apply_tree_theme(list_view, dark);
     }
 }
 
@@ -725,7 +830,7 @@ pub fn toggle_panel(hwnd: HWND) {
         unsafe {
             (*data).visible = true;
         }
-        refresh_list(hwnd);
+        refresh_tree(hwnd);
         // SAFETY: 显示面板并置前到前台，由用户显式热键触发的窗口操作。
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);

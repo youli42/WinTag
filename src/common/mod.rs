@@ -3,7 +3,7 @@
 //! 本模块只依赖 windows-rs 与标准库，不依赖项目内其他模块
 //! （core / sys / ui / hotkey），供任意模块按需复用。当前提供：
 //!
-//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发、设置窗口、主题变更
+//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发、设置窗口、主题变更、标签变更
 //! - [`widestring`]：UTF-16 宽字符串转换
 //! - [`get_userdata`] / [`set_userdata`]：窗口用户数据（GWLP_USERDATA）读写
 //!
@@ -38,6 +38,12 @@ pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 4;
 ///
 /// 用于主题状态变化后向主线程广播，重新应用暗色/浅色主题到各窗口。
 pub const WM_APP_THEME_CHANGED: u32 = WM_APP + 5;
+
+/// 自定义消息：标签数据变更广播（wParam = 目标窗口句柄）
+///
+/// 由便签弹窗保存标签后发送到隐藏窗口，主线程转发给概览面板，
+/// 面板收到后刷新树形列表（镜像 [`WM_APP_THEME_CHANGED`] 的广播模式）。
+pub const WM_APP_TAGS_CHANGED: u32 = WM_APP + 6;
 
 /// 将字符串编码为以 NUL（`\0`）结尾的 UTF-16 宽字符串
 ///

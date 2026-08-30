@@ -3,25 +3,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, FALSE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, EndPaint, GetDC, ReleaseDC, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, UpdateWindow, ValidateRect, BLENDFUNCTION, DT_WORDBREAK, HGDIOBJ, PS_SOLID,
-    TRANSPARENT,
+    BeginPaint, CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, GetDC, GetTextExtentPoint32W, InvalidateRect,
+    PatBlt, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
+    ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, BLENDFUNCTION, DIB_RGB_COLORS,
+    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HGDIOBJ, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
     GetWindowTextW, IsIconic, IsWindowVisible, RegisterClassW, SetWindowPos, ShowWindow,
     UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    SWP_NOACTIVATE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ERASEBKGND,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
-use super::badge::{render_badge, BadgeParams};
+use super::badge::{render_badge, render_rounded_rect, truncate_title, BadgeParams};
 use super::TagStore;
 use crate::common::{get_userdata, set_userdata, widestring};
 
@@ -29,15 +32,36 @@ use crate::common::{get_userdata, set_userdata, widestring};
 const BADGE_SIZE: i32 = 18;
 /// 角标在覆盖层窗口中的偏移（距窗口左上角）
 const BADGE_OFFSET: i32 = 2;
-/// 覆盖层窗口边长 = 三角形腰长 + 左右/上下各留 [`BADGE_OFFSET`] 透明边
+/// 覆盖层角标区边长 = 三角形腰长 + 左右/上下各留 [`BADGE_OFFSET`] 透明边
 ///
-/// 覆盖层窗口只覆盖角标这一小块（贴目标窗口左上角），而非整块目标窗口，
-/// 从而避免铺满窗口时吞掉目标窗口的点击（`HTTRANSPARENT` 无法穿透其他进程窗口）。
+/// 覆盖层窗口只覆盖角标（及可选的标题条）这一小块、贴目标窗口左上角，
+/// 而非铺满整块目标窗口，从而避免铺满窗口时吞掉目标窗口的点击
+/// （`HTTRANSPARENT` 无法穿透其他进程窗口）。
 const BADGE_WIN_SIZE: i32 = BADGE_SIZE + BADGE_OFFSET * 2;
+/// 标题条最大显示字符数（超出以省略号截断，需求：默认显示 5 个字）
+const TITLE_MAX_CHARS: usize = 5;
+/// 标题条高度（覆盖层高度 [`BADGE_WIN_SIZE`] 内垂直居中）
+const TITLE_H: i32 = 16;
+/// 标题条纵向偏移
+const TITLE_Y: i32 = (BADGE_WIN_SIZE - TITLE_H) / 2;
+/// 标题条左右内边距
+const TITLE_PAD_X: i32 = 7;
 /// 圆点回退颜色（橙色，RGB [255, 183, 77]）
 const FALLBACK_DOT_RGBA: [u8; 4] = [255, 183, 77, 255];
 /// WM_MOUSELEAVE：TrackMouseEvent(TME_LEAVE) 触发的鼠标离开消息
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// 角标标题条显示开关（R6 设置项 `show_badge_title` 的 sys 层注入镜像）
+///
+/// 依赖方向约束（ui → core → sys）不允许 sys 层读取 `core::settings`，
+/// 因此由主线程经 [`set_show_title`] 注入（启动时 + 设置保存广播后），
+/// 镜像 [`set_tooltip_theme`] 的注入模式。未注入时默认显示。
+static SHOW_TITLE: AtomicBool = AtomicBool::new(true);
+
+/// 注入标题条显示开关（R6：设置页"角标显示标题"）
+pub fn set_show_title(enabled: bool) {
+    SHOW_TITLE.store(enabled, Ordering::Relaxed);
+}
 
 /// 单个覆盖层的悬停状态
 ///
@@ -92,7 +116,9 @@ pub fn set_tooltip_theme(bg: COLORREF, fg: COLORREF) {
 /// 透明覆盖层窗口
 ///
 /// 覆盖层是一个 `WS_EX_LAYERED` 穿透式透明窗口，绘制在目标窗口左上角
-/// 作为"已标记"指示圆点；鼠标悬停时弹出便签 tooltip。
+/// 作为"已标记"指示圆点；鼠标悬停时弹出便签 tooltip。R6 起角标右侧可
+/// 附带一个圆角标题条（[`SHOW_TITLE`] 开关控制，显示标签标题，超长省略号
+/// 截断），悬停标题条同样显示完整标题与备注。
 ///
 /// 覆盖层窗口仅在主线程创建、访问与销毁，其生命周期与 `Overlay` 值绑定：
 /// `Drop` 时先销毁仍显示的悬停 tooltip，再从 [`TARGET_MAP`] 注销，最后销毁自身窗口。
@@ -107,11 +133,6 @@ pub struct Overlay {
     /// （[`crate::main::poll_overlays`] 的可见性校正）共用此状态，
     /// 用于避免对同一窗口重复调用 `ShowWindow`。
     visible: AtomicBool,
-    /// 上次已同步应用的目标窗口矩形（DWM 边界，元组为 left/top/width/height）
-    ///
-    /// 仅主线程读写，用于 [`sync_position`] 的变更去重：与当前矩形一致时跳过
-    /// `SetWindowPos`。用 `Mutex` 承载以保持 `unsafe impl Send/Sync` 的一致性约定。
-    last_rect: Mutex<Option<(i32, i32, i32, i32)>>,
 }
 
 // SAFETY: Overlay 仅承载 HWND 与原子状态，手动实现 Send/Sync 的依据如下：
@@ -172,8 +193,9 @@ impl Overlay {
             WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0,
         );
 
-        // 覆盖层窗口只占角标大小、贴在目标窗口左上角，而非铺满整个目标窗口。
-        // 铺满目标窗口会吞掉其点击（`HTTRANSPARENT` 无法穿透其他进程窗口）。
+        // 覆盖层窗口只占角标区大小、贴在目标窗口左上角，而非铺满整个目标窗口。
+        // 铺满目标窗口会吞掉其点击（`HTTRANSPARENT` 无法穿透其他进程窗口）；
+        // 标题条（R6）在首次绘制时经 UpdateLayeredWindow 自适应加宽。
         let side = BADGE_WIN_SIZE;
 
         // SAFETY: 传入已注册的窗口类名、有效样式与尺寸，父窗口/菜单/实例均不参与
@@ -207,11 +229,14 @@ impl Overlay {
             );
         }
 
-        // SAFETY: hwnd 为本函数刚创建且存活的窗口；ShowWindow/UpdateWindow 触发
-        // 首次绘制（WM_PAINT 内经 UpdateLayeredWindow 提交预乘 RGBA）。
+        // SAFETY: hwnd 为本函数刚创建且存活的窗口；ShowWindow 显示窗口后仅
+        // InvalidateRect 标记重绘，首绘延迟到消息循环空闲时触发（WM_PAINT →
+        // update_layered_badge）。刻意不在创建栈内 UpdateWindow 同步绘制：
+        // 实测创建瞬间的同步 UpdateLayeredWindow 内容可能未生效（角标不显示，
+        // 需事后重绘才出现），异步首绘与设置保存后 refresh() 的恢复路径一致。
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = UpdateWindow(hwnd);
+            let _ = InvalidateRect(hwnd, None, FALSE);
         }
 
         Ok(Overlay {
@@ -219,14 +244,14 @@ impl Overlay {
             target_hwnd: target,
             running: AtomicBool::new(true),
             visible: AtomicBool::new(true),
-            last_rect: Mutex::new(None),
         })
     }
 
     /// 将覆盖层位置同步到目标窗口当前可见区域的左上角（窗口移动/缩放时调用）
     ///
-    /// 覆盖层窗口尺寸固定为角标大小（[`BADGE_WIN_SIZE`]），仅跟随目标窗口左上角位置；
-    /// 目标窗口缩放而左上角不变时无需重排（角标始终锚定该角）。
+    /// 覆盖层只跟随目标窗口左上角位置；窗口尺寸由 [`update_layered_badge`]
+    /// 绘制时自适应（角标区 + 可选标题条宽度），此处携带 [`SWP_NOSIZE`]
+    /// 仅调整位置，避免用固定尺寸覆盖掉绘制结果。
     ///
     /// 优先使用 DWM 扩展帧边界（[`DWMWA_EXTENDED_FRAME_BOUNDS`]）获取目标窗口的
     /// **可见区域**：该边界不含隐形 resize 边框，与用户视觉感知一致；在 Per-Monitor
@@ -236,7 +261,8 @@ impl Overlay {
     /// 可见性守卫：目标窗口最小化（`IsIconic`）或不可见（`!IsWindowVisible`）时
     /// **自动隐藏覆盖层**——这是 500ms 兜底轮询与事件丢失场景下的可见性校正路径，
     /// 确保目标最小化/隐藏后覆盖层不会悬浮残留；目标恢复可见后由 [`show`] 恢复。
-    /// 变更去重：矩形与上次已应用结果一致时跳过 `SetWindowPos`，避免无谓窗口重排。
+    /// 每次同步都执行 `SetWindowPos`（不按位置去重），顺带重申 `HWND_TOPMOST`，
+    /// 保证覆盖层 z 序永远压在目标窗口之上。
     pub fn sync_position(&self) -> Result<()> {
         // SAFETY: self.target_hwnd 由本 Overlay 持有且窗口存活；IsIconic/IsWindowVisible
         // 为只读查询，句柄失效时返回 FALSE/0，此处视为"不短路"，由后续窗口查询报错。
@@ -273,31 +299,23 @@ impl Overlay {
             return Ok(());
         }
 
-        // 覆盖层窗口固定为角标大小（badge 窗口），仅跟随目标窗口左上角位置；
-        // 尺寸不再随目标缩放而变化。
-        let side = BADGE_WIN_SIZE;
-
-        // 变更去重：与上次已应用的矩形一致时跳过 SetWindowPos；锁中毒时继续执行，
-        // 保持与之前相同的定位行为（下次同步仍会重新去重）。
-        let current = (rect.left, rect.top, side, side);
-        if let Ok(mut last) = self.last_rect.lock() {
-            if last.as_ref() == Some(&current) {
-                return Ok(());
-            }
-            *last = Some(current);
-        }
-
+        // 覆盖层窗口仅跟随目标窗口左上角位置；尺寸由绘制自适应（SWP_NOSIZE）。
+        // 每次同步都执行 SetWindowPos（含重申 HWND_TOPMOST）：若按位置去重早退，
+        // 目标窗口被激活压住覆盖层（同属 topmost 带时后者在前）后 z 序永远无法
+        // 恢复，角标就此被遮挡不再显示。事件合并（win_event.rs）+ 500ms 轮询
+        // 已节制调用频率，单次 SetWindowPos 开销可忽略。
         // SAFETY: self.hwnd 与 self.target_hwnd 由本 Overlay 持有且窗口存活；
-        // SetWindowPos 仅调整位置尺寸，失败忽略（下次同步会重试）。
+        // SetWindowPos 仅调整位置并重申置顶（SWP_NOSIZE 保留绘制自适应尺寸），
+        // 失败忽略（下次同步会重试）。
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
                 rect.left,
                 rect.top,
-                side,
-                side,
-                SWP_NOACTIVATE,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE,
             );
         }
         Ok(())
@@ -361,6 +379,19 @@ impl Overlay {
     /// 查询覆盖层是否仍处于运行状态（未被销毁）
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    /// 强制覆盖层立即重绘（标签内容/主题配色/显示开关变化后调用）
+    ///
+    /// 触发一次同步 `WM_PAINT`：`update_layered_badge` 会按当前 TagStore、
+    /// 主题调色板与 `show_badge_title` 开关重新渲染并自适应窗口尺寸。
+    pub fn refresh(&self) {
+        // SAFETY: self.hwnd 由本 Overlay 独占持有，Drop 前始终存活；
+        // InvalidateRect 标记重绘，UpdateWindow 同步触发 WM_PAINT。
+        unsafe {
+            let _ = InvalidateRect(self.hwnd, None, FALSE);
+            let _ = UpdateWindow(self.hwnd);
+        }
     }
 }
 
@@ -428,32 +459,300 @@ fn badge_stroke_rgba() -> [u8; 4] {
         .unwrap_or([60, 60, 60, 255])
 }
 
-/// 渲染角标并经 `UpdateLayeredWindow` 提交到覆盖层窗口（逐像素 alpha 抗锯齿）
+/// `COLORREF`（0x00BBGGRR）→ RGB 字节序（描边等不透明色转换）
+fn colorref_to_rgb(c: COLORREF) -> [u8; 3] {
+    [
+        (c.0 & 0xFF) as u8,
+        ((c.0 >> 8) & 0xFF) as u8,
+        ((c.0 >> 16) & 0xFF) as u8,
+    ]
+}
+
+/// 读取标题条显示文本（R6：角标旁显示标题，超长截断为省略号）
+///
+/// - 开关关闭（[`set_show_title`]）或未注入标签存储 → `None`（只画角标）；
+/// - 标签标题为空时回退窗口原始标题（`tag.window_title`）；
+/// - 均为空 → `None`。
+fn title_text(target_hwnd: isize) -> Option<String> {
+    if !SHOW_TITLE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let store = TAG_STORE_INNER.get()?;
+    let Ok(store) = store.lock() else {
+        return None;
+    };
+    let tag = store.get(&target_hwnd)?;
+    let raw = if tag.title.is_empty() {
+        tag.window_title.as_str()
+    } else {
+        tag.title.as_str()
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_title(trimmed, TITLE_MAX_CHARS))
+}
+
+/// 量测标题文本像素宽度（系统消息字体；量测失败回退每字符 12px 估算）
+fn measure_title_width(text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let count = (wide.len() as i32 - 1).max(0);
+    if count == 0 {
+        return 0;
+    }
+    // SAFETY: GetDC(None) 取屏幕 DC 仅作字体量测，用后 ReleaseDC 归还。
+    let hdc = unsafe { GetDC(None) };
+    let mut width = 0i32;
+    if !hdc.is_invalid() {
+        let font = crate::ui::theme::message_font();
+        let old = if !font.is_invalid() {
+            // SAFETY: SelectObject 切换量测字体，结束后恢复原对象。
+            unsafe { SelectObject(hdc, font) }
+        } else {
+            HGDIOBJ::default()
+        };
+        let mut size = SIZE::default();
+        // SAFETY: wide 为 NUL 结尾宽字符串切片，size 为栈上缓冲，调用期间存活。
+        let ok = unsafe { GetTextExtentPoint32W(hdc, &wide[..count as usize], &mut size) };
+        if ok.as_bool() {
+            width = size.cx;
+        }
+        if !font.is_invalid() {
+            // SAFETY: 恢复 SelectObject 保存的原对象。
+            unsafe {
+                let _ = SelectObject(hdc, old);
+            }
+        }
+        // SAFETY: 与 GetDC(None) 成对归还屏幕 DC。
+        unsafe {
+            let _ = ReleaseDC(None, hdc);
+        }
+    }
+    if width <= 0 {
+        // 回退估算：每字符约 12px（中文略偏小，仅量测彻底失败时兜底）
+        width = count * 12;
+    }
+    width
+}
+
+/// 将标题文字按蒙版方式合成进预乘 RGBA 缓冲（GDI 黑底白字 → 亮度作 alpha）
+///
+/// `rgba` 为整窗预乘缓冲，`win` 为整窗 (宽, 高)；文字绘制在 `rect`
+/// = (x0, y0, 宽, 高) 的标题条内部。以 `CreateDIBSection` 建立
+/// 32bpp 顶朝下 DIB，GDI 以白字写黑底后读回：R 通道亮度即文字覆盖率，
+/// 以 `fg` 色经 alpha-over 合成到标题条底色上。
+fn overlay_text_into(
+    rgba: &mut [u8],
+    win: (i32, i32),
+    rect: (i32, i32, i32, i32),
+    text: &str,
+    fg: [u8; 3],
+) {
+    let (win_w, win_h) = win;
+    let (x0, y0, w, h) = rect;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            // 负高度 = 顶朝下（行序与 rgba 缓冲一致）
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: bmi 为栈上有效结构；bits 出参由系统写入；DIB 尺寸小（≤ 数十字节宽）。
+    let hbmp = unsafe { CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
+    let hbmp = match hbmp {
+        Ok(h) if !bits.is_null() => h,
+        Ok(h) => {
+            // SAFETY: DIB 创建成功但像素指针为空（异常路径），删除后退出。
+            unsafe {
+                let _ = DeleteObject(h);
+            }
+            return;
+        }
+        Err(_) => return,
+    };
+    // SAFETY: CreateCompatibleDC 创建内存 DC，SelectObject 选入 DIB，
+    // 用毕成对恢复/删除（与本函数内其余 GDI 调用同作用域完成）。
+    let mem_dc = unsafe { CreateCompatibleDC(None) };
+    if mem_dc.is_invalid() {
+        // SAFETY: hbmp 刚创建，无效 DC 路径下仅删 bitmap。
+        unsafe {
+            let _ = DeleteObject(hbmp);
+        }
+        return;
+    }
+    let old_bmp = unsafe { SelectObject(mem_dc, hbmp) };
+
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: mem_dc 存活；PatBlt 将 DIB 整面涂黑作文字蒙版底色。
+    unsafe {
+        let _ = PatBlt(mem_dc, 0, 0, w, h, BLACKNESS);
+        let _ = SetBkMode(mem_dc, TRANSPARENT);
+        // 白字：R 通道亮度即文字覆盖率
+        let _ = SetTextColor(mem_dc, COLORREF(0x00FFFFFF));
+    }
+    let font = crate::ui::theme::message_font();
+    let old_font = if !font.is_invalid() {
+        // SAFETY: 字体为进程级缓存句柄（永不删除），选入后恢复。
+        unsafe { SelectObject(mem_dc, font) }
+    } else {
+        HGDIOBJ::default()
+    };
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    // SAFETY: wide 为 NUL 结尾缓冲，rc 为栈上矩形，均在调用期间存活。
+    unsafe {
+        let _ = DrawTextW(mem_dc, &mut wide, &mut rc, DT_SINGLELINE | DT_VCENTER);
+    }
+    if !old_font.is_invalid() {
+        // SAFETY: 恢复原字体对象。
+        unsafe {
+            let _ = SelectObject(mem_dc, old_font);
+        }
+    }
+
+    // 读回蒙版像素（32bpp 内存序 B,G,R,unused），合成到整窗缓冲
+    // SAFETY: bits 指向 hbmp 的像素内存（w*h*4 字节），DIB 与 mem_dc 存活期间有效。
+    let mask = unsafe { std::slice::from_raw_parts(bits as *const u8, (w * h) as usize * 4) };
+    for y in 0..h {
+        let wy = y0 + y;
+        if wy < 0 || wy >= win_h {
+            continue;
+        }
+        for x in 0..w {
+            let wx = x0 + x;
+            if wx < 0 || wx >= win_w {
+                continue;
+            }
+            let cov = mask[((y * w + x) * 4 + 2) as usize] as f32 / 255.0;
+            if cov <= 0.0 {
+                continue;
+            }
+            let di = ((wy * win_w + wx) * 4) as usize;
+            let da = rgba[di + 3] as f32 / 255.0;
+            // premultiplied alpha-over：out = fg*cov + dst*(1-cov)
+            let inv = 1.0 - cov;
+            rgba[di] = (fg[0] as f32 * cov + rgba[di] as f32 * inv).round() as u8;
+            rgba[di + 1] = (fg[1] as f32 * cov + rgba[di + 1] as f32 * inv).round() as u8;
+            rgba[di + 2] = (fg[2] as f32 * cov + rgba[di + 2] as f32 * inv).round() as u8;
+            rgba[di + 3] = (255.0 * cov + 255.0 * da * inv).round() as u8;
+        }
+    }
+
+    // 清理：恢复原对象 → 删 DIB → 删内存 DC
+    // SAFETY: 成对清理，无跨消息生命周期。
+    unsafe {
+        let _ = SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(hbmp);
+        let _ = DeleteDC(mem_dc);
+    }
+}
+
+/// 渲染角标 + 标题条并经 `UpdateLayeredWindow` 提交到覆盖层窗口（逐像素 alpha 抗锯齿）
+///
+/// - 角标：贴左上角的圆边三角形（[`render_badge`]），色取标签色；
+/// - 标题条（R6）：角标右侧圆角胶囊（[`render_rounded_rect`]），底色/文字色
+///   取注入的 tooltip 主题配色（主题热更新即时生效），文字为标签标题
+///   （超长省略号截断）。无标签或开关关闭时只画角标，窗口退回角标区大小。
+/// - 窗口尺寸随内容自适应：`UpdateLayeredWindow` 以 `psize` 同步改窗口大小。
 fn update_layered_badge(hwnd: HWND) {
-    let side = BADGE_WIN_SIZE;
+    let h = BADGE_WIN_SIZE;
+    let target_hwnd = get_target_hwnd(hwnd);
     let fill = tag_color_rgba(hwnd);
     let stroke = badge_stroke_rgba();
-    // 先渲染纯三角形缓冲（腰长 BADGE_SIZE，贴左上角），再拷贝进全窗口缓冲，
-    // 使三角形相对窗口左上角偏移 BADGE_OFFSET 像素、四周留透明边。
+
+    // 标题条几何与配色（tooltip 主题配色 + border 描边，与悬停 tooltip 一致）
+    let title = if target_hwnd != 0 {
+        title_text(target_hwnd)
+    } else {
+        None
+    };
+    let (pill_fill, pill_stroke, text_fg) = {
+        let theme = TOOLTIP_THEME
+            .get()
+            .and_then(|m| m.lock().ok().map(|g| *g))
+            .unwrap_or((COLORREF(0x00FFFFFF), COLORREF(0x00000000)));
+        let border = crate::ui::theme::theme_colors()
+            .map(|c| c.border)
+            .unwrap_or(COLORREF(0x00808080));
+        (
+            colorref_to_rgb(theme.0),
+            colorref_to_rgb(border),
+            colorref_to_rgb(theme.1),
+        )
+    };
+
+    let (win_w, pill_x, pill_w, text) = match &title {
+        Some(t) => {
+            let pw = measure_title_width(t) + TITLE_PAD_X * 2;
+            (BADGE_WIN_SIZE + pw, BADGE_WIN_SIZE, pw, t.clone())
+        }
+        None => (BADGE_WIN_SIZE, 0, 0, String::new()),
+    };
+
+    let mut rgba = vec![0u8; (win_w * h) as usize * 4];
+
+    // 1. 角标三角形（贴左上角，四周留 BADGE_OFFSET 透明边）
     let tri = render_badge(BadgeParams {
         size: BADGE_SIZE,
         fill,
         stroke,
     });
-    let mut rgba = vec![0u8; (side * side) as usize * 4];
     for y in 0..BADGE_SIZE {
         let src = (y * BADGE_SIZE) as usize * 4;
-        let dst = (((y + BADGE_OFFSET) * side + BADGE_OFFSET) as usize) * 4;
+        let dst = (((y + BADGE_OFFSET) * win_w + BADGE_OFFSET) as usize) * 4;
         let len = BADGE_SIZE as usize * 4;
         rgba[dst..dst + len].copy_from_slice(&tri[src..src + len]);
+    }
+
+    // 2. 标题条圆角胶囊（贴角标区右侧）+ 3. 文字蒙版合成
+    if pill_w > 0 {
+        let pill = render_rounded_rect(
+            pill_w,
+            TITLE_H,
+            TITLE_H / 2,
+            [pill_fill[0], pill_fill[1], pill_fill[2], 255],
+            [pill_stroke[0], pill_stroke[1], pill_stroke[2], 255],
+        );
+        for y in 0..TITLE_H {
+            let src = (y * pill_w) as usize * 4;
+            let dst = ((TITLE_Y + y) * win_w + pill_x) as usize * 4;
+            let len = pill_w as usize * 4;
+            rgba[dst..dst + len].copy_from_slice(&pill[src..src + len]);
+        }
+        overlay_text_into(
+            &mut rgba,
+            (win_w, h),
+            (
+                pill_x + TITLE_PAD_X,
+                TITLE_Y,
+                pill_w - TITLE_PAD_X * 2,
+                TITLE_H,
+            ),
+            &text,
+            text_fg,
+        );
     }
 
     // SAFETY: CreateBitmap 创建 32bpp DIB，数据由 rgba 提供；返回 HBITMAP。
     // rgba 在调用期间存活，CreateBitmap 内部完成像素拷贝。
     let hbmp = unsafe {
         CreateBitmap(
-            side,
-            side,
+            win_w,
+            h,
             1,
             32,
             Some(rgba.as_ptr() as *const std::ffi::c_void),
@@ -475,9 +774,10 @@ fn update_layered_badge(hwnd: HWND) {
     }
     let old_bmp = unsafe { SelectObject(mem_dc, hbmp) };
 
-    // 目标位置/尺寸由 create/sync_position 设定，此处不传 pt_dst（保持窗口原位置），
-    // 避免 UpdateLayeredWindow 将窗口重定位到 `pt_dst` 所指"屏幕坐标"从而挪走窗口。
-    let sz = SIZE { cx: side, cy: side };
+    // 目标位置由 create/sync_position 设定，此处不传 pt_dst（保持窗口原位置），
+    // 避免 UpdateLayeredWindow 将窗口重定位到 `pt_dst` 所指"屏幕坐标"从而挪走窗口；
+    // psize 携带内容自适应尺寸（角标区 + 可选标题条宽），分层窗口尺寸随之更新。
+    let sz = SIZE { cx: win_w, cy: h };
     let pt_src = POINT { x: 0, y: 0 };
     let blend = BLENDFUNCTION {
         BlendOp: 0, // AC_SRC_OVER
@@ -487,9 +787,9 @@ fn update_layered_badge(hwnd: HWND) {
     };
 
     // SAFETY: hwnd 为覆盖层窗口存活句柄；UpdateLayeredWindow 提交内存 DC 内容
-    // 为窗口的分层像素，ULW_ALPHA 启用逐像素 alpha 混合；失败静默忽略
-    // （下次 WM_PAINT 会重试）。mem_dc 为 CreateCompatibleDC 返回的 HDC。
-    let _ = unsafe {
+    // 为窗口的分层像素，ULW_ALPHA 启用逐像素 alpha 混合。mem_dc 为
+    // CreateCompatibleDC 返回的 HDC。
+    if let Err(e) = unsafe {
         UpdateLayeredWindow(
             hwnd,
             None,
@@ -501,7 +801,11 @@ fn update_layered_badge(hwnd: HWND) {
             Some(&blend),
             ULW_ALPHA,
         )
-    };
+    } {
+        // 失败不再静默：记录错误，便于定位“角标不显示”类问题
+        //（失败时下次 WM_PAINT 会重试）。
+        eprintln!("[覆盖层] UpdateLayeredWindow 失败: {e}，角标内容未提交");
+    }
 
     // 清理：恢复原对象 → 删 bitmap → 删内存 DC
     // SAFETY: 成对清理，无跨消息生命周期。
@@ -537,7 +841,9 @@ extern "system" fn overlay_wndproc(
             LRESULT(0)
         }
         WM_NCHITTEST => {
-            // 命中测试：仅角标三角形内部可点击（HTCLIENT），其余区域穿透（HTTRANSPARENT）
+            // 命中测试：角标三角形内部与标题条区域可交互（HTCLIENT），
+            // 其余区域穿透（HTTRANSPARENT）。窗口宽 = 角标区 + 可选标题条，
+            // 标题条区域即 [BADGE_WIN_SIZE, win_w) × [TITLE_Y, TITLE_Y+TITLE_H)。
             let x = (lparam.0 & 0xFFFF) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let mut wr = RECT::default();
@@ -545,9 +851,16 @@ extern "system" fn overlay_wndproc(
             unsafe {
                 let _ = GetWindowRect(hwnd, &mut wr);
             }
-            let cx = x - wr.left - BADGE_OFFSET;
-            let cy = y - wr.top - BADGE_OFFSET;
-            if point_in_badge_triangle(cx, cy, BADGE_SIZE) {
+            let win_w = wr.right - wr.left;
+            let cx = x - wr.left;
+            let cy = y - wr.top;
+            let in_badge =
+                point_in_badge_triangle(cx - BADGE_OFFSET, cy - BADGE_OFFSET, BADGE_SIZE);
+            let in_title = win_w > BADGE_WIN_SIZE
+                && cx >= BADGE_WIN_SIZE
+                && cx < win_w
+                && (TITLE_Y..TITLE_Y + TITLE_H).contains(&cy);
+            if in_badge || in_title {
                 LRESULT(HTCLIENT as isize)
             } else {
                 LRESULT(HTTRANSPARENT as isize)

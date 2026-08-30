@@ -39,21 +39,21 @@ src/
 ├── sys/             # 底层系统服务层 — Win32 API 调用
 │   ├── mod.rs
 │   ├── window.rs    # 窗口检测、句柄捕获、事件监听
-│   ├── badge.rs     # 角标软件光栅渲染纯函数（SDF 圆边三角形，D11）
-│   └── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha，D11）
+│   ├── badge.rs     # 角标/标题条软件光栅渲染纯函数（SDF 圆边三角形 + 圆角矩形 + 标题截断，D11/D12）
+│   └── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha；D12 起含可选圆角标题条，开关经 set_show_title 注入；D14 首绘异步化 + 每次同步重申置顶）
 ├── core/            # 核心数据管理层
 │   ├── mod.rs
 │   ├── tag.rs       # 标签数据结构定义（内存中，无持久化）
 │   ├── matcher.rs   # 窗口句柄匹配逻辑
-│   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml）
+│   └── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml；含 show_badge_title，R6）
 ├── ui/              # 用户界面层
 │   ├── mod.rs
-│   ├── panel.rs     # 全局概览面板（DarkMode_Explorer + NM_CUSTOMDRAW，D11）
-│   ├── popup.rs     # 悬浮便签浮窗（布局重排 + 自绘按钮，D11）
+│   ├── panel.rs     # 全局概览面板（DarkMode_Explorer；D12 改 SysTreeView32 可展开树形列表 + 单击置前目标窗口；D13 标签变更自动刷新 WM_APP_TAGS_CHANGED + MIN_W 300；D14 默认纵向 400×640）；D15 根项「标题 | 窗口名称」同行、展开显示完整多行备注
+│   ├── popup.rs     # 悬浮便签浮窗（布局重排 + 自绘按钮，D11；Tab 循环/回车保存/Shift+回车换行子类化转发，D14）
 │   ├── button.rs    # 自绘圆角按钮模块（BS_OWNERDRAW + WM_DRAWITEM，D11）
 │   ├── layout.rs    # DPI 缩放辅助（dp()，D11）
 │   ├── theme.rs     # 暗色主题与圆角 + 全局字体 + 扩展调色板（DWM + WM_CTLCOLOR + lfMessageFont，D11）
-│   └── settings.rs  # 设置页面窗口（主题/圆角选择、保存、WM_APP_THEME_CHANGED 广播）
+│   └── settings.rs  # 设置页面窗口（主题/圆角选择、角标显示标题开关、保存、WM_APP_THEME_CHANGED 广播）
 └── hotkey.rs        # 全局热键注册
 tests/
 └── smoke.rs         # 冒烟测试（30 个用例）
@@ -104,4 +104,4 @@ tests/
 
 ## 当前阶段
 
-项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；2026-08-29 完成 UI 全面现代化（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + 自绘圆角按钮 + ListView DarkMode_Explorer + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow 圆边三角形角标 + tooltip 圆角分层重绘）；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。详细设计文档见 `doc/` 目录。
+项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；2026-08-29 完成 UI 全面现代化（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + 自绘圆角按钮 + ListView DarkMode_Explorer + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow 圆边三角形角标 + tooltip 圆角分层重绘）；2026-08-30 完成覆盖层标题条（R6/R11：角标旁圆角胶囊显示标签标题、5 字省略号截断、悬停看完整标题与备注、设置页开关）、概览面板树形化（R12：SysTreeView32 可展开列表）与面板单击置前（R13），见 [decision-records.md D12](./doc/decision-records.md)；同日完成面板标签变更自动刷新（D13：`WM_APP_TAGS_CHANGED` 广播经主线程转发、刷新保留展开状态）与面板最小宽度放宽（520 → 300 设计像素），见 [decision-records.md D13](./doc/decision-records.md)；同日完成弹窗键盘语义补全与三项修复（D14：Tab 在标题/备注/按钮间循环切换、备注框回车保存 Shift+回车换行、备注框遮挡按钮行的布局修复与 DPI 基准统一、面板默认纵向 400×640、覆盖层首绘异步化 + 创建后强制重绘 + 每次同步重申 HWND_TOPMOST 以修复新标注角标不显示），见 [decision-records.md D14](./doc/decision-records.md)；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。详细设计文档见 `doc/` 目录。

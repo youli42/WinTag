@@ -14,15 +14,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
+use windows::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, ShowWindow, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MINMAXINFO, SW_HIDE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    SetForegroundWindow, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBS_DROPDOWNLIST,
+    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    HMENU, MINMAXINFO, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
@@ -37,6 +38,7 @@ use crate::ui::theme::{
 /// 控件 ID 常量（子控件消息路由用）
 const IDC_THEME_COMBO: i32 = 201;
 const IDC_CORNER_COMBO: i32 = 202;
+const IDC_TITLE_CHECK: i32 = 203;
 const IDC_SAVE_BUTTON: i32 = 205;
 const IDC_CANCEL_BUTTON: i32 = 206;
 
@@ -45,11 +47,13 @@ const MARGIN: i32 = 20;
 const LABEL_W: i32 = 80;
 const CTRL_H: i32 = 26;
 const ROW_GAP: i32 = 48;
+/// 复选框行与上一行的间距（比下拉框行距更紧凑）
+const ROW_GAP_SMALL: i32 = 30;
 const BTN_W: i32 = 88;
 const BTN_H: i32 = 30;
 const BTN_GAP: i32 = 8;
 const WIN_W: i32 = 460;
-const WIN_H: i32 = 280;
+const WIN_H: i32 = 330;
 
 /// 设置窗口的用户数据：设置存储引用、隐藏窗口句柄与可见状态
 ///
@@ -71,6 +75,8 @@ pub struct SettingsData {
     pub theme_edit: HWND,
     /// 圆角编辑框句柄（预留：当前版本使用 `CBS_DROPDOWNLIST`，无独立编辑框）
     pub corner_edit: HWND,
+    /// "角标显示标题"复选框句柄（`WM_CREATE` 后有效，R6）
+    pub title_check: HWND,
 }
 
 /// 创建设置窗口（初始隐藏）
@@ -228,6 +234,7 @@ extern "system" fn settings_wndproc(
             let ctrl_h = dp(hwnd, CTRL_H);
             let row1_y = m + dp(hwnd, 8);
             let row2_y = row1_y + ctrl_h + dp(hwnd, ROW_GAP);
+            let row3_y = row2_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
             let combo_x = m + label_w;
             let combo_w = WIN_W - m - combo_x;
             let client_h = WIN_H - dp(hwnd, 30);
@@ -363,6 +370,34 @@ extern "system" fn settings_wndproc(
                 }
             }
 
+            // —— 角标显示标题复选框（R6：角标旁显示标签标题，超长省略号截断）——
+            let check_style =
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32);
+            // SAFETY: 创建 AUTOCHECKBOX 子控件（ID = IDC_TITLE_CHECK）；
+            // 失败时返回默认句柄并打印告警，保存时按未勾选处理。
+            let title_check = match unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("BUTTON"),
+                    windows::core::w!("角标显示标题"),
+                    check_style,
+                    combo_x,
+                    row3_y,
+                    combo_w,
+                    ctrl_h,
+                    hwnd,
+                    HMENU(IDC_TITLE_CHECK as *mut c_void),
+                    instance,
+                    None,
+                )
+            } {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("创建标题显示复选框失败: {e}");
+                    HWND::default()
+                }
+            };
+
             // —— 按钮行：右下 保存（accent）/取消（次要），自绘（9.4/9.8）——
             // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略。
             let _ = button::create_button(
@@ -392,6 +427,7 @@ extern "system" fn settings_wndproc(
             unsafe {
                 (*data).theme_combo = theme_combo;
                 (*data).corner_combo = corner_combo;
+                (*data).title_check = title_check;
             }
 
             // 全局消息字体注入所有子控件（STATIC/COMBOBOX；按钮自绘时选用 message_font）
@@ -594,8 +630,9 @@ fn refresh_selections(hwnd: HWND) {
         return;
     }
     let current = current_settings();
-    // SAFETY: data 已校验非空；theme_combo/corner_combo 在 WM_CREATE 时创建，
-    // CB_SETCURSEL 以枚举变体索引（System=0/Light=1/Dark=2 等）作 wParam。
+    // SAFETY: data 已校验非空；theme_combo/corner_combo/title_check 在 WM_CREATE 时创建，
+    // CB_SETCURSEL 以枚举变体索引（System=0/Light=1/Dark=2 等）作 wParam，
+    // BM_SETCHECK 以 BST_* 作 wParam。
     unsafe {
         let _ = SendMessageW(
             (*data).theme_combo,
@@ -607,6 +644,16 @@ fn refresh_selections(hwnd: HWND) {
             (*data).corner_combo,
             CB_SETCURSEL,
             WPARAM(current.corner as usize),
+            LPARAM(0),
+        );
+        let _ = SendMessageW(
+            (*data).title_check,
+            BM_SETCHECK,
+            WPARAM(if current.show_badge_title {
+                BST_CHECKED.0 as usize
+            } else {
+                BST_UNCHECKED.0 as usize
+            }),
             LPARAM(0),
         );
     }
@@ -632,12 +679,15 @@ fn save_and_hide(hwnd: HWND) {
     let pd = unsafe { &*data };
 
     // 读取两个下拉框当前选中索引（未选中时为 -1，映射函数回退默认值）
-    // SAFETY: theme_combo/corner_combo 在 WM_CREATE 时创建，均为有效子控件句柄。
+    // SAFETY: theme_combo/corner_combo/title_check 在 WM_CREATE 时创建，均为有效子控件句柄。
     let theme_idx = unsafe { SendMessageW(pd.theme_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
     let corner_idx = unsafe { SendMessageW(pd.corner_combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0;
+    let show_title = unsafe { SendMessageW(pd.title_check, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0
+        == BST_CHECKED.0 as isize;
     let new_settings = Settings {
         theme: theme_from_index(theme_idx as i32),
         corner: corner_from_index(corner_idx as i32),
+        show_badge_title: show_title,
     };
 
     // 更新内存中的设置并写盘（锁中毒时跳过，避免 panic 传播）

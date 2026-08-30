@@ -13,8 +13,9 @@ use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic, IsWindow,
-    IsWindowVisible, RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW, CS_VREDRAW, MSG,
-    WINDOW_EX_STYLE, WM_HOTKEY, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    IsWindowVisible, PostMessageW, RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_OVERLAPPED,
 };
 
 use wintag::common::{self, widestring};
@@ -89,9 +90,10 @@ fn main() -> anyhow::Result<()> {
     let _ = ui::theme::apply_dark_mode(hwnd, dark);
     let _ = ui::theme::apply_corner_preference(hwnd, cfg.corner);
 
-    // 注入 tooltip 配色（OnceLock 一次性语义：须在任何 tooltip 显示前调用，
-    // 重复调用仅首次生效，tooltip 将沿用启动时注入的配色）
+    // 注入 tooltip 配色与标题条显示开关（Mutex/AtomicBool 可热更新：
+    // reapply_theme 在设置保存广播后重新注入，新内容即时采用新配色/开关）
     sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
+    sys::overlay::set_show_title(cfg.show_badge_title);
 
     // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）
     let settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
@@ -102,6 +104,7 @@ fn main() -> anyhow::Result<()> {
         corner_combo: HWND::default(),
         theme_edit: HWND::default(),
         corner_edit: HWND::default(),
+        title_check: HWND::default(),
     });
     if settings_hwnd == HWND::default() {
         eprintln!("[设置] 设置窗口创建失败，热键仍可用（打开时自动重试创建）");
@@ -258,6 +261,10 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         match overlays.entry(target_hwnd) {
                             Entry::Vacant(v) => match sys::overlay::Overlay::create(target_hwnd) {
                                 Ok(overlay) => {
+                                    // 创建后立即强制一次重绘（与设置保存后 reapply_theme
+                                    // 的 refresh() 恢复路径一致）：确保首次 UpdateLayeredWindow
+                                    // 内容生效，角标立即可见。
+                                    overlay.refresh();
                                     v.insert(overlay);
                                     println!("[覆盖层] 创建成功: HWND={}", target_hwnd);
                                 }
@@ -265,8 +272,10 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     eprintln!("[覆盖层] 创建失败: {}", e);
                                 }
                             },
-                            Entry::Occupied(_) => {
-                                // 该窗口已有覆盖层，忽略重复请求
+                            Entry::Occupied(o) => {
+                                // 该窗口已有覆盖层：强制重绘刷新标签内容/配色
+                                // （重新标注同一窗口时标题条与颜色即时更新）
+                                o.get().refresh();
                             }
                         }
                     }
@@ -314,6 +323,30 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         common::WM_APP_THEME_CHANGED => {
             // 设置页保存后广播：重新读取全局设置并应用到所有已知窗口
             reapply_theme(hwnd);
+            LRESULT(0)
+        }
+        common::WM_APP_TAGS_CHANGED => {
+            // 便签弹窗保存标签后广播：转发给概览面板刷新树形列表
+            // （镜像 WM_APP_THEME_CHANGED 的注入/广播模式，ui 层不直接依赖面板句柄）
+            if let Some(&panel) = PANEL_HWND.get() {
+                if panel != 0 {
+                    let panel_hwnd = HWND(panel as *mut std::ffi::c_void);
+                    // SAFETY: IsWindowVisible 为只读查询，面板句柄由 main 启动时
+                    // 写入且窗口随进程存活，无生命周期风险。
+                    if unsafe { IsWindowVisible(panel_hwnd) }.as_bool() {
+                        // SAFETY: PostMessageW 为线程安全投递 API，wParam/lparam
+                        // 原样透传（wParam = 目标窗口句柄），面板自行取用。
+                        unsafe {
+                            let _ = PostMessageW(
+                                panel_hwnd,
+                                common::WM_APP_TAGS_CHANGED,
+                                wparam,
+                                lparam,
+                            );
+                        }
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
@@ -505,17 +538,18 @@ fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
         corner_combo: HWND::default(),
         theme_edit: HWND::default(),
         corner_edit: HWND::default(),
+        title_check: HWND::default(),
     })
 }
 
-/// 从全局设置重新解析主题并应用到所有已知窗口（主题变更统一入口）
+/// 从全局设置重新解析主题并应用到所有已知窗口（主题/设置变更统一入口）
 ///
 /// 供 hidden_wndproc 处理 `WM_APP_THEME_CHANGED`（设置页保存后广播）与
 /// `WM_SETTINGCHANGE`（系统主题切换，跟随系统模式）时调用：
 /// 重读设置 → 重解析调色板 → 更新全局主题 → 对 hidden/panel/settings 窗口
 /// 重新应用 DWM 暗色与圆角属性并强制重绘（WM_CTLCOLOR* 换新配色）。
-/// 覆盖层 tooltip 配色为 OnceLock 一次性注入（启动时已定），新 tooltip
-/// 沿用启动色，无需额外处理。
+/// 同时重新注入覆盖层的 tooltip 配色与标题条开关，并强制所有已存在的
+/// 覆盖层重绘（角标描边色 / 标题条配色与开关即时生效）。
 fn reapply_theme(hidden_hwnd: HWND) {
     // 重读全局设置（未注入或锁中毒时回退默认）
     let cfg = core::settings::global_settings()
@@ -539,8 +573,8 @@ fn reapply_theme(hidden_hwnd: HWND) {
         // SAFETY: panel_hwnd 由 create_panel 成功后写入 PANEL_HWND，窗口存活。
         let _ = ui::theme::apply_dark_mode(panel_hwnd, dark);
         let _ = ui::theme::apply_corner_preference(panel_hwnd, cfg.corner);
-        // 刷新 ListView 主题（DarkMode_Explorer 热更新，问题 9.3/9.5）
-        ui::panel::reapply_listview_theme(panel_hwnd, dark);
+        // 刷新树形列表主题（DarkMode_Explorer 热更新，问题 9.3/9.5）
+        ui::panel::reapply_tree_theme(panel_hwnd, dark);
         // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
         unsafe {
             let _ = InvalidateRect(panel_hwnd, None, FALSE);
@@ -562,4 +596,14 @@ fn reapply_theme(hidden_hwnd: HWND) {
     // 重新注入 tooltip 配色（Mutex 可热更新，主题切换后新 tooltip 即时采用新配色，
     // 修复原先 OnceLock 一次性注入导致主题切换后 tooltip 沿用启动配色的遗留问题）
     sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
+    // 重新注入标题条显示开关（R6），并强制所有已存在的覆盖层重绘：
+    // 主题切换后角标描边色 / 标题条配色即时更新，开关切换即时生效。
+    sys::overlay::set_show_title(cfg.show_badge_title);
+    if let Some(store) = OVERLAY_STORE.get() {
+        if let Ok(overlays) = store.lock() {
+            for overlay in overlays.values() {
+                overlay.refresh();
+            }
+        }
+    }
 }

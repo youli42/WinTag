@@ -203,6 +203,77 @@
 
 ---
 
+## D12：覆盖层标题条 + 面板树形化 + 单击置前（2026-08-30）
+
+- **决策**：四项功能改进，全部沿用纯 Win32 原生路线：
+  1. **覆盖层左上角标题条**（R6 落地）：角标右侧附加圆角胶囊标题条，显示标签标题（`tag.title`，空回退 `window_title`），超 5 个 Unicode 字符以省略号截断（`badge.rs::truncate_title` 纯函数）；渲染在 `update_layered_badge` 内合成——`badge.rs::render_rounded_rect` SDF 圆角矩形做底（tooltip 主题配色 + border 描边）+ GDI `CreateDIBSection` 文字蒙版（黑底白字 → 亮度作 alpha → tooltip_fg 着色）→ 预乘 RGBA 合成提交；窗口尺寸随内容自适应（`UpdateLayeredWindow` 的 `psize` 驱动窗口大小，`sync_position` 加 `SWP_NOSIZE` 仅跟位置）；
+  2. **悬停显示完整标题与备注**：标题条区域命中（`WM_NCHITTEST` 返回 HTCLIENT）即触发既有 tooltip 机制（`WM_MOUSEMOVE` → `TrackMouseEvent` → 自绘弹窗，显示完整 title + note），未新建机制；
+  3. **面板改可展开树形列表**：概览面板 SysListView32 四列报表 → SysTreeView32（`TVS_HASBUTTONS|HASLINES|LINESATROOT|SHOWSELALWAYS`），每个标签一个根项（`lParam` = 目标 HWND），展开显示"备注/窗口/进程"三行详情子项；配色改 `TVM_SETBKCOLOR/SETTEXTCOLOR/SETLINECOLOR`（替代 ListView 的 `NM_CUSTOMDRAW` 行级着色），暗色主题沿用 `DarkMode_Explorer`；
+  4. **面板单击置前**：`NM_CLICK`/`NM_DBLCLK` → `TVM_HITTEST` 定位根项（命中 `[+]` 按钮时交给树控件展开，详情子项不触发）→ 目标窗口最小化先 `SW_RESTORE`，再 `SetForegroundWindow` + `HWND_TOP`（**临时置前**语义：切走后不驻留顶层）。
+- **背景**：用户反馈三项使用性需求——① 角标仅有色块不足以辨识窗口，需直接显示标题（默认 5 字 + 省略号），悬停看完整标题与注释；② Ctrl+Shift+M 面板的四列表格信息密度低，希望改为可展开列表；③ 面板内应能一键把对应软件置顶到最前。
+- **备选方案**：
+  1. 标题条用独立分层窗口（否决，窗口数量翻倍且与角标同步复杂化，单窗口内合成更简单可靠）；
+  2. 文字整体软件光栅（否决，GDI 字体渲染质量与回退链成熟，仅做蒙版合成即可兼顾抗锯齿与主题色）；
+  3. 面板按软件分组两级树（否决，多数软件单窗口会多一层空壳，每标签一行 + 详情子项更贴合现有数据结构）；
+  4. 置顶用 `HWND_TOPMOST` 常驻（否决，会一直压住其他窗口，采用与既有双击一致的临时置前）。
+- **理由**：
+  1. 标题条合入覆盖层单窗口，复用既有 `UpdateLayeredWindow` 管线与 TagStore 读取链，命中测试仅在 `WM_NCHITTEST` 增加矩形分支，影响面最小；
+  2. `Settings.show_badge_title` 经 `sys::overlay::set_show_title` 注入（`AtomicBool`），维持 sys 层不读 core 的依赖方向（镜像 `set_tooltip_theme` 模式），`reapply_theme` 统一重注入并 `refresh()` 全部覆盖层（顺带修复主题切换后覆盖层不重绘、重复标注同窗口不刷新两处遗留）；
+  3. 旧 config.toml 缺 `show_badge_title` 字段经 `#[serde(default = "default_true")]` 回退显示，不破坏既有配置；
+  4. TreeView 的 lParam 承载 HWND 与原 ListView 方案一一对应，`handle_list_activate` 逻辑平移，单击即可达（双击保留同样语义）。
+
+---
+
+## D13：面板标签变更自动刷新 + 最小宽度放宽（2026-08-30）
+
+- **决策**：
+  1. **标签变更广播**：新增 `common::WM_APP_TAGS_CHANGED`（`WM_APP+6`），便签弹窗 `save_and_close` 保存成功后在既有 `WM_CREATE_OVERLAY` 广播旁追加发送；主线程 `hidden_wndproc` 收到后若面板可见则原样转发到面板窗口（`wParam` 透传目标 HWND），面板 `panel_wndproc` 收到即调 `refresh_tree` 重建树形列表。
+  2. **展开状态保留**：`refresh_tree` 重建前经 `collect_expanded_targets`（`TVM_GETNEXTITEM` 遍历根项 + `TVM_GETITEMW` 读 `TVIS_EXPANDED`）按目标窗口句柄（根项 `lParam`）记录展开集，重建后对匹配项 `TVM_EXPAND(TVE_EXPAND)` 恢复——自动刷新不再打断用户的展开浏览。
+  3. **面板最小宽度**：`MIN_W` 520 → 300（96 DPI 设计像素，经 `dp()` 缩放；150% DPI 下物理最小宽度 780 → 450px），列表形态允许拖窄到紧凑宽度。
+- **背景**：用户反馈面板开启时新建标签后列表不自动更新（面板此前为纯拉取式刷新，仅在打开/搜索输入/点击失效项时重建）；且 520 设计像素的最小宽度对列表而言过宽，无法拖窄。
+- **理由**：
+  1. 广播链完全镜像 `WM_APP_THEME_CHANGED` 的注入模式（弹窗 → 隐藏窗口 → 主线程 → 面板），ui 层之间不直接持有对方句柄，维持 `main` 统一分发的依赖方向；
+  2. 转发前以 `IsWindowVisible` 判可见，面板隐藏时跳过刷新（下次 `toggle_panel` 打开时本就会全量重建）；
+  3. 展开状态按目标 HWND 而非树项句柄记录，规避 `TVM_DELETEITEM` 令旧句柄失效的问题；
+  4. `MIN_W=300` 下搜索框与树列表仍可用（两者宽度均随 `WM_SIZE`/`layout_children` 收缩），无控件溢出。
+- **遗留**：面板创建尺寸 `WIN_W`/`WIN_H` 尚未经 `dp()` 缩放（高 DPI 下初始窗口偏小），独立问题另行处理。
+
+---
+
+## D14：弹窗键盘语义补全 + 按钮遮挡修复 + 面板默认纵向 + 角标首绘修复（2026-08-30）
+
+- **决策**：四项修复，全部沿用既有机制（子类化转发 / 刷新广播），不引入新架构：
+  1. **弹窗 Tab 焦点循环**（R7）：编辑框子类化过程（`popup.rs::edit_subclass_proc`）与按钮子类化过程（`button.rs::button_subclass_proc`）均拦截 `VK_TAB`（按钮加 `VK_ESCAPE`）`PostMessageW` 转发父弹窗；弹窗 `WM_KEYDOWN` 按"标题 → 备注 → 确认 → 取消"（`FOCUS_ORDER`）循环 `SetFocus`，Shift+Tab 反向。**不引入 `IsDialogMessageW`**——它会抢走回车键走对话框默认按钮语义，与本项目"子类化转发回车=保存"机制冲突；
+  2. **备注框回车=保存、Shift+回车=换行**（R8/R10）：子类化过程中备注框裸回车与标题框回车同路径转发保存；Shift+回车不拦截，透传多行 EDIT 类过程插入换行；
+  3. **弹窗按钮遮挡修复**（问题 11）：`note_h` 补减标签行高（`ctrl_h + 4`）；顺带统一弹窗布局 DPI 基准——控件坐标原先混用未缩放的 `WIN_W`，改用 `dp(WIN_W)`/`dp(WIN_H)` 与 `WM_GETMINMAXINFO` 锁定的窗口尺寸同基准；
+  4. **角标首绘修复**（问题 12）+ **面板默认纵向**（R14）：见"根因"。
+- **根因（角标不显示）**：实测只有设置保存广播触发的 `reapply_theme → refresh()`（InvalidateRect+UpdateWindow 重走 `UpdateLayeredWindow`）能让角标出现，说明**创建瞬间的同步首绘内容未生效**；且 `sync_position` 按位置去重早退，目标窗口激活压住覆盖层后 z 序永远无法恢复。修复三管齐下：
+  1. `Overlay::create` 首绘异步化（去掉创建栈内 `UpdateWindow`，改 `InvalidateRect` 由消息循环空闲时绘制）；
+  2. `WM_CREATE_OVERLAY` Vacant 分支创建后立即 `refresh()`（与设置保存同一恢复路径，双保险）；
+  3. `sync_position` 去掉去重早退，每次同步都 `SetWindowPos(HWND_TOPMOST)` 重申置顶（事件合并 + 500ms 轮询已节制频率）；`update_layered_badge` 的 ULW 失败改为记日志，便于今后定位。
+- **备选方案**：
+  1. Tab 导航改 `IsDialogMessageW` + `WS_TABSTOP`（否决：对话框管理器接管回车后与子类化转发保存冲突，且影响 settings/panel 现有按键处理）；
+  2. 角标首绘改 PostMessage 延迟一拍（否决：InvalidateRect 异步路径已达同样效果且更简单）。
+- **理由**：
+  1. 子类化转发链是本弹窗既定模式（问题 5.2 起沿用），新增 VK_TAB 分支零新增机制；
+  2. 面板 640×480 → 400×640 仅改常量，`WM_SIZE → layout_children` 本就自适应；
+  3. 角标三项修复互相独立、均为幂等操作，任一根因成立都覆盖。
+- **遗留**：面板创建尺寸仍未经 `dp()` 缩放（D13 遗留项延续，另行处理）。
+
+---
+
+## D15：面板树形重构——根项合并窗口名、展开显示完整多行备注（2026-08-30）
+
+- **决策**：`refresh_tree` 项结构调整：根项文本由标签标题改为"标题 | 窗口名称"一行（`lParam` 仍为目标窗口句柄，点击置前/展开状态保留逻辑不变）；详情子项由"备注/窗口/进程三行"改为"备注："标签行 + 备注完整内容——TreeView 项为单行控件项，多行备注逐行拆为独立子项（空备注显示占位"（无）"）。进程/窗口字段不再单独展示，但搜索过滤仍匹配全部四个字段。
+- **背景**：R7/R8/R10 落地后备注支持多行（Shift+回车换行），而旧树形结构把备注压成"备注：xxx"一行子项，换行内容被截断无法完整显示；窗口名称与标题并排展示信息密度也更高。
+- **备选方案**：
+  1. 子项内嵌换行渲染（否决：SysTreeView32 项为单行，需自绘 ownerdraw 才能换行，复杂度不成比例）；
+  2. 备注首行并入"备注："、续行单独子项（否决：与用户预期的"备注：/内容"两段式版式不符）。
+- **理由**：仅改 `refresh_tree` 的文本拼装，树控件机制（lParam 置前、展开状态按 HWND 恢复、搜索过滤、DarkMode_Explorer 主题）零改动；多行拆行后每行仍受树宽自动裁剪，横向滚动条兜底超长行。
+- **遗留**：无。
+
+---
+
 # 代码质量审计
 
 审计日期：2026-08-20。审计范围为 `src/` 下全部 14 个 `.rs` 文件，共 2561 行。审计在项目根目录执行。

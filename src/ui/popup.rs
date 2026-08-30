@@ -4,7 +4,7 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+    GetFocus, GetKeyState, SetFocus, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetClientRect, GetDlgCtrlID,
@@ -29,6 +29,14 @@ const IDC_TITLE_EDIT: i32 = 101;
 const IDC_NOTE_EDIT: i32 = 103;
 const IDC_OK_BUTTON: i32 = 104;
 const IDC_CANCEL_BUTTON: i32 = 105;
+
+/// Tab 焦点循环顺序（控件 ID）：标题 → 备注 → 确认 → 取消 → 回到标题（R7）
+const FOCUS_ORDER: [i32; 4] = [
+    IDC_TITLE_EDIT,
+    IDC_NOTE_EDIT,
+    IDC_OK_BUTTON,
+    IDC_CANCEL_BUTTON,
+];
 
 /// 设计像素常量（96 DPI 基准），运行时经 [`dp`] 缩放
 const MARGIN: i32 = 12;
@@ -220,6 +228,10 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             };
 
             // —— DPI 缩放后的布局坐标 ——
+            // 窗口自身宽高同样经 dp 缩放（WM_GETMINMAXINFO 锁定的就是
+            // dp(WIN_W)×dp(WIN_H)），子控件坐标必须与之同基准，否则非 100%
+            // DPI 下控件会溢出窗口右缘/底缘。
+            let win_w = dp(hwnd, WIN_W);
             let m = dp(hwnd, MARGIN);
             let label_w = dp(hwnd, LABEL_W);
             let ctrl_h = dp(hwnd, CTRL_H);
@@ -230,10 +242,13 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             let title_row_y = dp(hwnd, TITLE_ROW_Y);
             let note_row_y = dp(hwnd, NOTE_ROW_Y);
             let edit_x = m + label_w;
-            let edit_w = WIN_W - m - edit_x;
-            let client_h = WIN_H - dp(hwnd, 30); // 减去标题栏近似高度
+            let edit_w = win_w - m - edit_x;
+            let client_h = dp(hwnd, WIN_H) - dp(hwnd, 30); // 减去标题栏近似高度
             let btn_row_y = client_h - m - btn_h;
-            let note_h = btn_row_y - btn_gap - note_row_y;
+            // 备注编辑框顶 = 备注标签行下方（标签行高 + 4px 间距），底 = 按钮行
+            // 上方（留 btn_gap 间距）。原实现漏减标签行高，编辑框下探遮挡按钮行。
+            let note_top = note_row_y + ctrl_h + dp(hwnd, 4);
+            let note_h = btn_row_y - btn_gap - note_top;
 
             // —— 信息行：窗口 + 进程合并为一行 muted 小字（问题 10）——
             let info = format!("窗口：{} · 进程：{}", pd.window_title, pd.process_name);
@@ -248,7 +263,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     child_style,
                     m,
                     m,
-                    WIN_W - 2 * m,
+                    win_w - 2 * m,
                     info_h,
                     hwnd,
                     None,
@@ -345,8 +360,8 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     PCWSTR(note_wide.as_ptr()),
                     note_ws,
                     m,
-                    note_row_y + ctrl_h + dp(hwnd, 4),
-                    WIN_W - 2 * m,
+                    note_top,
+                    win_w - 2 * m,
                     note_h,
                     hwnd,
                     HMENU(IDC_NOTE_EDIT as *mut std::ffi::c_void),
@@ -363,7 +378,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             }
 
             // —— 按钮行：右下 确认（accent）/取消（次要），自绘（9.4/9.8）——
-            let btn_row_x = WIN_W - m - (btn_w * 2 + btn_gap);
+            let btn_row_x = win_w - m - (btn_w * 2 + btn_gap);
             // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略即可
             // （按钮不可用不影响弹窗其余功能，WM_COMMAND 仍走原 ID 路由）。
             let _ = button::create_button(
@@ -443,6 +458,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 虚拟键码常量（结构体字段访问不能直接作 match 模式，先绑定为常量）
             const VK_RETURN_CODE: u16 = VK_RETURN.0;
             const VK_ESCAPE_CODE: u16 = VK_ESCAPE.0;
+            const VK_TAB_CODE: u16 = VK_TAB.0;
             match key {
                 // 回车：与点击“确认”按钮等价的保存并关闭
                 VK_RETURN_CODE => save_and_close(hwnd),
@@ -453,6 +469,14 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     if !data.is_null() {
                         cancel_and_close(hwnd, data);
                     }
+                }
+                // Tab / Shift+Tab：在标题/备注/确认/取消间循环切换键盘焦点（R7）。
+                // 焦点在编辑框内时由子类化过程转发到达，焦点在按钮上时由
+                // button.rs 的子类化过程转发到达。
+                VK_TAB_CODE => {
+                    // SAFETY: GetKeyState 查询虚拟键状态，无失败路径。
+                    let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                    focus_next_control(hwnd, !shift_down);
                 }
                 _ => {}
             }
@@ -590,6 +614,13 @@ fn save_and_close(hwnd: HWND) {
                     WPARAM((*data).target_hwnd as usize),
                     LPARAM(0),
                 );
+                // SAFETY: 同上；广播标签数据变更，主线程转发给概览面板刷新树形列表。
+                let _ = PostMessageW(
+                    HWND((*data).hidden_hwnd as *mut std::ffi::c_void),
+                    common::WM_APP_TAGS_CHANGED,
+                    WPARAM((*data).target_hwnd as usize),
+                    LPARAM(0),
+                );
             }
             println!("已标记窗口：{}", unsafe { &(*data).window_title });
         } else {
@@ -620,12 +651,38 @@ fn cancel_and_close(hwnd: HWND, data: *mut PopupData) {
     }
 }
 
-/// 将 EDIT 子控件子类化：把回车（仅标题框）/ESC 键转发给父弹窗处理（问题 5.2）
+/// 在弹窗子控件间循环切换键盘焦点（Tab 正向 / Shift+Tab 反向，R7）
+///
+/// 按 [`FOCUS_ORDER`] 顺序从当前焦点控件取下一个；焦点不在已知控件上
+/// （异常路径）时落到第一个控件（标题框）。
+fn focus_next_control(hwnd: HWND, forward: bool) {
+    // SAFETY: GetFocus 查询调用线程当前焦点窗口，无失败路径（无焦点返回 NULL）。
+    let current = unsafe { GetFocus() };
+    // SAFETY: current 为本线程焦点窗口句柄（可能为 NULL，查询返回 0 无副作用）。
+    let cur_id = unsafe { GetDlgCtrlID(current) };
+    let next_idx = match FOCUS_ORDER.iter().position(|&id| id == cur_id) {
+        Some(i) => {
+            let n = FOCUS_ORDER.len();
+            let delta = if forward { 1 } else { n - 1 };
+            (i + delta) % n
+        }
+        None => 0,
+    };
+    // SAFETY: GetDlgItem 按 ID 查询本窗口子控件，失败返回 Err 被忽略。
+    if let Ok(next) = unsafe { GetDlgItem(hwnd, FOCUS_ORDER[next_idx]) } {
+        // SAFETY: next 为存活子控件句柄；SetFocus 失败仅返回 Err，忽略。
+        unsafe {
+            let _ = SetFocus(next);
+        }
+    }
+}
+
+/// 将 EDIT 子控件子类化：把回车/ESC/TAB 键转发给父弹窗处理（问题 5.2/R7/R14）
 ///
 /// 键盘消息（`WM_KEYDOWN`）只会投递给拥有键盘焦点的窗口——即编辑框本身；
-/// 若不子类化，父弹窗收不到回车/ESC，`WM_KEYDOWN` 分支无法触发保存/取消。
-/// 子类化过程仅做按键转发，其余消息经 `GetClassLongPtrW(GCLP_WNDPROC)` 取回的
-/// EDIT 类原始窗口过程透传，不影响编辑框其他行为（如多行编辑框回车换行）。
+/// 若不子类化，父弹窗收不到回车/ESC/TAB，`WM_KEYDOWN` 分支无法触发保存/取消/
+/// 焦点切换。子类化过程仅做按键转发与判定，其余消息经 `GetClassLongPtrW`
+/// (GCLP_WNDPROC) 取回的 EDIT 类原始窗口过程透传，不影响编辑框其他行为。
 ///
 /// # 参数
 ///
@@ -644,11 +701,11 @@ fn subclass_edit_for_keys(edit_hwnd: HWND) {
     }
 }
 
-/// 弹窗 EDIT 子控件的子类化窗口过程：转发回车/ESC 键给父弹窗，其余消息透传
+/// 弹窗 EDIT 子控件的子类化窗口过程：转发确认/取消/切焦点键给父弹窗，其余透传
 ///
-/// - 标题编辑框（`IDC_TITLE_EDIT`）回车 → 转发父弹窗保存；
-/// - 任一编辑框 ESC → 转发父弹窗取消；
-/// - 备注编辑框（多行）回车不转发，保留编辑框自身插入换行行为；
+/// - 标题编辑框（`IDC_TITLE_EDIT`）任意回车 → 转发父弹窗保存；
+/// - 备注编辑框（多行）：裸回车 → 转发父弹窗保存；Shift+回车透传插入换行；
+/// - 任一编辑框 ESC → 转发父弹窗取消，TAB → 转发父弹窗循环切换焦点；
 /// - 其余消息调用 EDIT 类原始窗口过程处理。
 unsafe extern "system" fn edit_subclass_proc(
     hwnd: HWND,
@@ -677,7 +734,20 @@ unsafe extern "system" fn edit_subclass_proc(
         }
         // SAFETY: GetDlgCtrlID 查询子控件 ID（创建时经 HMENU 传入）。
         let is_title = unsafe { GetDlgCtrlID(hwnd) } == IDC_TITLE_EDIT;
-        if (is_title && key == VK_RETURN.0) || key == VK_ESCAPE.0 {
+        // 转发判定：
+        // - 标题框回车 → 保存；备注框裸回车 → 保存（Shift+回车透传换行）；
+        // - ESC 取消 / TAB 切换焦点：两框均转发父弹窗统一处理。
+        let forward = if key == VK_RETURN.0 {
+            if is_title {
+                true
+            } else {
+                // SAFETY: GetKeyState 查询虚拟键状态，最高位为 1（负值）表示按下。
+                (unsafe { GetKeyState(VK_SHIFT.0 as i32) }) >= 0
+            }
+        } else {
+            key == VK_ESCAPE.0 || key == VK_TAB.0
+        };
+        if forward {
             // SAFETY: GetParent 返回创建时指定的弹窗父窗口；PostMessageW 为线程安全
             // 标准 API，异步投递避免在子控件窗口过程内同步销毁窗口（WM_DESTROY 链）。
             if let Ok(parent) = unsafe { GetParent(hwnd) } {
