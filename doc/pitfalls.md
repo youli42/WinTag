@@ -42,8 +42,26 @@
 - **`UpdateLayeredWindow` 返回 `Result`** 而非 BOOL，与多数 GDI/USER 函数不同；按 BOOL 写 `as_bool()` 会 E0599。
 - **`unsafe {}` 块参与二元比较必须加括号**：`unsafe { GetKeyState(..) } >= 0` 语法歧义报"expected expression"，需写成 `(unsafe { .. }) >= 0`。
 - **`iter().position()` 返回 `usize`**，混入 `i32` 运算后被迫来回 cast，`clippy -D warnings` 会以 `unnecessary_cast` 拦截。教训：索引运算全程保持 usize。
+- **`OnceLock<T>::get()` 返回 `&T`**：`GLOBAL_TAG_STORE.get()` 拿到的是 `&Arc<...>`，再写 `Arc::clone(&store)` 就是 `&&`，`clippy` 以 `needless_borrow` 拦截——直接 `Arc::clone(store)`。
+- **在 `if let Ok(x) = unsafe { ... }` 外再包一层括号**会触发 `unnecessary Parentheses` 警告：先把 unsafe 表达式赋给局部变量再 `if let`。
 
-### 5. SysTreeView32 项是单行的（R15 重构的原因）
+### 5. UpdateLayeredWindow 的像素字节序是 BGRA 不是 RGBA（问题 15，D17）
+
+覆盖层光栅函数按 `R,G,B,A` 顺序写像素缓冲，而 `UpdateLayeredWindow` 的 32bpp 位图内存布局是 **`B,G,R,A`**（小端 DWORD `0xAARRGGBB`）。R/B 互换使橙色 [255,183,77] 渲染成浅蓝 RGB(77,183,255)。**为什么两周没发现**：标签颜色固定橙色时代没有第二种颜色对比，且描边/标题条/文字用的都是 R≈B 的灰色系，互换后不可见——直到 D16 引入五色选择才暴露。**教训**：(a) 涉及原始像素缓冲的 API（ULW/DIB/DirectX）先确认字节序再写渲染代码；(b) 灰色/白色的测试用例验证不了通道顺序，字节序必须有专门的断言（现在 `badge_pixel_layout_is_bgra` 用纯红填充锁定）。
+
+### 6. 下拉列表的 WM_CTLCOLORLISTBOX 发给 COMBOBOX 自己（问题 16，D17）
+
+父窗口的 `WM_CTLCOLOR*` 分支收不到下拉列表的配色请求——消息发给列表的父窗口即 COMBOBOX 本身，DefWindowProc 用系统配色（暗色主题变体下深底黑字不可读）。修复必须**子类化下拉框**在其过程内拦截配色；同理 `CBS_DROPDOWNLIST` 的关闭态显示区也是这么发的。
+
+### 7. 窗口类 hCursor 为 NULL 时鼠标会"消失"（问题 14，D17）
+
+`RegisterClassW` 的 `WNDCLASSW` 经 `..Default::default()` 构造时 `hCursor` 为 NULL，`DefWindowProc` 处理 `WM_SETCURSOR` 会 `SetCursor(NULL)`——鼠标悬停到该窗口上光标隐藏。时序依赖使它"间歇出现"（光标状态残留），极难直觉定位。**教训**：每个自定义窗口类都应显式设 `hCursor: LoadCursorW(None, IDC_ARROW)`；本项目收敛为 `common::arrow_cursor()` 统一取用。
+
+### 8. 后台启动的测试进程会锁住构建产物
+
+用 `./target/debug/wintag.exe &` 做冒烟/自动化测试后忘记杀进程，下次 `cargo build/run` 报"拒绝访问 (os error 5)"（Windows 锁定运行中的 exe）。**教训**：后台启动的验证进程用完立即 `taskkill`；遇到 os error 5 先 `tasklist | grep wintag`。
+
+### 9. SysTreeView32 项是单行的（R15 重构的原因）
 
 备注支持多行（Shift+回车换行）后，旧面板树把备注压成"备注：xxx"一行子项，换行内容被截断。TreeView 项**没有自动换行**，要换行只有 ownerdraw 自绘一条路（复杂度不成比例）。实际采用：多行备注逐行拆成独立子项，视觉上即"备注：标签行 + 内容行"的树形版式。**教训**：选系统控件前先确认其文本渲染边界（单行、无自动换行、宽度裁剪策略），功能需求（多行文本展示）可能直接推翻控件选型。
 

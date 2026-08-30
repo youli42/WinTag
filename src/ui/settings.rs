@@ -17,13 +17,14 @@ use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    HMENU, MINMAXINFO, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, GetClassLongPtrW, GetClientRect, PostMessageW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
+    BS_AUTOCHECKBOX, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_WNDPROC, GWLP_WNDPROC, HMENU, MINMAXINFO, SW_HIDE,
+    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
@@ -31,8 +32,8 @@ use crate::core::settings::{global_settings, CornerPreference, Settings, ThemeMo
 use crate::ui::button::{self, ButtonStyle};
 use crate::ui::layout::dp;
 use crate::ui::theme::{
-    apply_corner_preference, apply_dark_mode, apply_font_to_children, detect_system_dark,
-    get_brush, light_colors, theme_colors,
+    apply_control_theme, apply_corner_preference, apply_dark_mode, apply_font_to_children,
+    get_brush, light_colors, sync_window_theme, theme_colors,
 };
 
 /// 控件 ID 常量（子控件消息路由用）
@@ -104,6 +105,8 @@ pub fn create_settings(data: SettingsData) -> HWND {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(settings_wndproc),
         hInstance: HINSTANCE::default(),
+        // 类光标必须非 NULL（NULL 会让 DefWindowProc 的 WM_SETCURSOR 隐藏光标）
+        hCursor: crate::common::arrow_cursor(),
         lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
@@ -285,7 +288,12 @@ extern "system" fn settings_wndproc(
                     None,
                 )
             } {
-                Ok(c) => c,
+                Ok(c) => {
+                    // 下拉框子类化（D17）：下拉列表的 WM_CTLCOLORLISTBOX 发给
+                    // COMBOBOX 自己而非父窗口，须在其子类过程中拦截配色
+                    subclass_combo_for_theme(c);
+                    c
+                }
                 Err(e) => {
                     eprintln!("创建主题下拉框失败: {e}");
                     HWND::default()
@@ -344,7 +352,11 @@ extern "system" fn settings_wndproc(
                     None,
                 )
             } {
-                Ok(c) => c,
+                Ok(c) => {
+                    // 同上：子类化拦截下拉列表配色（D17）
+                    subclass_combo_for_theme(c);
+                    c
+                }
                 Err(e) => {
                     eprintln!("创建圆角下拉框失败: {e}");
                     HWND::default()
@@ -433,19 +445,20 @@ extern "system" fn settings_wndproc(
             // 全局消息字体注入所有子控件（STATIC/COMBOBOX；按钮自绘时选用 message_font）
             apply_font_to_children(hwnd);
 
-            // 应用当前主题与圆角偏好（从全局设置读取，未注入时用默认值）
-            let current = current_settings();
-            let dark = match current.theme {
-                ThemeMode::Dark => true,
-                ThemeMode::System => detect_system_dark(),
-                ThemeMode::Light => false,
-            };
+            // 统一主题管理器（D17）：解析全局设置 → 写入全局调色板 → 取得暗色判定，
+            // 与弹窗/面板走同一入口（此前各自解析，存在与全局调色板漂移的隐患）
+            let theme_ctx = sync_window_theme();
+            let dark = theme_ctx.dark;
             // SAFETY: hwnd 为正在创建中的有效窗口句柄；apply_* 内部已处理 DWM 调用失败。
             let _ = apply_dark_mode(hwnd, dark);
-            let _ = apply_corner_preference(hwnd, current.corner);
+            let _ = apply_corner_preference(hwnd, theme_ctx.corner);
 
             // 按当前全局设置初始化下拉框选中项
             refresh_selections(hwnd);
+
+            // 子控件 comctl32 主题变体（D17）：下拉框/复选框随暗色主题渲染
+            //（此前从不应用，暗色主题下保持系统默认的白色外观）
+            apply_control_theme(hwnd, dark);
 
             LRESULT(0)
         }
@@ -617,6 +630,56 @@ fn ctlcolor_brush(lparam: LPARAM, bg: COLORREF, fg: COLORREF) -> LRESULT {
         let _ = SetBkColor(hdc, bg);
     }
     LRESULT(get_brush(bg).0 as isize)
+}
+
+/// 将 COMBOBOX 子类化：拦截下拉列表/显示区的配色消息（D17）
+///
+/// Win32 坑：下拉框的下拉列表（以及 `CBS_DROPDOWNLIST` 的显示区）把
+/// `WM_CTLCOLORLISTBOX` / `WM_CTLCOLORSTATIC` 发给 **COMBOBOX 自己**而非
+/// 父窗口——父窗口的 `WM_CTLCOLOR*` 分支收不到，列表保持系统配色
+///（暗色主题变体下表现为深底黑字）。子类过程按全局调色板设置文字/背景色
+/// 并返回背景画刷，其余消息透传 COMBOBOX 类原始过程。
+///
+/// # 参数
+///
+/// - `combo_hwnd`：刚创建成功的 COMBOBOX 子控件句柄
+fn subclass_combo_for_theme(combo_hwnd: HWND) {
+    // SAFETY: combo_hwnd 为刚创建成功的有效子控件；SetWindowLongPtrW 仅替换
+    // 实例窗口过程，无额外内存操作，失败静默忽略。
+    unsafe {
+        let _ = SetWindowLongPtrW(
+            combo_hwnd,
+            GWLP_WNDPROC,
+            combo_subclass_proc as *const () as isize,
+        );
+    }
+}
+
+/// 下拉框子类化窗口过程：拦截配色消息按主题着色，其余透传
+unsafe extern "system" fn combo_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CTLCOLORLISTBOX || msg == WM_CTLCOLORSTATIC {
+        // 主题状态未初始化时回退系统默认配色
+        if let Some(c) = theme_colors() {
+            // SAFETY: wParam 携带列表/显示区本次绘制使用的 HDC，仅消息处理期间有效。
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let _ = SetTextColor(hdc, c.fg);
+            let _ = SetBkColor(hdc, c.bg);
+            // 背景画刷进程级缓存持有，可安全作为消息返回值
+            return LRESULT(get_brush(c.bg).0 as isize);
+        }
+    }
+    // 其余消息透传 COMBOBOX 类原始窗口过程
+    // SAFETY: GetClassLongPtrW(GCLP_WNDPROC) 返回类过程，函数指针↔整数
+    // transmute 往返在 Windows ABI 下良定义。
+    let orig = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
+    let orig_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+        unsafe { std::mem::transmute(orig) };
+    orig_proc(hwnd, msg, wparam, lparam)
 }
 
 /// 刷新两个下拉框的选中项为当前全局设置

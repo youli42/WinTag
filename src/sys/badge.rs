@@ -8,7 +8,8 @@
 //!   计算每像素 coverage，天然抗锯齿；
 //! - 1px 深色描边（混 `stroke` 色）保证浅色窗口上可辨识。
 //!
-//! 输出为预乘 RGBA 字节缓冲（`UpdateLayeredWindow` 32bpp DIB 直接使用），
+//! 输出为预乘 BGRA 字节缓冲（字节序 B,G,R,A——`UpdateLayeredWindow` 32bpp 位图
+//! 的内存布局；D16 修复：原先误写 RGBA 导致 R≠B 的颜色互换显示），
 //! `render_badge` 为无窗口依赖的纯函数，可单测。
 
 /// 角标渲染参数
@@ -44,7 +45,7 @@ fn signed_dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) 
     (dist, cross >= 0.0)
 }
 
-/// 渲染贴角圆边三角形为预乘 RGBA 字节缓冲
+/// 渲染贴角圆边三角形为预乘 BGRA 字节缓冲
 ///
 /// 三角形顶点（以左上角为原点，x 向右、y 向下）：
 /// - A = (0, 0)        左上直角顶点
@@ -54,7 +55,7 @@ fn signed_dist_to_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) 
 /// 斜边 BC；内部判定：点在 BC 的左下侧（叉积 ≥ 0）且在两条直角边内侧。
 /// 圆角：在顶点附近用距离场软化；描边：距斜边 < 1.5px 时混 stroke 色。
 ///
-/// 返回 `size * size * 4` 字节的预乘 RGBA 缓冲（行优先、从上到下）。
+/// 返回 `size * size * 4` 字节的预乘 BGRA 缓冲（字节序 B,G,R,A；行优先、从上到下）。
 pub fn render_badge(params: BadgeParams) -> Vec<u8> {
     let n = params.size.max(0) as usize;
     let mut buf = vec![0u8; n * n * 4];
@@ -137,11 +138,13 @@ pub fn render_badge(params: BadgeParams) -> Vec<u8> {
             let g = base_g * (1.0 - stroke_mix) + s_g * stroke_mix;
             let b = base_b * (1.0 - stroke_mix) + s_b * stroke_mix;
             let alpha = (coverage * 255.0).round() as u8;
-            // 预乘：颜色通道乘以 coverage
+            // 预乘：颜色通道乘以 coverage；字节序为 B,G,R,A——
+            // UpdateLayeredWindow 的 32bpp 位图内存布局即 BGRA（D16 修复：
+            // 原先按 RGBA 写入导致橙/蓝等 R≠B 的颜色互换显示）
             let premul = coverage;
-            buf[idx] = (r * premul) as u8;
+            buf[idx] = (b * premul) as u8;
             buf[idx + 1] = (g * premul) as u8;
-            buf[idx + 2] = (b * premul) as u8;
+            buf[idx + 2] = (r * premul) as u8;
             buf[idx + 3] = alpha;
         }
     }
@@ -162,14 +165,14 @@ pub fn truncate_title(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// 渲染圆角矩形为预乘 RGBA 字节缓冲（纯函数，SDF 抗锯齿）
+/// 渲染圆角矩形为预乘 BGRA 字节缓冲（纯函数，SDF 抗锯齿）
 ///
 /// `width`/`height` 为矩形逻辑像素尺寸，`radius` 为四角圆角半径
 /// （自动夹取到不超过宽高一半）；`fill` 为填充色，`stroke` 为 1px
 /// 边界描边混色。与 [`render_badge`] 同款：逐像素计算到圆角矩形边界
 /// 的符号距离，边界 1px 过渡带实现抗锯齿。
 ///
-/// 返回 `width * height * 4` 字节的预乘 RGBA 缓冲（行优先、从上到下）。
+/// 返回 `width * height * 4` 字节的预乘 BGRA 缓冲（字节序 B,G,R,A；行优先、从上到下）。
 pub fn render_rounded_rect(
     width: i32,
     height: i32,
@@ -225,9 +228,10 @@ pub fn render_rounded_rect(
             let b_ch = fill[2] as f32 * (1.0 - stroke_mix) + stroke[2] as f32 * stroke_mix;
             let alpha = (coverage * 255.0).round() as u8;
             let premul = coverage;
-            buf[idx] = (r_ch * premul) as u8;
+            // 字节序 B,G,R,A（UpdateLayeredWindow 32bpp 位图内存布局，同 render_badge）
+            buf[idx] = (b_ch * premul) as u8;
             buf[idx + 1] = (g_ch * premul) as u8;
-            buf[idx + 2] = (b_ch * premul) as u8;
+            buf[idx + 2] = (r_ch * premul) as u8;
             buf[idx + 3] = alpha;
         }
     }
@@ -346,5 +350,27 @@ mod tests {
         assert_eq!(buf.len(), 20 * 20 * 4);
         // 中心像素应实心（胶囊形状）
         assert!(buf[(10 * 20 + 10) * 4 + 3] > 200);
+    }
+
+    /// 像素字节序必须是 BGRA（D16）：红色填充的中心像素
+    /// 应为 [B=0, G=0, R=255, A=255]——按 RGBA 误读即出现橙/蓝互换
+    #[test]
+    fn badge_pixel_layout_is_bgra() {
+        let buf = render_badge(BadgeParams {
+            size: 18,
+            fill: [255, 0, 0, 255],
+            stroke: [255, 0, 0, 255],
+        });
+        // 取 (5,5)：远离三条边与顶点圆角（(9,9) 已在斜边过渡带上）
+        let c = (5 * 18 + 5) * 4;
+        assert_eq!(buf[c], 0, "byte0 应为蓝通道");
+        assert_eq!(buf[c + 1], 0, "byte1 应为绿通道");
+        assert_eq!(buf[c + 2], 255, "byte2 应为红通道");
+        assert_eq!(buf[c + 3], 255);
+
+        let rect = render_rounded_rect(20, 20, 6, [0, 0, 255, 255], [0, 0, 255, 255]);
+        let c = (10 * 20 + 10) * 4;
+        assert_eq!(rect[c], 255, "byte0 应为蓝通道");
+        assert_eq!(rect[c + 2], 0, "byte2 应为红通道");
     }
 }

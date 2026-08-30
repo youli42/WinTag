@@ -3,7 +3,7 @@
 //! 本模块只依赖 windows-rs 与标准库，不依赖项目内其他模块
 //! （core / sys / ui / hotkey），供任意模块按需复用。当前提供：
 //!
-//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发、设置窗口、主题变更、标签变更
+//! - 自定义窗口消息常量：覆盖层创建 / 销毁、WinEvent 事件转发、设置窗口、主题变更、标签变更、标签编辑
 //! - [`widestring`]：UTF-16 宽字符串转换
 //! - [`get_userdata`] / [`set_userdata`]：窗口用户数据（GWLP_USERDATA）读写
 //!
@@ -11,7 +11,7 @@
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, GWLP_USERDATA, WM_APP,
+    GetWindowLongPtrW, LoadCursorW, SetWindowLongPtrW, GWLP_USERDATA, IDC_ARROW, WM_APP,
 };
 
 /// 自定义消息：创建覆盖层（wParam = 目标窗口句柄）
@@ -45,12 +45,30 @@ pub const WM_APP_THEME_CHANGED: u32 = WM_APP + 5;
 /// 面板收到后刷新树形列表（镜像 [`WM_APP_THEME_CHANGED`] 的广播模式）。
 pub const WM_APP_TAGS_CHANGED: u32 = WM_APP + 6;
 
+/// 自定义消息：请求编辑目标窗口的标签（wParam = 目标窗口句柄）
+///
+/// 由覆盖层（角标/标题条单击，R5）或概览面板右键菜单"编辑标签"发送到
+/// 隐藏窗口，主线程读取标签存储后为该目标窗口打开标记弹窗（预填已有
+/// 标题/备注/颜色）。
+pub const WM_APP_EDIT_TAG: u32 = WM_APP + 7;
+
 /// 将字符串编码为以 NUL（`\0`）结尾的 UTF-16 宽字符串
 ///
 /// 用于向 Win32 API 传入窗口类名、窗口标题等宽字符串参数，
 /// 返回值可直接通过 `PCWSTR(ptr)` 或 `PCWSTR(as_ptr())` 使用。
 pub fn widestring(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 返回系统标准箭头光标句柄（供自注册窗口类的 `hCursor` 字段使用）
+///
+/// 自定义窗口类的 `hCursor` 为 NULL 时，`DefWindowProc` 处理 `WM_SETCURSOR`
+/// 会把光标设为 NULL——表现为鼠标悬停在该窗口上时光标"消失"。所有
+/// `RegisterClassW` 注册的类都应设置本句柄。
+pub fn arrow_cursor() -> windows::Win32::UI::WindowsAndMessaging::HCURSOR {
+    // SAFETY: LoadCursorW 加载标准共享光标资源，无副作用；失败返回 Err 时
+    // 回退默认句柄（与旧行为一致）。
+    unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default()
 }
 
 /// 读取窗口的用户数据指针（GWLP_USERDATA）

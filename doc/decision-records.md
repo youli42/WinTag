@@ -274,6 +274,38 @@
 
 ---
 
+## D16：标注流程闭环——角标点击编辑 + 颜色选择 + 面板右键菜单（2026-08-30）
+
+- **决策**：四项围绕"标注流程闭环"的改进：
+  1. **角标/标题条单击打开编辑弹窗**（R5）：覆盖层可交互区（`WM_NCHITTEST` 已返回 HTCLIENT 的角标三角形 + 标题条）补 `WM_LBUTTONDOWN` → 经注入的隐藏窗口发 `WM_APP_EDIT_TAG`（`WM_APP+7`）→ 主线程校验目标存活且有标签后调用 `ui::popup::create_popup`（预填标题/备注/颜色）。sys 层不反向依赖 ui，隐藏窗口句柄经 `set_message_target` 注入（镜像 `set_tag_store` 模式）；
+  2. **弹窗颜色选择行**（R16）：5 个 `BS_OWNERDRAW` 色块（`WM_DRAWITEM` 拦截自绘纯色圆角矩形，选中项 2px 前景色描边环），点击走标准 `WM_COMMAND` 路由更新 `PopupData.selected_color`；编辑已有标签预选原颜色；保存不再固定橙色；
+  3. **面板右键菜单 + Esc 关闭**（R17）：根项右键 `TrackPopupMenu(TPM_RETURNCMD)`（置前/编辑/移除），移除 = 清存储 + `WM_DESTROY_OVERLAY` + 刷新；搜索框子类化转发 Esc（标准 EDIT 吞键，与弹窗 Tab 同一坑）；
+  4. **标题/备注动态长度读取**：`GetWindowTextLengthW` 分配取代 256/1024 定长栈缓冲——原先超长内容被**静默丢弃**，用户毫无感知。
+- **备选方案**：
+  1. 色块用 `button::create_button` 复用文本按钮（否决：文本按钮自绘流程注册状态表、悬停态对纯色块无意义，直接 `BS_OWNERDRAW` + `WM_DRAWITEM` 拦截更薄）；
+  2. 覆盖层直接调用 `ui::popup::create_popup`（否决：sys → ui 反向依赖，违反模块方向约定）；
+  3. 面板菜单经 `WM_COMMAND` 路由（否决：`TPM_RETURNCMD` 同步取回更简单，无路由状态需保存）。
+- **理由**：全链路复用既有机制——渲染管线按 `tag.color` 取色使颜色选择零渲染改动；`WM_APP_EDIT_TAG` 通道同时服务角标单击与面板菜单两个入口；Esc 转发与 D14 的按键子类化转发同构。
+- **遗留**：无。
+
+---
+
+## D17：BGRA 字节序修复 + 统一主题管理器 + 弹窗单例/定位 + 光标修复（2026-08-30）
+
+- **决策**：五项修复，全部为既有机制的纠偏与收口：
+  1. **覆盖层颜色字节序**（问题 15）：`badge.rs` 两个 SDF 光栅函数与 `overlay_text_into` 文字合成的像素写入从 RGBA 改为 **BGRA**（`UpdateLayeredWindow` 32bpp 位图内存布局即字节序 B,G,R,A、预乘 alpha），新增单测锁定字节序（红填充中心像素 `[B=0,G=0,R=255,A=255]`）；
+  2. **统一主题管理器**（问题 16，用户需求"用一个统一的主题管理器控制背景色、方便扩展复用"）：`theme.rs` 新增 `sync_window_theme()`（读全局设置+系统深浅色 → 解析调色板写入全局 → 返回 `WindowThemeCtx{colors,dark,corner}`）与 `apply_control_theme()`（对 EDIT/BUTTON/COMBOBOX 应用 `DarkMode_Explorer`/`Explorer` comctl32 变体，使下拉框箭头/复选框图形/滚动条随主题）；弹窗/面板/设置三窗口 WM_CREATE 统一走该入口（替代各自复制的四步），`reapply_theme` 热更新时重应用控件变体；
+  3. **下拉框配色**（问题 16）：下拉列表/`CBS_DROPDOWNLIST` 显示区的 `WM_CTLCOLORLISTBOX`/`WM_CTLCOLORSTATIC` 发给 COMBOBOX 自身而非父窗口——子类化下拉框拦截配色按全局调色板着色（镜像 Edit 子类化模式）；
+  4. **弹窗单例 + 光标附近定位**（问题 13/用户需求）：`ACTIVE_POPUP` 注册表——同目标请求复用置前聚焦、异目标销毁旧弹窗重建；弹窗创建于光标右下 (16,16)，按 dp 实际尺寸钳制到所在显示器工作区（创建样式去掉 `WS_VISIBLE` 先定位后显示，避免默认位置闪现）；顺带修正弹窗创建尺寸未过 `dp()` 的 DPI 隐患；
+  5. **窗口类光标**（问题 14）：5 个自注册窗口类统一 `hCursor = arrow_cursor()`（common 新增辅助）——类光标 NULL 时 `DefWindowProc` 的 `WM_SETCURSOR` 会隐藏光标。
+- **附带改进**：tooltip 文本动态长度读取（>512 字符备注不再截断）、tooltip 位置工作区钳制（底部放不下翻到光标上方）、标题尾部 CR 剥离。
+- **备选方案**：
+  1. 字节序在合成端交换而非光栅端输出 BGRA（否决：三处消费点统一为一种布局更不易再错，且单测可直接断言缓冲字节）；
+  2. 下拉框换 `CBS_OWNERDRAWFIXED` 自绘（否决：为配色引入整套项绘制，子类化拦截 CTLCOLOR 更薄）。
+- **遗留**：**问题 17（悬停 tooltip 备注显示不完整）待修复**——已做动态读取/定位钳制/CR 清理三部分，现象仍待复测排查。
+
+---
+
 # 代码质量审计
 
 审计日期：2026-08-20。审计范围为 `src/` 下全部 14 个 `.rs` 文件，共 2561 行。审计在项目根目录执行。

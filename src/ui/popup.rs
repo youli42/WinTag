@@ -1,16 +1,23 @@
 use std::sync::{Arc, Mutex};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
-use windows::Win32::UI::Controls::EM_SETSEL;
+use windows::Win32::Foundation::{
+    COLORREF, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    CreatePen, CreateSolidBrush, DeleteObject, DrawFocusRect, FillRect, GetMonitorInfoW,
+    InvalidateRect, MonitorFromPoint, RoundRect, SelectObject, SetBkColor, SetTextColor, HDC,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PS_SOLID,
+};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETSEL, ODS_FOCUS, ODT_BUTTON};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SetFocus, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetClientRect, GetDlgCtrlID,
-    GetDlgItem, GetParent, GetWindowTextW, PostMessageW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC, GWLP_WNDPROC, HMENU,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassLongPtrW, GetClientRect, GetCursorPos,
+    GetDlgCtrlID, GetDlgItem, GetParent, GetWindowTextLengthW, GetWindowTextW, IsWindow,
+    PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL,
+    ES_AUTOVSCROLL, ES_MULTILINE, GCLP_WNDPROC, GWLP_WNDPROC, HMENU, HWND_TOPMOST, SWP_NOACTIVATE,
     SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
     WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO,
     WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -19,7 +26,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::common::{self, get_userdata, set_userdata, widestring};
 use crate::core::matcher;
-use crate::core::settings::ThemeMode;
 use crate::core::tag::{Tag, TagColor, TagStore};
 use crate::ui::button::{self, ButtonStyle};
 use crate::ui::layout::dp;
@@ -29,6 +35,8 @@ const IDC_TITLE_EDIT: i32 = 101;
 const IDC_NOTE_EDIT: i32 = 103;
 const IDC_OK_BUTTON: i32 = 104;
 const IDC_CANCEL_BUTTON: i32 = 105;
+/// 颜色选择色块起始 ID（依次为 [`COLOR_CHOICES`] 各变体，R16）
+const IDC_COLOR_BASE: i32 = 110;
 
 /// Tab 焦点循环顺序（控件 ID）：标题 → 备注 → 确认 → 取消 → 回到标题（R7）
 const FOCUS_ORDER: [i32; 4] = [
@@ -36,6 +44,15 @@ const FOCUS_ORDER: [i32; 4] = [
     IDC_NOTE_EDIT,
     IDC_OK_BUTTON,
     IDC_CANCEL_BUTTON,
+];
+
+/// 颜色选择行的候选色（顺序即色块 ID 顺序，R16）
+const COLOR_CHOICES: [TagColor; 5] = [
+    TagColor::Orange,
+    TagColor::Blue,
+    TagColor::Green,
+    TagColor::Red,
+    TagColor::Purple,
 ];
 
 /// 设计像素常量（96 DPI 基准），运行时经 [`dp`] 缩放
@@ -47,7 +64,13 @@ const BTN_H: i32 = 30;
 const BTN_GAP: i32 = 8;
 const INFO_H: i32 = 20;
 const TITLE_ROW_Y: i32 = 44;
-const NOTE_ROW_Y: i32 = 80;
+/// 颜色选择行 Y 坐标（标题行下方，R16）
+const COLOR_ROW_Y: i32 = 78;
+const NOTE_ROW_Y: i32 = 112;
+/// 颜色色块尺寸与间距（R16）
+const CHIP_W: i32 = 40;
+const CHIP_H: i32 = 16;
+const CHIP_GAP: i32 = 8;
 const WIN_W: i32 = 420;
 const WIN_H: i32 = 320;
 
@@ -58,13 +81,23 @@ struct PopupData {
     window_title: String,
     process_name: String,
     hidden_hwnd: isize,
+    /// 当前选中的标签颜色（R16：色块行选择，保存时写入 Tag）
+    selected_color: TagColor,
 }
+
+/// 当前打开的标记弹窗注册表：(目标窗口句柄, 弹窗句柄)
+///
+/// 同一时间至多一个弹窗：同目标重复请求（如多次点击同一角标）复用并置前，
+/// 异目标请求销毁旧弹窗后新建。仅主线程读写。
+static ACTIVE_POPUP: Mutex<Option<(isize, isize)>> = Mutex::new(None);
 
 /// 创建“标记窗口”弹窗
 ///
 /// 在主线程中为指定目标窗口弹出标签编辑弹窗，用于输入标签标题与备注。
 /// 弹窗数据（[`PopupData`]）通过 `lpCreateParams` 传入，窗口销毁（`WM_DESTROY`）时释放；
 /// 确认按钮触发标签写入成功后，才发送 `WM_CREATE_OVERLAY` 请求覆盖层创建。
+/// 同一时间仅存在一个弹窗（R18）：同目标请求复用置前，异目标请求替换；
+/// 弹窗出现在鼠标附近（R19），越界时钳制回显示器工作区。
 ///
 /// # 参数
 ///
@@ -80,12 +113,50 @@ pub fn create_popup(
     process_name: &str,
     hidden_hwnd: isize,
 ) {
+    // 单例复用（R18）：已有弹窗时——同目标置前复用（不再叠加新弹窗），
+    // 异目标销毁旧弹窗（WM_DESTROY 释放数据并清理注册表）后新建
+    if let Ok(mut active) = ACTIVE_POPUP.lock() {
+        if let Some((old_target, old_hwnd)) = *active {
+            // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE。
+            if unsafe { IsWindow(HWND(old_hwnd as *mut std::ffi::c_void)) }.as_bool() {
+                if old_target == target_hwnd {
+                    // 复用：置前并聚焦标题框，直接返回
+                    let popup = HWND(old_hwnd as *mut std::ffi::c_void);
+                    // SAFETY: popup 为存活弹窗句柄；ShowWindow/SetForegroundWindow/
+                    // GetDlgItem/SetFocus 失败均仅返回错误值，忽略。
+                    unsafe {
+                        let _ = ShowWindow(popup, SW_SHOW);
+                        let _ = SetForegroundWindow(popup);
+                        if let Ok(title_edit) = GetDlgItem(popup, IDC_TITLE_EDIT) {
+                            let _ = SetFocus(title_edit);
+                        }
+                    }
+                    return;
+                }
+                // SAFETY: old_hwnd 为本进程存活弹窗，DestroyWindow 触发
+                // WM_DESTROY 释放其用户数据（主线程内调用合法）。
+                unsafe {
+                    let _ = DestroyWindow(HWND(old_hwnd as *mut std::ffi::c_void));
+                }
+            }
+            *active = None;
+        }
+    }
+
+    // 预选颜色：已有标签沿用其颜色，否则默认橙色（R16）
+    let selected_color = store
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&target_hwnd).map(|t| t.color))
+        .unwrap_or(TagColor::Orange);
+
     let data = Box::new(PopupData {
         tag_store: store,
         target_hwnd,
         window_title: window_title.to_string(),
         process_name: process_name.to_string(),
         hidden_hwnd,
+        selected_color,
     });
     // SAFETY: data 的所有权转交给弹窗窗口（作为 lpCreateParams 传入），窗口 WM_DESTROY 时
     // 通过 Box::from_raw 归还；若 CreateWindowExW 失败则在本函数内归还释放，均只释放一次。
@@ -97,6 +168,8 @@ pub fn create_popup(
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(popup_wndproc),
         hInstance: HINSTANCE::default(),
+        // 类光标必须非 NULL（NULL 会让 DefWindowProc 的 WM_SETCURSOR 隐藏光标）
+        hCursor: common::arrow_cursor(),
         lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
@@ -112,10 +185,16 @@ pub fn create_popup(
     // - 保留 WS_THICKFRAME（WS_OVERLAPPEDWINDOW 的可缩放边框）但通过
     //   WM_GETMINMAXINFO 固定尺寸，防止控件位置错乱（9.6 原本靠布局自适应，
     //   但固定尺寸是最简且不撕裂的方案）。
-    let style = WINDOW_STYLE(
-        (WS_OVERLAPPEDWINDOW.0 & !((WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0)) | WS_VISIBLE.0,
-    );
+    // - 不带 WS_VISIBLE：先定位到光标附近再显示，避免默认位置闪现。
+    let style = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 & !((WS_MINIMIZEBOX | WS_MAXIMIZEBOX).0));
     let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0);
+
+    // 光标附近初始位置（R19）；创建后按 dp 实际尺寸精确钳制
+    let mut origin = POINT::default();
+    // SAFETY: GetCursorPos 无前置条件，失败时 origin 保持 (0,0)。
+    unsafe {
+        let _ = GetCursorPos(&mut origin);
+    }
 
     // SAFETY: CreateWindowExW 为线程安全标准 API；失败时归还 data_ptr 所有权并打印错误，
     // 提前返回，避免 Box 泄漏。
@@ -125,8 +204,8 @@ pub fn create_popup(
             PCWSTR(class_name.as_ptr()),
             windows::core::w!("标记窗口"),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            origin.x + 16,
+            origin.y + 16,
             WIN_W,
             WIN_H,
             None,
@@ -136,8 +215,19 @@ pub fn create_popup(
         )
     } {
         Ok(hwnd) => {
-            // SAFETY: hwnd 为刚创建成功的有效窗口句柄。
+            // 登记活动弹窗（单例复用依据，R18）
+            if let Ok(mut active) = ACTIVE_POPUP.lock() {
+                *active = Some((target_hwnd, hwnd.0 as isize));
+            }
+
+            // 尺寸对齐 DPI（WM_GETMINMAXINFO 锁定的就是 dp 尺寸，创建尺寸需一致）
+            // 并钳制到光标附近 + 显示器工作区内，然后一次性显示（无默认位置闪现）。
+            let w = dp(hwnd, WIN_W);
+            let h = dp(hwnd, WIN_H);
+            let (x, y) = clamp_to_work(origin.x + 16, origin.y + 16, w, h);
+            // SAFETY: hwnd 为刚创建成功的有效窗口句柄；SetWindowPos 定位定尺寸。
             unsafe {
+                let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
             // 弹窗已显示：激活窗口（问题 5.1）。WM_CREATE 中的 SetFocus 在窗口未激活时
@@ -168,6 +258,42 @@ pub fn create_popup(
     }
 }
 
+/// 将弹窗位置钳制到光标附近 + 所在显示器工作区内（R19）
+///
+/// 首选光标右下偏移 (16, 16)；越出工作区右/下边界时向左/上收回，
+/// 负坐标时贴工作区左/上边缘。
+fn clamp_to_work(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    // SAFETY: MonitorFromPoint 为只读查询，取不到时返回 NULL 由下方回退处理。
+    let hmon = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    if hmon.is_invalid() {
+        return (x, y);
+    }
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: mi 为栈上缓冲且 cbSize 已填，GetMonitorInfoW 只读填充。
+    if !unsafe { GetMonitorInfoW(hmon, &mut mi) }.as_bool() {
+        return (x, y);
+    }
+    let work = mi.rcWork;
+    let mut nx = x;
+    let mut ny = y;
+    if nx + w > work.right {
+        nx = work.right - w;
+    }
+    if ny + h > work.bottom {
+        ny = work.bottom - h;
+    }
+    if nx < work.left {
+        nx = work.left;
+    }
+    if ny < work.top {
+        ny = work.top;
+    }
+    (nx, ny)
+}
+
 extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CREATE => {
@@ -183,24 +309,15 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 set_userdata(hwnd, data as *mut std::ffi::c_void);
             }
 
-            // 读取全局设置并应用暗色主题与圆角偏好（任务 T7）
-            // global_settings 未注入（如独立测试环境）时回退默认设置（跟随系统 + 默认圆角）。
+            // 统一主题管理器（D17）：解析全局设置 → 写入全局调色板 → 取得暗色判定。
             // 需在子控件创建前完成：控件首次绘制即发 WM_CTLCOLOR* 请求配色，须先写入
-            // THEME_STATE 保证画刷取色有值。
-            let settings = crate::core::settings::global_settings()
-                .and_then(|s| s.lock().ok().map(|guard| *guard))
-                .unwrap_or_default();
-            let system_dark = crate::ui::theme::detect_system_dark();
-            let colors = crate::ui::theme::resolve_colors(settings.theme, system_dark);
-            // 先写入 THEME_STATE，确保后续 WM_CTLCOLOR* 消息能取到当前调色板
-            crate::ui::theme::set_theme(colors);
-            // 简化暗色判定：显式深色，或跟随系统且系统当前为深色，即视为暗色主题
-            let dark = settings.theme == ThemeMode::Dark
-                || (settings.theme == ThemeMode::System && system_dark);
+            // 全局调色板保证画刷取色有值（DWM/控件主题变体在子控件创建后应用）。
+            let theme_ctx = crate::ui::theme::sync_window_theme();
+            let dark = theme_ctx.dark;
             // SAFETY: hwnd 为正在创建的弹窗窗口（WM_CREATE 期间有效）；
             // DWM 属性调用失败（如 Win10 不支持圆角属性）时静默忽略返回值。
             let _ = crate::ui::theme::apply_dark_mode(hwnd, dark);
-            let _ = crate::ui::theme::apply_corner_preference(hwnd, settings.corner);
+            let _ = crate::ui::theme::apply_corner_preference(hwnd, theme_ctx.corner);
 
             // SAFETY: data 指针有效（见上），借用弹窗数据创建子控件与预填编辑框。
             let pd = unsafe { &*data };
@@ -240,7 +357,11 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             let btn_gap = dp(hwnd, BTN_GAP);
             let info_h = dp(hwnd, INFO_H);
             let title_row_y = dp(hwnd, TITLE_ROW_Y);
+            let color_row_y = dp(hwnd, COLOR_ROW_Y);
             let note_row_y = dp(hwnd, NOTE_ROW_Y);
+            let chip_w = dp(hwnd, CHIP_W);
+            let chip_h = dp(hwnd, CHIP_H);
+            let chip_gap = dp(hwnd, CHIP_GAP);
             let edit_x = m + label_w;
             let edit_w = win_w - m - edit_x;
             let client_h = dp(hwnd, WIN_H) - dp(hwnd, 30); // 减去标题栏近似高度
@@ -321,6 +442,47 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 // 失败仅返回 Err，忽略即可（不影响弹窗功能）。
                 unsafe {
                     let _ = SetFocus(title_edit);
+                }
+            }
+
+            // —— 颜色行：标签 + 5 个色块（R16），编辑已有标签时预选原颜色 ——
+            // SAFETY: 静态标签创建失败忽略。
+            unsafe {
+                let _ = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("STATIC"),
+                    windows::core::w!("颜色："),
+                    child_style,
+                    m,
+                    color_row_y,
+                    label_w,
+                    ctrl_h,
+                    hwnd,
+                    None,
+                    instance,
+                    None,
+                );
+            }
+            // 色块：BS_OWNERDRAW 按钮纯色绘制（WM_DRAWITEM 拦截自绘），
+            // 点击经标准 WM_COMMAND/BN_CLICKED 路由更新选中色
+            for (i, _) in COLOR_CHOICES.iter().enumerate() {
+                let chip_x = edit_x + (chip_w + chip_gap) * i as i32;
+                // SAFETY: 色块为标准子控件创建，失败忽略（仅少了该色块选项）。
+                unsafe {
+                    let _ = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        windows::core::w!("BUTTON"),
+                        windows::core::w!(""),
+                        WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_OWNERDRAW as u32),
+                        chip_x,
+                        color_row_y + (ctrl_h - chip_h) / 2,
+                        chip_w,
+                        chip_h,
+                        hwnd,
+                        HMENU((IDC_COLOR_BASE + i as i32) as *mut std::ffi::c_void),
+                        instance,
+                        None,
+                    );
                 }
             }
 
@@ -406,6 +568,9 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 自绘时经 message_font() 选择字体）
             apply_font_to_children(hwnd);
 
+            // 子控件 comctl32 主题变体（D17）：备注框滚动条随暗色主题渲染
+            crate::ui::theme::apply_control_theme(hwnd, dark);
+
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
@@ -425,8 +590,19 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_DRAWITEM => {
-            // 自绘按钮绘制请求（问题 9.4/9.8）：委托 ui::button 处理
-            if button::handle_draw_item(lparam) {
+            // 颜色色块自绘（R16）：纯色圆角矩形，选中项加描边环；
+            // 其余自绘按钮（确认/取消）委托 ui::button 处理
+            // SAFETY: WM_DRAWITEM 的 lParam 指向 DRAWITEMSTRUCT，生命周期覆盖消息处理。
+            let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            let chip_index = dis.CtlID as i32 - IDC_COLOR_BASE;
+            if dis.CtlType == ODT_BUTTON && (0..COLOR_CHOICES.len() as i32).contains(&chip_index) {
+                // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
+                let data = unsafe { get_userdata::<PopupData>(hwnd) };
+                let selected = !data.is_null()
+                    && (unsafe { (*data).selected_color }) == COLOR_CHOICES[chip_index as usize];
+                draw_color_chip(dis, selected);
+                LRESULT(1)
+            } else if button::handle_draw_item(lparam) {
                 LRESULT(1)
             } else {
                 // SAFETY: 非按钮的 WM_DRAWITEM 透传默认过程。
@@ -446,6 +622,19 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             match id {
                 IDC_OK_BUTTON => save_and_close(hwnd),
                 IDC_CANCEL_BUTTON => cancel_and_close(hwnd, data),
+                // 颜色色块点击（R16）：更新选中色并整窗重绘色块行
+                id if (IDC_COLOR_BASE..IDC_COLOR_BASE + COLOR_CHOICES.len() as i32)
+                    .contains(&id) =>
+                {
+                    // SAFETY: data 已校验非空；写入弹窗用户数据字段。
+                    unsafe {
+                        (*data).selected_color = COLOR_CHOICES[(id - IDC_COLOR_BASE) as usize];
+                    }
+                    // SAFETY: InvalidateRect 标记整窗重绘（色块行随 WM_DRAWITEM 刷新）。
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, FALSE);
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -528,6 +717,12 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             LRESULT(0)
         }
         WM_DESTROY => {
+            // 清理活动弹窗注册表（本弹窗销毁，单例复用依据失效）
+            if let Ok(mut active) = ACTIVE_POPUP.lock() {
+                if active.is_some_and(|(_, h)| h == hwnd.0 as isize) {
+                    *active = None;
+                }
+            }
             // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
             let data = unsafe { get_userdata::<PopupData>(hwnd) };
             if !data.is_null() {
@@ -559,27 +754,18 @@ fn save_and_close(hwnd: HWND) {
         return;
     }
 
-    let mut title_buf = [0u16; 256];
     // SAFETY: GetDlgItem 查询本窗口子控件，失败返回 Err 由调用方处理。
     let title_hwnd = unsafe { GetDlgItem(hwnd, IDC_TITLE_EDIT) };
     if let Ok(th) = title_hwnd {
-        // SAFETY: th 为有效子控件句柄；GetWindowTextW 写入栈上缓冲区，
-        // 长度受数组上限约束，无越界风险。
-        let title_len = unsafe { GetWindowTextW(th, &mut title_buf) } as usize;
-        let title = String::from_utf16_lossy(&title_buf[..title_len.min(255)])
-            .trim()
-            .to_string();
+        // 动态长度读取（原固定 256/1024 u16 栈缓冲会静默丢弃超长内容）
+        // SAFETY: th 为本弹窗存活子控件句柄。
+        let title = unsafe { read_window_text(th) }.trim().to_string();
 
-        let mut note_buf = [0u16; 1024];
         // SAFETY: GetDlgItem 查询本窗口子控件，失败返回 Err 由调用方处理。
         let note_hwnd = unsafe { GetDlgItem(hwnd, IDC_NOTE_EDIT) };
         let note = if let Ok(nh) = note_hwnd {
-            // SAFETY: nh 为有效子控件句柄；GetWindowTextW 写入栈上缓冲区，
-            // 长度受数组上限约束，无越界风险。
-            let note_len = unsafe { GetWindowTextW(nh, &mut note_buf) } as usize;
-            String::from_utf16_lossy(&note_buf[..note_len.min(1023)])
-                .trim()
-                .to_string()
+            // SAFETY: nh 为本弹窗存活子控件句柄。
+            unsafe { read_window_text(nh) }.trim().to_string()
         } else {
             String::new()
         };
@@ -592,7 +778,8 @@ fn save_and_close(hwnd: HWND) {
                 title
             },
             note,
-            color: TagColor::Orange,
+            // 选中颜色（R16 色块行），不再固定橙色
+            color: unsafe { (*data).selected_color },
             window_title: unsafe { (*data).window_title.clone() },
             process_name: unsafe { (*data).process_name.clone() },
         };
@@ -800,4 +987,87 @@ fn handle_ctlcolor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRES
     // 缓存持有、进程生命周期内不销毁，可安全作为 LRESULT 返回。
     let brush = crate::ui::theme::get_brush(bg);
     LRESULT(brush.0 as isize)
+}
+
+/// 读取窗口文本为 String（按 `GetWindowTextLengthW` 动态分配，避免静默截断）
+///
+/// 取代原先 256/1024 定长栈缓冲——超长标题/备注会被无声丢弃，用户毫无感知。
+///
+/// # Safety
+///
+/// `hwnd` 须为存活窗口句柄（本弹窗子控件，消息处理期间有效）。
+unsafe fn read_window_text(hwnd: HWND) -> String {
+    // SAFETY: hwnd 由调用方保证存活；GetWindowTextLengthW 为只读查询。
+    let len = unsafe { GetWindowTextLengthW(hwnd) } as usize;
+    if len == 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; len + 1];
+    // SAFETY: buf 长度 len+1 覆盖文本与 NUL 终止符，无越界风险。
+    let n = unsafe { GetWindowTextW(hwnd, &mut buf) } as usize;
+    String::from_utf16_lossy(&buf[..n])
+}
+
+/// 绘制颜色色块（R16）：填充圆角矩形；选中项加主题前景色描边环，聚焦画焦点框
+fn draw_color_chip(dis: &DRAWITEMSTRUCT, selected: bool) {
+    let color = COLOR_CHOICES[(dis.CtlID as i32 - IDC_COLOR_BASE) as usize];
+    let [r, g, b, _] = color.as_rgba();
+    let theme = crate::ui::theme::theme_colors();
+    // 选中：2px 主题前景色描边环；未选中：1px 主题描边色弱框
+    let pen_color = if selected {
+        theme.map(|c| c.fg).unwrap_or(COLORREF(0x00FFFFFF))
+    } else {
+        theme.map(|c| c.border).unwrap_or(COLORREF(0x00808080))
+    };
+    let pen_width = if selected { 2 } else { 1 };
+
+    // SAFETY: DRAWITEMSTRUCT.hDC 由系统在绘制期间提供，仅本函数内使用；
+    // 画刷/画笔在本函数内成对创建、恢复、删除。
+    unsafe {
+        let brush = CreateSolidBrush(COLORREF((r as u32) | (g as u32) << 8 | (b as u32) << 16));
+        let pen = CreatePen(PS_SOLID, pen_width, pen_color);
+        let old_pen = SelectObject(dis.hDC, pen);
+        let old_brush = SelectObject(dis.hDC, brush);
+        let rc = dis.rcItem;
+        let _ = RoundRect(dis.hDC, rc.left, rc.top, rc.right, rc.bottom, 6, 6);
+        let _ = SelectObject(dis.hDC, old_brush);
+        let _ = SelectObject(dis.hDC, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+        if (dis.itemState.0 & ODS_FOCUS.0) != 0 {
+            let focus = RECT {
+                left: rc.left + 2,
+                top: rc.top + 2,
+                right: rc.right - 2,
+                bottom: rc.bottom - 2,
+            };
+            let _ = DrawFocusRect(dis.hDC, &focus);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 颜色候选：5 个变体的 RGBA 互不相同（R16 色块行选择依据）
+    #[test]
+    fn color_choices_are_distinct() {
+        assert_eq!(COLOR_CHOICES.len(), 5);
+        let mut rgba: Vec<_> = COLOR_CHOICES.iter().map(|c| c.as_rgba()).collect();
+        rgba.sort();
+        rgba.dedup();
+        assert_eq!(rgba.len(), 5);
+    }
+
+    /// 色块 ID 区间与候选数量一致（WM_COMMAND 路由的边界）
+    #[test]
+    fn color_chip_id_range_matches_choices() {
+        let last = IDC_COLOR_BASE + COLOR_CHOICES.len() as i32 - 1;
+        assert!(
+            (IDC_COLOR_BASE..=last).contains(&(IDC_COLOR_BASE + 4)),
+            "第 5 个色块 ID 应落在路由区间内"
+        );
+        assert!(!(IDC_COLOR_BASE..=last).contains(&(last + 1)));
+    }
 }

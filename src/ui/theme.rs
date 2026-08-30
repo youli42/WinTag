@@ -13,7 +13,7 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, COLORREF, ERROR_SUCCESS, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{BOOL, COLORREF, ERROR_SUCCESS, HWND, LPARAM, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWINDOWATTRIBUTE,
@@ -24,8 +24,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY_CURRENT_USER, REG_DWORD, REG_VALUE_TYPE, RRF_RT_REG_DWORD,
 };
+use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, SendMessageW, SystemParametersInfoW, NONCLIENTMETRICSW,
+    EnumChildWindows, GetClassNameW, SendMessageW, SystemParametersInfoW, NONCLIENTMETRICSW,
     SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_SETFONT,
 };
 
@@ -458,6 +459,95 @@ pub fn apply_font_to_children(hwnd: HWND) {
     unsafe {
         let _ = EnumChildWindows(hwnd, Some(enum_font_child_proc), LPARAM(font.0 as isize));
     }
+}
+
+// ============================================================
+// 统一主题管理器（决策记录 D17）
+// ============================================================
+//
+// 此前各窗口在 WM_CREATE 内各自复制"读设置 → 解析调色板 → set_theme →
+// DWM 暗色/圆角"四步，且 comctl32 控件（下拉框/复选框/滚动条）从不应用
+// 暗色主题变体——暗色主题下保持系统默认的白色外观。此处统一为一个入口：
+// 窗口 WM_CREATE 调 [`sync_window_theme`] 拿到本次应用的调色板/暗色判定/
+// 圆角偏好（同时写入全局调色板供 WM_CTLCOLOR* 与覆盖层取色），再调
+// [`apply_theme_to_window`] 一次性应用 DWM 属性与控件主题变体。
+
+/// 单个窗口一次解析出的主题上下文
+#[derive(Debug, Clone, Copy)]
+pub struct WindowThemeCtx {
+    /// 当前调色板（已同步写入全局，`WM_CTLCOLOR*` 经 `theme_colors` 取同一份）
+    pub colors: ThemeColors,
+    /// 是否暗色（决定 DWM 暗色标题栏与 comctl32 控件主题变体）
+    pub dark: bool,
+    /// 圆角偏好
+    pub corner: CornerPreference,
+}
+
+/// 解析当前应使用的主题并写入全局调色板（窗口 WM_CREATE 的统一主题入口）
+///
+/// 主题来源与 [`resolve_colors`] 一致：全局设置的 [`ThemeMode`] + 系统深浅色检测。
+/// 每次窗口创建都重新解析，保证任何创建顺序下窗口拿到的调色板与全局状态一致。
+pub fn sync_window_theme() -> WindowThemeCtx {
+    let cfg = crate::core::settings::global_settings()
+        .and_then(|s| s.lock().ok().map(|guard| *guard))
+        .unwrap_or_default();
+    let system_dark = detect_system_dark();
+    let colors = resolve_colors(cfg.theme, system_dark);
+    let dark = cfg.theme == ThemeMode::Dark || (cfg.theme == ThemeMode::System && system_dark);
+    set_theme(colors);
+    WindowThemeCtx {
+        colors,
+        dark,
+        corner: cfg.corner,
+    }
+}
+
+/// 将主题一次性应用到窗口：DWM 暗色标题栏/圆角 + 子控件 comctl32 主题变体
+///
+/// 在 [`sync_window_theme`] 之后、子控件全部创建完成后调用。
+pub fn apply_theme_to_window(hwnd: HWND, ctx: &WindowThemeCtx) {
+    // DWM 属性调用失败（如 Win10 不支持圆角属性）静默忽略
+    let _ = apply_dark_mode(hwnd, ctx.dark);
+    let _ = apply_corner_preference(hwnd, ctx.corner);
+    apply_control_theme(hwnd, ctx.dark);
+}
+
+/// 为窗口的 EDIT/BUTTON/COMBOBOX 子控件应用 comctl32 明暗主题变体
+///
+/// `DarkMode_Explorer` 变体使下拉框按钮、复选框图形与滚动条随暗色主题渲染
+/// （控件客户区配色仍由父窗口 `WM_CTLCOLOR*` 决定）；亮色主题应用 `Explorer`
+/// 恢复系统默认。对无主题变体的类（STATIC 等）为无害空操作，不做类名过滤。
+pub fn apply_control_theme(parent: HWND, dark: bool) {
+    let name = if dark {
+        windows::core::w!("DarkMode_Explorer")
+    } else {
+        windows::core::w!("Explorer")
+    };
+    // SAFETY: parent 为存活窗口；回调签名符合 EnumChildWindows 约定；
+    // lParam 携带 'static 宽字面量指针，回调仅在调用期间访问。
+    unsafe {
+        let _ = EnumChildWindows(
+            parent,
+            Some(control_theme_proc),
+            LPARAM(name.as_ptr() as isize),
+        );
+    }
+}
+
+/// `apply_control_theme` 的枚举回调：对子控件设置主题变体
+unsafe extern "system" fn control_theme_proc(child: HWND, lparam: LPARAM) -> BOOL {
+    let name = PCWSTR(lparam.0 as *const u16);
+    // 仅对下拉框/按钮/编辑框应用（与暗色变体实际相关的类），
+    // STATIC 等静态控件跳过，减少无谓的主题切换
+    let mut class_buf = [0u16; 32];
+    // SAFETY: class_buf 为栈上缓冲；GetClassNameW 截断写入并返回长度。
+    let n = GetClassNameW(child, &mut class_buf) as usize;
+    let class = String::from_utf16_lossy(&class_buf[..n.min(31)]);
+    if matches!(class.as_str(), "Edit" | "Button" | "ComboBox") {
+        // SAFETY: child 为存活子控件，name 为 'static 字面量。
+        let _ = SetWindowTheme(child, name, PCWSTR::null());
+    }
+    TRUE
 }
 
 /// 设置全局主题调色板

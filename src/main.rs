@@ -69,9 +69,11 @@ fn main() -> anyhow::Result<()> {
     if GLOBAL_TAG_STORE.get().is_none() {
         let _ = GLOBAL_TAG_STORE.set(Arc::clone(&tag_store));
     }
+    // 注入覆盖层的消息中转目标（R5：角标/标题条单击 → WM_APP_EDIT_TAG 请求编辑）
+    sys::overlay::set_message_target(hwnd.0 as isize);
 
     // 创建概览面板（隐藏）
-    let panel_hwnd = ui::panel::create_panel(Arc::clone(&tag_store));
+    let panel_hwnd = ui::panel::create_panel(Arc::clone(&tag_store), hwnd.0 as isize);
     if PANEL_HWND.get().is_none() {
         let _ = PANEL_HWND.set(panel_hwnd.0 as isize);
     }
@@ -318,6 +320,38 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
                 ui::settings::toggle_settings(shwnd, hwnd.0 as isize, settings);
             }
+            LRESULT(0)
+        }
+        common::WM_APP_EDIT_TAG => {
+            // 角标/标题条单击或面板右键菜单"编辑标签"（R5/R16）：
+            // 目标窗口仍存活且已有标签时，打开预填编辑弹窗
+            let target_hwnd = wparam.0 as isize;
+            // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
+            let valid = unsafe { IsWindow(HWND(target_hwnd as *mut std::ffi::c_void)).as_bool() };
+            if !valid {
+                eprintln!("[编辑] 拒绝无效窗口句柄: HWND={}", target_hwnd);
+                return LRESULT(0);
+            }
+            let Some(store) = GLOBAL_TAG_STORE.get() else {
+                return LRESULT(0);
+            };
+            let Ok(tags) = store.lock() else {
+                return LRESULT(0);
+            };
+            let Some(tag) = tags.get(&target_hwnd) else {
+                eprintln!("[编辑] 目标窗口无标签: HWND={}", target_hwnd);
+                return LRESULT(0);
+            };
+            let window_title = tag.window_title.clone();
+            let process_name = tag.process_name.clone();
+            drop(tags);
+            ui::popup::create_popup(
+                Arc::clone(store),
+                target_hwnd,
+                &window_title,
+                &process_name,
+                hwnd.0 as isize,
+            );
             LRESULT(0)
         }
         common::WM_APP_THEME_CHANGED => {
@@ -575,6 +609,8 @@ fn reapply_theme(hidden_hwnd: HWND) {
         let _ = ui::theme::apply_corner_preference(panel_hwnd, cfg.corner);
         // 刷新树形列表主题（DarkMode_Explorer 热更新，问题 9.3/9.5）
         ui::panel::reapply_tree_theme(panel_hwnd, dark);
+        // 子控件主题变体热更新（D17）
+        ui::theme::apply_control_theme(panel_hwnd, dark);
         // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
         unsafe {
             let _ = InvalidateRect(panel_hwnd, None, FALSE);
@@ -587,6 +623,8 @@ fn reapply_theme(hidden_hwnd: HWND) {
         // SAFETY: settings_hwnd 由 create_settings 成功后写入，窗口存活。
         let _ = ui::theme::apply_dark_mode(settings_hwnd, dark);
         let _ = ui::theme::apply_corner_preference(settings_hwnd, cfg.corner);
+        // 子控件主题变体热更新（D17）：下拉框/复选框随主题切换
+        ui::theme::apply_control_theme(settings_hwnd, dark);
         // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
         unsafe {
             let _ = InvalidateRect(settings_hwnd, None, FALSE);

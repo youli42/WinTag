@@ -9,19 +9,20 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateBitmap, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
-    DeleteDC, DeleteObject, DrawTextW, EndPaint, GetDC, GetTextExtentPoint32W, InvalidateRect,
-    PatBlt, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow,
-    ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS, BLENDFUNCTION, DIB_RGB_COLORS,
-    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HGDIOBJ, PS_SOLID, TRANSPARENT,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, GetDC, GetMonitorInfoW, GetTextExtentPoint32W,
+    InvalidateRect, MonitorFromPoint, PatBlt, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, UpdateWindow, ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
-    GetWindowTextW, IsIconic, IsWindowVisible, RegisterClassW, SetWindowPos, ShowWindow,
-    UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindowVisible, PostMessageW, RegisterClassW,
+    SetWindowPos, ShowWindow, UpdateLayeredWindow, CS_HREDRAW, CS_VREDRAW, HTCLIENT, HTTRANSPARENT,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOW, ULW_ALPHA, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 use super::badge::{render_badge, render_rounded_rect, truncate_title, BadgeParams};
@@ -61,6 +62,38 @@ static SHOW_TITLE: AtomicBool = AtomicBool::new(true);
 /// 注入标题条显示开关（R6：设置页"角标显示标题"）
 pub fn set_show_title(enabled: bool) {
     SHOW_TITLE.store(enabled, Ordering::Relaxed);
+}
+
+/// 注入的隐藏窗口句柄（消息中转目标）
+///
+/// 依赖方向约束（ui → core → sys）不允许 sys 层反向调用 ui 层打开编辑弹窗，
+/// 因此角标/标题条单击（R5）只经 [`set_message_target`] 注入的隐藏窗口发送
+/// `WM_APP_EDIT_TAG`，由主线程隐藏窗口 WndProc 统一分发（镜像 [`set_tag_store`]
+/// 的注入模式）。未注入时单击静默（不发送消息）。
+static MESSAGE_TARGET: OnceLock<isize> = OnceLock::new();
+
+/// 注入隐藏窗口句柄（`WM_APP_EDIT_TAG` 等请求消息的接收方）
+///
+/// 必须在任何覆盖层创建之前调用（程序启动时主线程注入一次）。
+pub fn set_message_target(hidden_hwnd: isize) {
+    let _ = MESSAGE_TARGET.set(hidden_hwnd);
+}
+
+/// 向隐藏窗口发送编辑标签请求（R5：角标/标题条单击打开编辑弹窗）
+fn request_edit_tag(target_hwnd: isize) {
+    let Some(&hidden) = MESSAGE_TARGET.get() else {
+        return;
+    };
+    // SAFETY: hidden 为主线程注入的存活隐藏窗口句柄；PostMessageW 为线程安全
+    // 标准 API，失败（窗口已销毁）静默忽略。
+    unsafe {
+        let _ = PostMessageW(
+            HWND(hidden as *mut std::ffi::c_void),
+            crate::common::WM_APP_EDIT_TAG,
+            WPARAM(target_hwnd as usize),
+            LPARAM(0),
+        );
+    }
 }
 
 /// 单个覆盖层的悬停状态
@@ -168,6 +201,9 @@ impl Overlay {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(overlay_wndproc),
             hInstance: windows::Win32::Foundation::HINSTANCE::default(),
+            // 类光标必须非 NULL：NULL 会让 DefWindowProc 的 WM_SETCURSOR 隐藏光标
+            //（表现为悬停角标/标题条时鼠标"消失"）
+            hCursor: crate::common::arrow_cursor(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
@@ -645,9 +681,10 @@ fn overlay_text_into(
             let da = rgba[di + 3] as f32 / 255.0;
             // premultiplied alpha-over：out = fg*cov + dst*(1-cov)
             let inv = 1.0 - cov;
-            rgba[di] = (fg[0] as f32 * cov + rgba[di] as f32 * inv).round() as u8;
+            // 缓冲字节序为 BGRA（同 render_badge）：fg 为 [R,G,B]，故 di 写蓝通道
+            rgba[di] = (fg[2] as f32 * cov + rgba[di] as f32 * inv).round() as u8;
             rgba[di + 1] = (fg[1] as f32 * cov + rgba[di + 1] as f32 * inv).round() as u8;
-            rgba[di + 2] = (fg[2] as f32 * cov + rgba[di + 2] as f32 * inv).round() as u8;
+            rgba[di + 2] = (fg[0] as f32 * cov + rgba[di + 2] as f32 * inv).round() as u8;
             rgba[di + 3] = (255.0 * cov + 255.0 * da * inv).round() as u8;
         }
     }
@@ -871,6 +908,16 @@ extern "system" fn overlay_wndproc(
             // SAFETY: 消息参数由系统传入，转发给默认窗口过程处理。
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_LBUTTONDOWN => {
+            // 角标/标题条单击（R5）：请求主线程为对应目标窗口打开编辑弹窗。
+            // 命中区域已由 WM_NCHITTEST 过滤（仅角标三角形与标题条返回 HTCLIENT），
+            // 能收到本消息即命中可交互区。
+            let target_hwnd = get_target_hwnd(hwnd);
+            if target_hwnd != 0 {
+                request_edit_tag(target_hwnd);
+            }
+            LRESULT(0)
+        }
         msg if msg == WM_MOUSELEAVE => {
             handle_mouse_leave(hwnd);
             LRESULT(0)
@@ -896,6 +943,8 @@ fn ensure_tooltip_class() {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(tooltip_wndproc),
         hInstance: windows::Win32::Foundation::HINSTANCE::default(),
+        // 类光标必须非 NULL：NULL 会让 DefWindowProc 的 WM_SETCURSOR 隐藏光标
+        hCursor: crate::common::arrow_cursor(),
         lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
@@ -1032,11 +1081,39 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
             // 实际窗口尺寸 = 内容宽高 + 四边 10px 内边距 + 1px 边框
             let win_w = content_w + 20 + 2;
             let win_h = content_h + 20 + 2;
+            // 定位钳制（D17 修复悬停备注显示不完整）：默认光标右下 (-10,+16)；
+            // 超出光标所在显示器工作区底部时翻到光标上方，仍放不下贴顶边；
+            // 横向越界收回右边缘。
+            let (mut tx, mut ty) = (pt.x - 10, pt.y + 16);
+            // SAFETY: MonitorFromPoint 只读查询，失败（NULL）时跳过钳制。
+            let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            if !hmon.is_invalid() {
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                // SAFETY: mi 为栈上缓冲且 cbSize 已填，GetMonitorInfoW 只读填充。
+                if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                    let work = mi.rcWork;
+                    if ty + win_h > work.bottom {
+                        ty = pt.y - win_h - 8;
+                    }
+                    if ty < work.top {
+                        ty = work.top;
+                    }
+                    if tx + win_w > work.right {
+                        tx = work.right - win_w;
+                    }
+                    if tx < work.left {
+                        tx = work.left;
+                    }
+                }
+            }
             let _ = SetWindowPos(
                 tooltip_hwnd,
                 HWND_TOPMOST,
-                pt.x - 10,
-                pt.y + 16,
+                tx,
+                ty,
                 win_w,
                 win_h,
                 SWP_NOACTIVATE,
@@ -1132,12 +1209,15 @@ extern "system" fn tooltip_wndproc(
                 let _ = DeleteObject(pen);
 
                 // —— 文字分层：标题（粗体）+ 备注（常规），以 \n 分隔 ——
-                let mut buf = [0u16; 512];
-                let len = GetWindowTextW(hwnd, &mut buf) as usize;
-                if len > 0 {
+                // 动态长度读取（定长 512 缓冲会静默丢弃超长备注）
+                let text_len = GetWindowTextLengthW(hwnd) as usize;
+                if text_len > 0 {
+                    let mut buf = vec![0u16; text_len + 1];
+                    let len = GetWindowTextW(hwnd, &mut buf) as usize;
                     let text = String::from_utf16_lossy(&buf[..len]);
                     let mut parts = text.splitn(2, '\n');
-                    let title = parts.next().unwrap_or("");
+                    // 标题尾部可能残留 EDIT 换行符的 CR，剥掉避免渲染成方框
+                    let title = parts.next().unwrap_or("").trim_end_matches('\r');
                     let note = parts.next().unwrap_or("");
 
                     let _ = SetBkMode(hdc, TRANSPARENT);

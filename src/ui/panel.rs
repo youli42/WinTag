@@ -11,24 +11,32 @@ use windows::Win32::UI::Controls::{
     TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
     TVM_SETTEXTCOLOR, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, GetDlgItem, GetWindowTextW,
-    IsIconic, IsWindow, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE, ES_AUTOHSCROLL, HWND_TOP,
-    MINMAXINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_NOTIFY,
-    WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClassLongPtrW,
+    GetClientRect, GetCursorPos, GetDlgItem, GetParent, GetWindowTextW, IsIconic, IsWindow,
+    PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE,
+    ES_AUTOHSCROLL, GCLP_WNDPROC, GWLP_WNDPROC, HWND_TOP, MF_STRING, MINMAXINFO, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use crate::common::{get_userdata, set_userdata, widestring, WM_APP_TAGS_CHANGED};
-use crate::core::settings::ThemeMode;
+use crate::common::{get_userdata, set_userdata, widestring, WM_APP_EDIT_TAG, WM_APP_TAGS_CHANGED};
 use crate::core::tag::TagStore;
 use crate::ui::layout::dp;
 use crate::ui::theme::{apply_font_to_children, theme_colors};
 
 const IDC_SEARCH_EDIT: i32 = 201;
 const IDC_LIST_VIEW: i32 = 202;
+
+/// 右键菜单命令 ID（R17，配合 `TPM_RETURNCMD` 直接取回选择）
+const IDM_ACTIVATE: i32 = 301;
+const IDM_EDIT: i32 = 302;
+const IDM_REMOVE: i32 = 303;
 
 /// 设计像素常量（96 DPI 基准），运行时经 [`dp`] 缩放为物理像素
 const MARGIN: i32 = 12;
@@ -49,6 +57,8 @@ pub struct PanelData {
     pub tag_store: Arc<Mutex<TagStore>>,
     /// 面板当前是否可见
     pub visible: bool,
+    /// 主线程隐藏窗口句柄（右键菜单"编辑标签"经 WM_APP_EDIT_TAG 转发，R17）
+    pub hidden_hwnd: isize,
 }
 
 /// 创建概览面板窗口（初始隐藏）
@@ -61,10 +71,11 @@ pub struct PanelData {
 ///
 /// 成功时返回面板窗口句柄；创建失败时打印错误信息并返回默认（NULL）句柄，
 /// 调用方应先检查返回值再使用。
-pub fn create_panel(data: Arc<Mutex<TagStore>>) -> HWND {
+pub fn create_panel(data: Arc<Mutex<TagStore>>, hidden_hwnd: isize) -> HWND {
     let panel_data = Box::new(PanelData {
         tag_store: data,
         visible: false,
+        hidden_hwnd,
     });
     let data_ptr = Box::into_raw(panel_data);
 
@@ -74,6 +85,8 @@ pub fn create_panel(data: Arc<Mutex<TagStore>>) -> HWND {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(panel_wndproc),
         hInstance: windows::Win32::Foundation::HINSTANCE::default(),
+        // 类光标必须非 NULL（NULL 会让 DefWindowProc 的 WM_SETCURSOR 隐藏光标）
+        hCursor: crate::common::arrow_cursor(),
         lpszClassName: PCWSTR(class_name.as_ptr()),
         ..Default::default()
     };
@@ -146,22 +159,14 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 set_userdata(hwnd, data as *mut std::ffi::c_void);
             }
 
-            // 读取全局设置并应用暗色主题与圆角偏好
-            // global_settings 未注入（如独立测试环境）时回退默认设置（跟随系统 + 默认圆角）
-            let settings = crate::core::settings::global_settings()
-                .and_then(|s| s.lock().ok().map(|guard| *guard))
-                .unwrap_or_default();
-            let system_dark = crate::ui::theme::detect_system_dark();
-            let colors = crate::ui::theme::resolve_colors(settings.theme, system_dark);
-            // 先写入 THEME_STATE，确保后续 WM_CTLCOLOR* 消息能取到当前调色板
-            crate::ui::theme::set_theme(colors);
-            // 简化暗色判定：显式深色，或跟随系统且系统当前为深色，即视为暗色主题
-            let dark = settings.theme == ThemeMode::Dark
-                || (settings.theme == ThemeMode::System && system_dark);
+            // 统一主题管理器（D17）：解析全局设置 → 写入全局调色板 → 取得暗色判定
+            //（需在子控件创建前完成，保证 WM_CTLCOLOR* 取色有值）
+            let theme_ctx = crate::ui::theme::sync_window_theme();
+            let dark = theme_ctx.dark;
             // SAFETY: hwnd 为正在创建的面板窗口（WM_CREATE 期间有效）；
             // DWM 属性调用失败（如 Win10 不支持圆角属性）时静默忽略返回值。
             let _ = crate::ui::theme::apply_dark_mode(hwnd, dark);
-            let _ = crate::ui::theme::apply_corner_preference(hwnd, settings.corner);
+            let _ = crate::ui::theme::apply_corner_preference(hwnd, theme_ctx.corner);
 
             let instance = windows::Win32::Foundation::HINSTANCE::default();
 
@@ -170,12 +175,12 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             let search_h = dp(hwnd, SEARCH_H);
             let list_y = m + search_h + dp(hwnd, SEARCH_GAP);
 
-            // 搜索框
+            // 搜索框（子类化转发 Esc → 关闭面板，R17）
             let search_ws = WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | ES_AUTOHSCROLL as u32);
             // SAFETY: 创建 EDIT 子控件（ID = IDC_SEARCH_EDIT）；
             // 失败时忽略，搜索功能不可用但不影响面板主体。
-            unsafe {
-                let _ = CreateWindowExW(
+            let search_result = unsafe {
+                CreateWindowExW(
                     WS_EX_CLIENTEDGE,
                     windows::core::w!("EDIT"),
                     windows::core::w!(""),
@@ -191,7 +196,18 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     ),
                     instance,
                     None,
-                );
+                )
+            };
+            if let Ok(search_edit) = search_result {
+                // SAFETY: search_edit 为刚创建成功的有效子控件句柄；子类化仅替换
+                // 实例窗口过程，无额外内存操作。
+                unsafe {
+                    let _ = SetWindowLongPtrW(
+                        search_edit,
+                        GWLP_WNDPROC,
+                        search_edit_subclass_proc as *const () as isize,
+                    );
+                }
             }
 
             // 可展开树形列表：每个标签一个根项（lParam = 目标窗口句柄），
@@ -243,6 +259,9 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
             // 全局消息字体注入所有子控件（搜索框 + 列表视图）
             apply_font_to_children(hwnd);
+
+            // 子控件 comctl32 主题变体（D17）：搜索框随主题渲染
+            crate::ui::theme::apply_control_theme(hwnd, dark);
 
             // 首次布局：触发 WM_SIZE 校正搜索框/列表实际尺寸位置
             // SAFETY: GetClientRect 写入栈上 RECT；无副作用。
@@ -299,6 +318,31 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             // 保留已展开根项的状态，避免自动刷新打断用户的展开浏览
             refresh_tree(hwnd);
             LRESULT(0)
+        }
+        WM_CONTEXTMENU => {
+            // 右键树项（R17）：根项弹出 置前/编辑/移除 菜单
+            handle_tree_context_menu(hwnd, msg, wparam, lparam)
+        }
+        WM_KEYDOWN => {
+            // Esc 关闭面板（R17）：搜索框聚焦时由其子类化过程转发到达
+            if (wparam.0 & 0xFFFF) as u16 == VK_ESCAPE.0 {
+                // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
+                let data = unsafe { get_userdata::<PanelData>(hwnd) };
+                if !data.is_null() {
+                    // SAFETY: data 已校验非空，标记为隐藏。
+                    unsafe {
+                        (*data).visible = false;
+                    }
+                }
+                // SAFETY: 仅隐藏面板，不销毁（镜像 WM_CLOSE 行为）。
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+                LRESULT(0)
+            } else {
+                // SAFETY: 未处理按键透传默认窗口过程。
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         // WM_CTLCOLOR*：子控件（搜索框 EDIT / SysListView32 列表区 / 静态文本）
         // 重绘前向父窗口请求配色，统一按当前主题调色板着色。
@@ -610,6 +654,182 @@ fn activate_target(hwnd: HWND, data: *mut PanelData, list_view: HWND, hitem: HTR
         }
         refresh_tree(hwnd);
     }
+}
+
+/// 处理树形列表右键菜单（R17）：根项弹出 置前窗口 / 编辑标签 / 移除标签
+///
+/// 仅鼠标右键（lParam != -1）触发；命中详情子项时上溯到其根项。
+/// `TPM_RETURNCMD` 直接取回所选命令，无需 WM_COMMAND 路由。
+fn handle_tree_context_menu(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
+    let data = unsafe { get_userdata::<PanelData>(hwnd) };
+    if data.is_null() {
+        // SAFETY: DefWindowProcW 透传未处理消息。
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    if lparam.0 == -1 {
+        // 键盘 Shift+F10：无光标坐标，忽略
+        return LRESULT(0);
+    }
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    let Ok(list_view) = (unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) }) else {
+        return LRESULT(0);
+    };
+    let x = (lparam.0 & 0xFFFF) as u16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i32;
+    let mut client = POINT { x, y };
+    // SAFETY: ScreenToClient 坐标换算，client 为栈上值。
+    unsafe {
+        let _ = ScreenToClient(list_view, &mut client);
+    }
+    let mut ht = TVHITTESTINFO {
+        pt: client,
+        ..Default::default()
+    };
+    // SAFETY: ht 为栈上变量，TVM_HITTEST 返回前完成写入。
+    unsafe {
+        let _ = SendMessageW(
+            list_view,
+            TVM_HITTEST,
+            WPARAM(0),
+            LPARAM(std::ptr::addr_of_mut!(ht) as isize),
+        );
+    }
+    if ht.hItem.0 == 0 {
+        return LRESULT(0);
+    }
+    // 命中详情子项 → 上溯到根项（菜单仅对根项/标签生效）
+    // SAFETY: hItem 为 TVM_HITTEST 返回的有效句柄，TVM_GETNEXTITEM 只读查询。
+    let parent = unsafe {
+        SendMessageW(
+            list_view,
+            TVM_GETNEXTITEM,
+            WPARAM(TVGN_PARENT as usize),
+            LPARAM(ht.hItem.0),
+        )
+    };
+    let hitem = if parent.0 != 0 {
+        HTREEITEM(parent.0)
+    } else {
+        ht.hItem
+    };
+
+    // 读根项 lParam（目标窗口句柄）
+    let mut tvi = TVITEMW {
+        mask: TVIF_HANDLE | TVIF_PARAM,
+        hItem: hitem,
+        ..Default::default()
+    };
+    // SAFETY: tvi 为栈上局部值，TVM_GETITEMW 在消息返回前完成数据拷贝。
+    unsafe {
+        let _ = SendMessageW(
+            list_view,
+            TVM_GETITEMW,
+            WPARAM(0),
+            LPARAM(std::ptr::addr_of_mut!(tvi) as isize),
+        );
+    }
+    let target = tvi.lParam.0;
+    if target == 0 {
+        return LRESULT(0);
+    }
+
+    // 构建并弹出菜单（项文本为编译期常量）
+    // SAFETY: CreatePopupMenu 返回新建菜单句柄，失败返回 Err 被忽略。
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return LRESULT(0);
+    };
+    // SAFETY: menu 为刚创建的存活菜单句柄，AppendMenuW 仅追加项。
+    unsafe {
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_ACTIVATE as usize,
+            windows::core::w!("置前窗口"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_EDIT as usize,
+            windows::core::w!("编辑标签…"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_REMOVE as usize,
+            windows::core::w!("移除标签"),
+        );
+    }
+    // TPM_RETURNCMD：返回值即所选命令 ID（0 = 未选择）；菜单操作为模态阻塞。
+    // SAFETY: menu/hwnd 均为存活句柄。
+    let cmd = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, hwnd, None) };
+    // SAFETY: 菜单已弹出完毕，销毁防泄漏。
+    unsafe {
+        let _ = DestroyMenu(menu);
+    }
+
+    match cmd.0 {
+        id if id == IDM_ACTIVATE => activate_target(hwnd, data, list_view, hitem),
+        id if id == IDM_EDIT => {
+            // 经隐藏窗口请求打开编辑弹窗（与角标单击同一路径，R5/R17）
+            // SAFETY: hidden_hwnd 为启动时注入的存活隐藏窗口句柄；
+            // PostMessageW 为线程安全标准 API。
+            unsafe {
+                let _ = PostMessageW(
+                    HWND((*data).hidden_hwnd as *mut std::ffi::c_void),
+                    WM_APP_EDIT_TAG,
+                    WPARAM(target as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+        id if id == IDM_REMOVE => {
+            // 移除标签：清存储 → 通知主线程销毁覆盖层 → 刷新列表
+            // SAFETY: data 已校验非空；锁中毒时跳过（仅覆盖层残留，下次清理兜底）。
+            if let Ok(mut store) = unsafe { (*data).tag_store.lock() } {
+                store.remove(&target);
+            }
+            // SAFETY: 同上，hidden_hwnd 为存活隐藏窗口句柄。
+            unsafe {
+                let _ = PostMessageW(
+                    HWND((*data).hidden_hwnd as *mut std::ffi::c_void),
+                    crate::common::WM_DESTROY_OVERLAY,
+                    WPARAM(target as usize),
+                    LPARAM(0),
+                );
+            }
+            refresh_tree(hwnd);
+        }
+        _ => {}
+    }
+    LRESULT(0)
+}
+
+/// 面板搜索框子类化过程：Esc 键转发父面板（关闭面板，R17），其余透传
+///
+/// 标准 EDIT 类过程会吞掉 Esc，不转发则搜索框聚焦时 Esc 无法关闭面板。
+unsafe extern "system" fn search_edit_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && (wparam.0 & 0xFFFF) as u16 == VK_ESCAPE.0 {
+        // SAFETY: GetParent 返回创建时指定的父窗口。
+        if let Ok(parent) = unsafe { GetParent(hwnd) } {
+            // SAFETY: PostMessageW 为线程安全标准 API，异步投递。
+            unsafe {
+                let _ = PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+            }
+        }
+        return LRESULT(0);
+    }
+    // SAFETY: GetClassLongPtrW(GCLP_WNDPROC) 返回 EDIT 类原始窗口过程，
+    // 函数指针↔整数 transmute 往返在 Windows ABI 下良定义。
+    let orig = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
+    let orig_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+        unsafe { std::mem::transmute(orig) };
+    orig_proc(hwnd, msg, wparam, lparam)
 }
 
 /// 按搜索条件重建树形列表
