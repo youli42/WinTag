@@ -306,6 +306,19 @@
 
 ---
 
+## D18：设置页配色消息参数修复 + 下拉框 owner-draw 自绘 + tooltip 备注裁切修复（2026-08-30）
+
+- **决策**：三项修复，均为用户实测反馈的缺陷收口：
+  1. **设置页 `WM_CTLCOLOR*` 参数误用**：`settings.rs` 的 `ctlcolor_brush` 把 **lParam（控件 HWND）当作 HDC** 传给 `SetTextColor`/`SetBkColor`，而 Win32 约定为 wParam = HDC、lParam = 控件句柄——对窗口句柄调用 GDI 文字函数静默失败，设置页所有文字按 DC 默认黑字白底绘制，暗色主题下明显错乱。改为取 wParam（与 `panel.rs`/`popup.rs` 的同名函数对齐）；
+  2. **下拉框改 `CBS_OWNERDRAWFIXED` 自绘**（**推翻 D17-3 的子类化方案**）：实测（诊断日志证实）Win11 上闭合成 `CBS_DROPDOWNLIST` 的显示区由主题变体直接绘制，**不发送任何 `WM_CTLCOLOR*`**——父窗口与子类过程均收不到配色消息，子类化路径对显示区是死路（仅下拉列表部分有效）。下拉框改用 owner-draw：`WM_DRAWITEM` 中关闭态选中字段（`itemID == -1`/`ODS_COMBOBOXEDIT`）按编辑框配色、列表项按选中/禁用态用列表配色绘制，文本经 `CB_GETLBTEXTLEN` 动态读取，`WM_MEASUREITEM` 自报行高；`DarkMode_Explorer` 仍应用于下拉列表边框/滚动条；
+  3. **tooltip 备注不可见**（D17 遗留问题 17 根因定位）：两层缺陷叠加——创建时用窗口默认字体对全文整体量测高度（实际绘制用粗体标题 + 常规备注的消息字体，行高更大），窗口偏矮裁掉备注行；`WM_PAINT` 里用 `y = tr.bottom + 4` 推备注行位置，但 `DrawTextW` 不带 `DT_CALCRECT` 时**不回写矩形 bottom**，备注被画到窗口底边之外。修复：新增 `measure_text_size`（`DT_CALCRECT`、分字体量测后按绘制排版累加），绘制侧改用 `DrawTextW` 返回值（实际绘制高度）推进下一行。
+- **备选方案**：
+  1. 继续子类化 + 补拦 `WM_ERASEBKGND` 等消息（否决：显示区不走任何配色消息，无消息可拦，实测证据否定该路径）；
+  2. 量测端与绘制端都改 `DT_CALCRECT`（采用：量测端必须 `DT_CALCRECT` 才不落屏；绘制端以返回值为准，不再依赖矩形回写语义）。
+- **教训**：D17-3 的"子类化拦截 CTLCOLOR"方案当时未经实测验证即写入决策记录；本轮以诊断日志实证其不覆盖显示区后推翻。决策记录中未经验证的方案应标注"待实测"。
+
+---
+
 # 代码质量审计
 
 审计日期：2026-08-20。审计范围为 `src/` 下全部 14 个 `.rs` 文件，共 2561 行。审计在项目根目录执行。

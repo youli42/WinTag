@@ -13,18 +13,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{FillRect, SetBkColor, SetTextColor, HDC};
-use windows::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
+use windows::Win32::Graphics::Gdi::{
+    DrawTextW, FillRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, DT_SINGLELINE,
+    DT_VCENTER, HDC, HGDIOBJ, TRANSPARENT,
+};
+use windows::Win32::UI::Controls::{
+    BST_CHECKED, BST_UNCHECKED, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_COMBOBOXEDIT, ODS_DISABLED,
+    ODS_SELECTED, ODT_COMBOBOX,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClassLongPtrW, GetClientRect, PostMessageW, RegisterClassW,
     SendMessageW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GCLP_WNDPROC, GWLP_WNDPROC, HMENU, MINMAXINFO, SW_HIDE,
-    SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    BS_AUTOCHECKBOX, CBS_DROPDOWNLIST, CBS_HASSTRINGS, CBS_OWNERDRAWFIXED, CB_ADDSTRING,
+    CB_GETCURSEL, CB_GETLBTEXT, CB_GETLBTEXTLEN, CB_SETCURSEL, CREATESTRUCTW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, GCLP_WNDPROC, GWLP_WNDPROC, HMENU, MINMAXINFO, SW_HIDE, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
     WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_MEASUREITEM, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
@@ -267,8 +274,18 @@ extern "system" fn settings_wndproc(
             }
 
             // —— 主题模式下拉框（只读下拉列表，高度含展开后的列表区域）——
+            // CBS_OWNERDRAWFIXED + CBS_HASSTRINGS：自绘关闭态显示区与列表项。
+            // Win11 上闭合成 CBS_DROPDOWNLIST 的显示区由主题变体直接绘制、
+            // 不查 WM_CTLCOLOR*（诊断证实零配色消息到达），暗色主题下无法经
+            // 消息着色，故启用 owner-draw，由 WM_DRAWITEM 按主题调色板绘制。
             let combo_style = WINDOW_STYLE(
-                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_VSCROLL.0 | CBS_DROPDOWNLIST as u32,
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | WS_VSCROLL.0
+                    | CBS_DROPDOWNLIST as u32
+                    | CBS_OWNERDRAWFIXED as u32
+                    | CBS_HASSTRINGS as u32,
             );
             // SAFETY: 创建 COMBOBOX 子控件（ID = IDC_THEME_COMBO），样式为只读下拉列表；
             // 失败时返回默认句柄并打印告警。
@@ -465,7 +482,7 @@ extern "system" fn settings_wndproc(
         WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
             // 静态文本 / 下拉列表 / 按钮：窗口背景色 + 前景文本色
             let c = theme_colors().unwrap_or_else(light_colors);
-            ctlcolor_brush(lparam, c.bg, c.fg)
+            ctlcolor_brush(wparam, c.bg, c.fg)
         }
         WM_CTLCOLOREDIT => {
             // 编辑框区域（预留的 theme_edit/corner_edit 命中时用编辑框配色，
@@ -483,12 +500,8 @@ extern "system" fn settings_wndproc(
             } else {
                 (c.bg, c.fg)
             };
-            ctlcolor_brush(lparam, bg, fg)
+            ctlcolor_brush(wparam, bg, fg)
         }
-        // WM_ERASEBKGND：窗口自身客户区背景。WM_CTLCOLOR* 只处理子控件配色，
-        // 客户区背景由 WM_ERASEBKGND 决定；默认 DefWindowProc 用白色类画刷擦除
-        // 背景（暗色主题下表现为白色窗口底色），此处按主题色填充并返回 1
-        // 告知系统背景已擦除，阻止默认白色填充。
         WM_GETMINMAXINFO => {
             // 固定设置窗口尺寸（问题 9.6）：禁止缩放导致控件错乱
             // SAFETY: lParam 指向 MINMAXINFO，WM_GETMINMAXINFO 期间有效；
@@ -505,15 +518,31 @@ extern "system" fn settings_wndproc(
             LRESULT(0)
         }
         WM_DRAWITEM => {
-            // 自绘按钮绘制请求（问题 9.4/9.8）：委托 ui::button 处理
-            if button::handle_draw_item(lparam) {
+            // 自绘下拉框（CBS_OWNERDRAWFIXED）优先，其次自绘按钮（9.4/9.8）
+            if handle_combo_draw_item(lparam) || button::handle_draw_item(lparam) {
                 LRESULT(1)
             } else {
-                // SAFETY: 非按钮的 WM_DRAWITEM 透传默认过程。
+                // SAFETY: 非自绘控件的 WM_DRAWITEM 透传默认过程。
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_MEASUREITEM => {
+            // 下拉框列表项行高（owner-draw 需自报）：CTRL_H - 4 设计像素
+            // SAFETY: WM_MEASUREITEM 的 lParam 指向可写 MEASUREITEMSTRUCT，
+            // 生命周期覆盖本消息；仅对 COMBOBOX 类型回填行高。
+            let mis = unsafe { &mut *(lparam.0 as *mut MEASUREITEMSTRUCT) };
+            if mis.CtlType == ODT_COMBOBOX {
+                mis.itemHeight = (dp(hwnd, CTRL_H) - dp(hwnd, 4)).max(16) as u32;
+                LRESULT(1)
+            } else {
+                // SAFETY: 非下拉框的 WM_MEASUREITEM 透传默认过程。
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
         WM_ERASEBKGND => {
+            // 窗口自身客户区背景。WM_CTLCOLOR* 只处理子控件配色，客户区背景由
+            // 本消息决定；默认 DefWindowProc 用白色类画刷擦除背景（暗色主题下
+            // 表现为白色窗口底色），此处按主题色填充并返回 1 告知系统背景已擦除。
             // 主题状态未初始化（从未调用 set_theme）时回退系统默认擦除
             let Some(colors) = theme_colors() else {
                 // SAFETY: DefWindowProcW 将未处理的 WM_ERASEBKGND 原样透传给系统
@@ -617,12 +646,104 @@ extern "system" fn settings_wndproc(
     }
 }
 
+/// 处理下拉框自绘（`WM_DRAWITEM`，`CBS_OWNERDRAWFIXED`，D18）
+///
+/// Win11 上闭合成 `CBS_DROPDOWNLIST` 的显示区由主题变体直接绘制、不查
+/// `WM_CTLCOLOR*`（实测零配色消息到达父窗口与子类过程），暗色主题下无法
+/// 经消息着色，故下拉框启用 owner-draw：关闭态选中字段（`itemID == -1` /
+/// `ODS_COMBOBOXEDIT`）按编辑框配色绘制，列表项按选中态用列表底色 / 选中色。
+///
+/// 返回 `true` 表示本消息属于下拉框且已绘制（父窗口返回 `LRESULT(1)`）。
+fn handle_combo_draw_item(lparam: LPARAM) -> bool {
+    // SAFETY: WM_DRAWITEM 的 lParam 指向 DRAWITEMSTRUCT，生命周期覆盖消息
+    // 处理过程；先校验 CtlType 为下拉框再使用。
+    let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+    if dis.CtlType != ODT_COMBOBOX {
+        return false;
+    }
+    let Some(c) = theme_colors() else {
+        return false;
+    };
+
+    // 配色：关闭态字段用编辑框配色（与弹窗编辑框观感一致）；列表项按
+    // 选中 / 禁用态取列表底色、选中色与次要文字色
+    let in_edit = dis.itemID == u32::MAX || (dis.itemState.0 & ODS_COMBOBOXEDIT.0) != 0;
+    let disabled = (dis.itemState.0 & ODS_DISABLED.0) != 0;
+    let (bg, fg) = if in_edit {
+        (c.edit_bg, c.edit_fg)
+    } else if disabled {
+        (c.listview_bg, c.muted)
+    } else if (dis.itemState.0 & ODS_SELECTED.0) != 0 {
+        (c.selected, c.listview_fg)
+    } else {
+        (c.listview_bg, c.listview_fg)
+    };
+
+    let hdc = dis.hDC;
+    // SAFETY: dis.hDC 为本次绘制 DC（消息期间有效）；画刷经 get_brush 进程级
+    // 缓存持有，可直接使用。
+    unsafe {
+        let _ = FillRect(hdc, &dis.rcItem, get_brush(bg));
+    }
+
+    // 取条目文本：关闭态字段 itemID == u32::MAX（-1），需先查当前选中索引；
+    // 文本长度经 CB_GETLBTEXTLEN 动态读取（避免定长缓冲静默截断）
+    let idx: i32 = if dis.itemID == u32::MAX {
+        // SAFETY: dis.hwndItem 为发起绘制的下拉框句柄，消息期间有效。
+        unsafe { SendMessageW(dis.hwndItem, CB_GETCURSEL, WPARAM(0), LPARAM(0)) }.0 as i32
+    } else {
+        dis.itemID as i32
+    };
+    if idx < 0 {
+        return true;
+    }
+    let len =
+        // SAFETY: CB_GETLBTEXTLEN 为只读查询。
+        unsafe { SendMessageW(dis.hwndItem, CB_GETLBTEXTLEN, WPARAM(idx as usize), LPARAM(0)) }.0;
+    if len <= 0 {
+        return true;
+    }
+    let mut buf = vec![0u16; len as usize + 1];
+    // SAFETY: buf 为 NUL 结尾缓冲，CB_GETLBTEXT 在消息返回前完成文本拷贝。
+    unsafe {
+        SendMessageW(
+            dis.hwndItem,
+            CB_GETLBTEXT,
+            WPARAM(idx as usize),
+            LPARAM(buf.as_mut_ptr() as isize),
+        );
+    }
+
+    // 绘文本：左侧 6px 内边距、单行垂直居中，选入全局消息字体
+    // SAFETY: dis.hDC 消息期间有效；字体为进程级缓存句柄（永不删除），
+    // 用后恢复原对象；buf 为 NUL 结尾 UTF-16，rc 为局部矩形。
+    unsafe {
+        let _ = SetTextColor(hdc, fg);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let font = crate::ui::theme::message_font();
+        let old = if !font.is_invalid() {
+            SelectObject(hdc, font)
+        } else {
+            HGDIOBJ::default()
+        };
+        let mut rc = dis.rcItem;
+        rc.left += 6;
+        let _ = DrawTextW(hdc, &mut buf, &mut rc, DT_SINGLELINE | DT_VCENTER);
+        if !font.is_invalid() {
+            let _ = SelectObject(hdc, old);
+        }
+    }
+    true
+}
+
 /// 按主题调色板为控件设置文本/背景色，返回背景画刷（`WM_CTLCOLOR*` 消息返回值）
 ///
-/// `lParam` 为消息携带的控件 DC 句柄；`bg`/`fg` 为 BGR 格式的 `COLORREF`。
-/// 画刷来自 [`get_brush`] 的进程级缓存（永不删除），可直接作为返回值。
-fn ctlcolor_brush(lparam: LPARAM, bg: COLORREF, fg: COLORREF) -> LRESULT {
-    let hdc = HDC(lparam.0 as *mut c_void);
+/// `wParam` 为消息携带的控件 DC 句柄（`WM_CTLCOLOR*` 约定：wParam = HDC、
+/// lParam = 控件 HWND，此前误用 lParam 作 DC 导致配色静默失效）；`bg`/`fg`
+/// 为 BGR 格式的 `COLORREF`。画刷来自 [`get_brush`] 的进程级缓存
+///（永不删除），可直接作为返回值。
+fn ctlcolor_brush(wparam: WPARAM, bg: COLORREF, fg: COLORREF) -> LRESULT {
+    let hdc = HDC(wparam.0 as *mut c_void);
     // SAFETY: lParam 在 WM_CTLCOLOR* 消息中为控件 DC 句柄，消息处理期间有效；
     // SetTextColor/SetBkColor 为线程安全标准 API，失败时仅影响该次绘制的配色。
     unsafe {

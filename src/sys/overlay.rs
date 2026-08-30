@@ -12,8 +12,8 @@ use windows::Win32::Graphics::Gdi::{
     DeleteDC, DeleteObject, DrawTextW, EndPaint, GetDC, GetMonitorInfoW, GetTextExtentPoint32W,
     InvalidateRect, MonitorFromPoint, PatBlt, ReleaseDC, RoundRect, SelectObject, SetBkMode,
     SetTextColor, UpdateWindow, ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BLACKNESS,
-    BLENDFUNCTION, DIB_RGB_COLORS, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PS_SOLID, TRANSPARENT,
+    BLENDFUNCTION, DIB_RGB_COLORS, DT_CALCRECT, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HDC,
+    HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -530,6 +530,40 @@ fn title_text(target_hwnd: isize) -> Option<String> {
     Some(truncate_title(trimmed, TITLE_MAX_CHARS))
 }
 
+/// 在指定 DC 上量测文本的绘制尺寸（`DT_CALCRECT`，只量测不实际绘制）
+///
+/// 返回 (宽, 高)。量测宽度上限 340px（与 tooltip 创建时的换行宽度一致）。
+/// 标题（粗体）与备注（常规）行高不同，须用各自字体分别量测后累加——
+/// 此前用窗口默认字体对全文整体量测，行高偏小导致 tooltip 高度不足、
+/// 备注行被裁掉不可见。
+fn measure_text_size(hdc: HDC, text: &str, font: HFONT) -> (i32, i32) {
+    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: 340,
+        bottom: 0,
+    };
+    let old = if !font.is_invalid() {
+        // SAFETY: 切换量测字体，结束后恢复原对象。
+        unsafe { SelectObject(hdc, font) }
+    } else {
+        HGDIOBJ::default()
+    };
+    // SAFETY: wide 为 NUL 结尾宽字符串切片，rc 为栈上矩形，调用期间存活；
+    // DT_CALCRECT 仅量测不绘制，DC 无副作用。
+    unsafe {
+        let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_WORDBREAK | DT_CALCRECT);
+    }
+    if !old.is_invalid() {
+        // SAFETY: 恢复 SelectObject 保存的原对象。
+        unsafe {
+            let _ = SelectObject(hdc, old);
+        }
+    }
+    (rc.right - rc.left, rc.bottom - rc.top)
+}
+
 /// 量测标题文本像素宽度（系统消息字体；量测失败回退每字符 12px 估算）
 fn measure_title_width(text: &str) -> i32 {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1035,7 +1069,7 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
         let _ = GetCursorPos(&mut pt);
     }
 
-    let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: tooltip 类已注册（ensure_tooltip_class），wide 为 NUL 结尾的 UTF-16 文本；
     // 创建失败返回 Err，由 if let Ok 处理，不传播。
     let tooltip_hwnd = unsafe {
@@ -1062,22 +1096,34 @@ fn handle_mouse_move(overlay_hwnd: HWND) {
             set_userdata(overlay_hwnd, tooltip_hwnd.0);
         }
 
-        // 宽度自适应 + 高度自适应：DrawTextW 预量，宽度上限 360px（解决问题 4 截断）
+        // 宽度自适应 + 高度自适应：与 tooltip_wndproc(WM_PAINT) 的排版一致，
+        // 标题（粗体）与备注（常规）用各自字体分别 DT_CALCRECT 量测后累加，
+        // 宽度上限 340px 内容宽（360 减四边 10px 边距）。此前用窗口默认字体
+        // 对全文整体量测（且未加 DT_CALCRECT，实际在屏幕上画了一次），
+        // 行高偏小导致窗口高度不足，备注行被裁掉不可见。
         // SAFETY: tooltip_hwnd 刚创建且存活；GetDC/ReleaseDC 成对调用；
-        // DrawTextW 测量文本，SetWindowPos 调整尺寸，失败均忽略。
+        // SetWindowPos 调整尺寸，失败均忽略。
         unsafe {
             let hdc = GetDC(tooltip_hwnd);
-            // 先按 340px 内容宽（360 减四边 10px 边距）测量高度
-            let mut rc = RECT {
-                left: 0,
-                top: 0,
-                right: 340,
-                bottom: 0,
+            let (title_w, title_h) = if title.is_empty() {
+                (0, 0)
+            } else {
+                measure_text_size(hdc, &title, crate::ui::theme::message_font_bold())
             };
-            let _ = DrawTextW(hdc, &mut wide, &mut rc, DT_WORDBREAK);
-            let content_w = (rc.right - rc.left).max(120);
-            let content_h = (rc.bottom - rc.top).max(20);
+            let (note_w, note_h) = if note.is_empty() {
+                (0, 0)
+            } else {
+                measure_text_size(hdc, &note, crate::ui::theme::message_font())
+            };
             let _ = ReleaseDC(tooltip_hwnd, hdc);
+            let content_w = title_w.max(note_w).max(120);
+            // 标题与备注之间的 4px 间距与 WM_PAINT 的 y = title_bottom + 4 对齐
+            let line_gap = if !title.is_empty() && !note.is_empty() {
+                4
+            } else {
+                0
+            };
+            let content_h = (title_h + line_gap + note_h).max(20);
             // 实际窗口尺寸 = 内容宽高 + 四边 10px 内边距 + 1px 边框
             let win_w = content_w + 20 + 2;
             let win_h = content_h + 20 + 2;
@@ -1243,8 +1289,10 @@ extern "system" fn tooltip_wndproc(
                             right: content_right,
                             bottom: rc.bottom - margin,
                         };
-                        let _ = DrawTextW(hdc, &mut title_wide, &mut tr, DT_WORDBREAK);
-                        y = tr.bottom + 4;
+                        // DrawTextW 返回值为文本实际绘制高度（不带 DT_CALCRECT 时
+                        // 不会回写 tr.bottom，不能用它推下一行位置）
+                        let title_h = DrawTextW(hdc, &mut title_wide, &mut tr, DT_WORDBREAK);
+                        y += title_h + 4;
                     }
                     if !old_font.is_invalid() {
                         let _ = SelectObject(hdc, old_font);
