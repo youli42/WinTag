@@ -99,15 +99,99 @@ pub fn global_settings() -> Option<Arc<Mutex<Settings>>> {
     GLOBAL_SETTINGS.get().cloned()
 }
 
-/// 返回配置文件路径：`%APPDATA%\WinTag\config.toml`
+/// 按优先级选择配置根目录：CLI > 环境变量 > exe 探测 > APPDATA。
 ///
-/// 若 `APPDATA` 环境变量缺失（如精简版 Windows 或测试环境），
-/// 回退到当前工作目录下的 `./wintag.toml`。
-pub fn config_path() -> PathBuf {
-    match std::env::var("APPDATA") {
-        Ok(dir) => PathBuf::from(dir).join("WinTag").join("config.toml"),
-        Err(_) => PathBuf::from("./wintag.toml"),
+/// 纯函数：四个候选按优先级取第一个 `Some`，全部为 `None` 时返回 `None`
+/// （由调用方决定兜底）。候选值本身不做存在性/可写性校验。
+pub(crate) fn pick_config_root(
+    cli: Option<&Path>,
+    env: Option<&Path>,
+    exe_probe: Option<&Path>,
+    appdata: Option<&Path>,
+) -> Option<PathBuf> {
+    cli.or(env)
+        .or(exe_probe)
+        .or(appdata)
+        .map(|p| p.to_path_buf())
+}
+
+/// 从命令行参数解析 `--config-dir <dir>` 或 `--config-dir=<dir>`。
+///
+/// 使用 `OsString` 遍历（非 UTF-8 argv 不 panic，仅跳过前缀匹配）；
+/// 未提供或 `--config-dir` 位于末尾缺值时返回 `None`。
+pub fn parse_cli_config_dir(args: &[std::ffi::OsString]) -> Option<PathBuf> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--config-dir" {
+            return iter.next().map(PathBuf::from);
+        }
+        if let Some(rest) = arg.to_str().and_then(|s| s.strip_prefix("--config-dir=")) {
+            return Some(PathBuf::from(rest));
+        }
     }
+    None
+}
+
+/// 探测 `<exe_dir>/config` 作为配置根目录（D22 便携配置）。
+///
+/// 目录已存在直接采用；否则尝试 `create_dir_all` 探测可写性，
+/// 成功（目录已建好，后续 save 可写入）返回 `Some`，失败返回 `None`。
+pub(crate) fn probe_exe_config(exe_dir: &Path) -> Option<PathBuf> {
+    let candidate = exe_dir.join("config");
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    std::fs::create_dir_all(&candidate).ok()?;
+    Some(candidate)
+}
+
+/// 判定 load 是否需读穿透旧配置（D9：只读不复制）。
+///
+/// 仅当 resolved 文件不存在且与 legacy 不是同一路径时为 `true`；
+/// resolved == legacy 时为 `false`，避免对同一路径做二次无意义读取。
+pub(crate) fn should_read_through(resolved: &Path, legacy: &Path) -> bool {
+    !resolved.exists() && resolved != legacy
+}
+
+/// 旧版配置路径（D9 迁移前）：`%APPDATA%\WinTag\config.toml`。
+///
+/// 独立于解析链、仅用于 `load` 读穿透，绝不参与写入；
+/// `APPDATA` 缺失时返回 `None`。
+fn legacy_appdata_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|v| PathBuf::from(v).join("WinTag").join("config.toml"))
+}
+
+/// 配置根目录解析链（D22/R1）memoize：读/写共用同一结果，保证一致。
+///
+/// 优先级：`--config-dir` CLI > `WINTAG_CONFIG_DIR` env > `<exe_dir>/config`
+/// 可写探测 > `%APPDATA%\WinTag`；全部不可得时兜底当前目录 `.`
+/// （配置文件落为 `./config.toml`）。
+static CONFIG_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// 返回 memoize 后的配置根目录（首次调用执行解析链，见 [`CONFIG_ROOT`]）
+pub fn config_root() -> PathBuf {
+    CONFIG_ROOT
+        .get_or_init(|| {
+            let cli = parse_cli_config_dir(&std::env::args_os().collect::<Vec<_>>());
+            let env = std::env::var_os("WINTAG_CONFIG_DIR").map(PathBuf::from);
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().and_then(probe_exe_config));
+            let appdata = std::env::var_os("APPDATA").map(|v| PathBuf::from(v).join("WinTag"));
+            pick_config_root(
+                cli.as_deref(),
+                env.as_deref(),
+                exe.as_deref(),
+                appdata.as_deref(),
+            )
+            .unwrap_or_else(|| PathBuf::from("."))
+        })
+        .clone()
+}
+
+/// 返回配置文件路径：`config_root()/config.toml`（解析链见 [`config_root`]）
+pub fn config_path() -> PathBuf {
+    config_root().join("config.toml")
 }
 
 /// 将 TOML 字符串解析为 [`Settings`]
@@ -118,21 +202,38 @@ fn parse_str(s: &str) -> Result<Settings, toml::de::Error> {
     toml::from_str(s)
 }
 
+/// 解析配置内容，失败回退默认并告警（`load` 的公共尾段，避免复制粘贴）
+fn parse_or_default(content: &str) -> Settings {
+    match parse_str(content) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[配置] 读取配置失败，使用默认配置: {e}");
+            Settings::default()
+        }
+    }
+}
+
 /// 从配置文件加载设置
 ///
 /// 任何错误（文件不存在 / IO 失败 / TOML 解析失败）都回退到默认配置，
 /// 仅打印一条中文警告，绝不 panic、绝不中断程序。
+///
+/// D9 读穿透：`config_path()` 不存在时，best-effort 读旧
+/// `%APPDATA%\WinTag\config.toml`（仅当二者不是同一路径，且不复制）。
 pub fn load() -> Settings {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(content) => match parse_str(&content) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[配置] 读取配置失败，使用默认配置: {e}");
-                Settings::default()
-            }
-        },
+        Ok(content) => parse_or_default(&content),
         Err(e) => {
+            // 新位置无文件时读穿透旧 %APPDATA% 配置（D9：只读，不复制）
+            if let Some(legacy) = legacy_appdata_path() {
+                if should_read_through(&path, &legacy) {
+                    if let Ok(content) = std::fs::read_to_string(&legacy) {
+                        println!("[配置] 已从旧位置 %APPDATA% 读取（D9 不复制）");
+                        return parse_or_default(&content);
+                    }
+                }
+            }
             eprintln!("[配置] 读取配置失败，使用默认配置: {e}");
             Settings::default()
         }
@@ -282,5 +383,104 @@ mod tests {
         assert_eq!(CornerPreference::Default.label_cn(), "默认");
         assert_eq!(CornerPreference::Round.label_cn(), "圆角");
         assert_eq!(CornerPreference::SmallRound.label_cn(), "小圆角");
+    }
+
+    // ---------- D22/R1 配置路径解析链 ----------
+
+    /// 测试 (f1)：pick_config_root 全 None → None
+    #[test]
+    fn test_pick_config_root_all_none() {
+        assert_eq!(pick_config_root(None, None, None, None), None);
+    }
+
+    /// 测试 (f2)：pick_config_root 优先级 —— cli > env > exe_probe > appdata
+    #[test]
+    fn test_pick_config_root_priority() {
+        let cli = Path::new("C:/cli");
+        let env = Path::new("C:/env");
+        let exe = Path::new("C:/exe");
+        let app = Path::new("C:/appdata");
+        // cli 优先于其余三者
+        assert_eq!(
+            pick_config_root(Some(cli), Some(env), Some(exe), Some(app)),
+            Some(PathBuf::from("C:/cli"))
+        );
+        // 无 cli 时 env 优先于 exe_probe / appdata
+        assert_eq!(
+            pick_config_root(None, Some(env), Some(exe), Some(app)),
+            Some(PathBuf::from("C:/env"))
+        );
+        // 无 cli/env 时 exe_probe 优先于 appdata
+        assert_eq!(
+            pick_config_root(None, None, Some(exe), Some(app)),
+            Some(PathBuf::from("C:/exe"))
+        );
+        // 仅 appdata
+        assert_eq!(
+            pick_config_root(None, None, None, Some(app)),
+            Some(PathBuf::from("C:/appdata"))
+        );
+    }
+
+    /// 测试 (g1)：parse_cli_config_dir —— `--config-dir <dir>` / `--config-dir=<dir>` / 缺省 / 无值
+    #[test]
+    fn test_parse_cli_config_dir_forms() {
+        use std::ffi::OsString;
+        // 空格分隔形式
+        let args = [
+            OsString::from("prog"),
+            OsString::from("--config-dir"),
+            OsString::from("D:\\cfg"),
+        ];
+        assert_eq!(parse_cli_config_dir(&args), Some(PathBuf::from("D:\\cfg")));
+        // 等号形式
+        let args = [
+            OsString::from("prog"),
+            OsString::from("--config-dir=D:\\cfg2"),
+        ];
+        assert_eq!(parse_cli_config_dir(&args), Some(PathBuf::from("D:\\cfg2")));
+        // 缺省 → None
+        let args = [OsString::from("prog"), OsString::from("--help")];
+        assert_eq!(parse_cli_config_dir(&args), None);
+        // --config-dir 位于末尾无值 → None（不 panic）
+        let args = [OsString::from("prog"), OsString::from("--config-dir")];
+        assert_eq!(parse_cli_config_dir(&args), None);
+    }
+
+    /// 测试 (g2)：parse_cli_config_dir —— 非 UTF-8 OsString 不 panic
+    #[test]
+    fn test_parse_cli_config_dir_non_utf8_no_panic() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        // 未配对 UTF-16 代理项：合法 OsString 但非 UTF-8
+        let weird = OsString::from_wide(&[0xD800]);
+        let args = [
+            OsString::from("prog"),
+            weird,
+            OsString::from("--config-dir"),
+            OsString::from("E:\\cfg"),
+        ];
+        assert_eq!(parse_cli_config_dir(&args), Some(PathBuf::from("E:\\cfg")));
+        // 非 UTF-8 值本身亦可作为路径值返回（不 panic、不参与 ASCII 前缀匹配）
+        let weird2 = OsString::from_wide(&[0xD800, b'x' as u16]);
+        let args2 = [OsString::from("--config-dir"), weird2];
+        assert_eq!(parse_cli_config_dir(&args2), Some(PathBuf::from(&args2[1])));
+    }
+
+    /// 测试 (h)：should_read_through —— resolved 不存在且 ≠ legacy → true；相等或已存在 → false
+    #[test]
+    fn test_should_read_through() {
+        let base = std::env::temp_dir().join(format!("wintag_readthrough_{}", std::process::id()));
+        let resolved = base.join("resolved.toml");
+        let legacy = base.join("legacy.toml");
+        // resolved 不存在且不等于 legacy → true
+        assert!(should_read_through(&resolved, &legacy));
+        // resolved == legacy → false（避免重复读同一路径）
+        assert!(!should_read_through(&resolved, &resolved));
+        // resolved 已存在 → false
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&resolved, "x").unwrap();
+        assert!(!should_read_through(&resolved, &legacy));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

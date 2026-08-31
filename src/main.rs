@@ -76,6 +76,26 @@ unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> BOOL {
 fn main() -> anyhow::Result<()> {
     println!("WinTag 启动中...");
 
+    // 命令行参数处理（D22/R1）：`--config-dir` 由 core::settings::config_root()
+    // 解析链消费（内部读取 args_os 并 memoize，见 settings.rs），此处仅扫描
+    // 未知参数告警后忽略，绝不中断程序。必须在 core::settings::load() 之前完成。
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let mut arg_idx = 1; // 跳过 argv[0]（程序名）
+    while arg_idx < raw_args.len() {
+        let arg = &raw_args[arg_idx];
+        if arg == "--config-dir" {
+            arg_idx += 2; // 连同其值一并跳过
+            continue;
+        }
+        let display = arg.to_string_lossy();
+        if display.starts_with("--config-dir=") {
+            arg_idx += 1;
+            continue;
+        }
+        eprintln!("[参数] 未知参数已忽略: {display}");
+        arg_idx += 1;
+    }
+
     // 声明 Per-Monitor V2 DPI 感知（必须在创建任何窗口之前调用）
     // SAFETY: SetProcessDpiAwarenessContext 为进程级设置，无参数生命周期问题；
     // 失败时降级到 V1，保证高 DPI 下覆盖层坐标与目标窗口物理像素一致。
