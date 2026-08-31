@@ -91,6 +91,51 @@ struct PopupData {
 /// 异目标请求销毁旧弹窗后新建。仅主线程读写。
 static ACTIVE_POPUP: Mutex<Option<(isize, isize)>> = Mutex::new(None);
 
+/// 创建标记弹窗前，对"已有弹窗该如何处理"的决策结果
+///
+/// 将弹窗单例复用/替换的判定抽为纯函数，供 [`create_popup`] 在**锁外**决定动作：
+/// 任何窗口 API（`DestroyWindow`/`ShowWindow`/`SetFocus` 等）都不应在持有
+/// [`ACTIVE_POPUP`] 锁时执行，否则 `DestroyWindow` 同步分发 `WM_DESTROY` 会重入
+/// 同一个不可重入的 `std::sync::Mutex`，导致主线程自死锁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupPlan {
+    /// 无活动弹窗，或旧弹窗已销毁：直接新建
+    Fresh,
+    /// 同目标且旧弹窗存活：复用并置前聚焦（载荷为旧弹窗句柄）
+    Reuse(isize),
+    /// 异目标且旧弹窗存活：销毁旧弹窗后新建（载荷为旧弹窗句柄）
+    Replace(isize),
+}
+
+/// 根据活动弹窗注册表、目标窗口句柄与旧弹窗存活状态，决策新建/复用/替换
+///
+/// 纯函数、无副作用：
+/// - `active` 为 `None` → [`PopupPlan::Fresh`]（第一次弹窗）；
+/// - 旧弹窗已销毁（`old_alive == false`）→ [`PopupPlan::Fresh`]（清空过期登记，直接新建）；
+/// - 同目标且存活 → [`PopupPlan::Reuse`]；
+/// - 异目标且存活 → [`PopupPlan::Replace`]。
+///
+/// `old_alive` 由调用方经 `IsWindow` 计算后传入，本函数自身不访问任何 Win32 API，
+/// 便于单元测试。
+fn plan_popup_action(
+    active: Option<(isize, isize)>,
+    target_hwnd: isize,
+    old_alive: bool,
+) -> PopupPlan {
+    match active {
+        None => PopupPlan::Fresh,
+        Some((old_target, old_hwnd)) => {
+            if !old_alive {
+                PopupPlan::Fresh
+            } else if old_target == target_hwnd {
+                PopupPlan::Reuse(old_hwnd)
+            } else {
+                PopupPlan::Replace(old_hwnd)
+            }
+        }
+    }
+}
+
 /// 创建“标记窗口”弹窗
 ///
 /// 在主线程中为指定目标窗口弹出标签编辑弹窗，用于输入标签标题与备注。
@@ -114,32 +159,59 @@ pub fn create_popup(
     hidden_hwnd: isize,
 ) {
     // 单例复用（R18）：已有弹窗时——同目标置前复用（不再叠加新弹窗），
-    // 异目标销毁旧弹窗（WM_DESTROY 释放数据并清理注册表）后新建
-    if let Ok(mut active) = ACTIVE_POPUP.lock() {
-        if let Some((old_target, old_hwnd)) = *active {
-            // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE。
-            if unsafe { IsWindow(HWND(old_hwnd as *mut std::ffi::c_void)) }.as_bool() {
-                if old_target == target_hwnd {
-                    // 复用：置前并聚焦标题框，直接返回
-                    let popup = HWND(old_hwnd as *mut std::ffi::c_void);
-                    // SAFETY: popup 为存活弹窗句柄；ShowWindow/SetForegroundWindow/
-                    // GetDlgItem/SetFocus 失败均仅返回错误值，忽略。
-                    unsafe {
-                        let _ = ShowWindow(popup, SW_SHOW);
-                        let _ = SetForegroundWindow(popup);
-                        if let Ok(title_edit) = GetDlgItem(popup, IDC_TITLE_EDIT) {
-                            let _ = SetFocus(title_edit);
-                        }
-                    }
-                    return;
-                }
-                // SAFETY: old_hwnd 为本进程存活弹窗，DestroyWindow 触发
-                // WM_DESTROY 释放其用户数据（主线程内调用合法）。
-                unsafe {
-                    let _ = DestroyWindow(HWND(old_hwnd as *mut std::ffi::c_void));
+    // 异目标销毁旧弹窗（WM_DESTROY 释放数据并清理注册表）后新建。
+    //
+    // 死锁修复（D21）：旧实现 `:118` 持 `ACTIVE_POPUP` 锁跨整个 if-let 块，`DestroyWindow`
+    // 在持锁时被调用——而 `DestroyWindow` 会同步分发 `WM_DESTROY`，`popup_wndproc` 的
+    // `WM_DESTROY` 分支又 `ACTIVE_POPUP.lock()`，同一线程重入同一不可重入 `std::sync::Mutex`
+    // → 主线程永久自死锁，程序"无响应"。
+    // 现改为：锁**只**用于读状态、计算决策并清空（Replace 时）登记，锁作用域结束、
+    // guard 释放后，才在锁外执行一切窗口 API（DestroyWindow / ShowWindow /
+    // SetForegroundWindow / SetFocus）。用纯函数 [`plan_popup_action`] 承载决策逻辑。
+    let plan = {
+        let active = ACTIVE_POPUP.lock().ok().and_then(|g| *g);
+        // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
+        let old_alive = active
+            .map(|(_, old_hwnd)| unsafe {
+                IsWindow(HWND(old_hwnd as *mut std::ffi::c_void)).as_bool()
+            })
+            .unwrap_or(false);
+        let plan = plan_popup_action(active, target_hwnd, old_alive);
+        // Replace：先清空登记（锁内，只改状态），实际销毁移到锁外执行。
+        if let PopupPlan::Replace(_) = plan {
+            if let Ok(mut g) = ACTIVE_POPUP.lock() {
+                *g = None;
+            }
+        }
+        plan
+    };
+
+    match plan {
+        PopupPlan::Reuse(old_hwnd) => {
+            // 复用：置前并聚焦标题框，直接返回（不新建、不销毁，覆盖层数据不变）。
+            // 此分支在锁外执行，绝无重入风险。
+            let popup = HWND(old_hwnd as *mut std::ffi::c_void);
+            // SAFETY: popup 为存活弹窗句柄；ShowWindow/SetForegroundWindow/
+            // GetDlgItem/SetFocus 失败均仅返回错误值，忽略。
+            unsafe {
+                let _ = ShowWindow(popup, SW_SHOW);
+                let _ = SetForegroundWindow(popup);
+                if let Ok(title_edit) = GetDlgItem(popup, IDC_TITLE_EDIT) {
+                    let _ = SetFocus(title_edit);
                 }
             }
-            *active = None;
+            return;
+        }
+        PopupPlan::Replace(old_hwnd) => {
+            // 异目标且旧弹窗存活：锁释放后销毁旧弹窗（WM_DESTROY 重入锁不再阻塞）。
+            // SAFETY: old_hwnd 为本进程存活弹窗，DestroyWindow 触发
+            // WM_DESTROY 释放其用户数据（主线程内调用合法）。
+            unsafe {
+                let _ = DestroyWindow(HWND(old_hwnd as *mut std::ffi::c_void));
+            }
+        }
+        PopupPlan::Fresh => {
+            // 无活动弹窗或旧弹窗已销毁：直接走下方创建路径
         }
     }
 
@@ -1049,6 +1121,40 @@ fn draw_color_chip(dis: &DRAWITEMSTRUCT, selected: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 无活动弹窗 → 直接新建
+    #[test]
+    fn plan_popup_absent_is_fresh() {
+        assert_eq!(plan_popup_action(None, 100, true), PopupPlan::Fresh);
+        assert_eq!(plan_popup_action(None, 100, false), PopupPlan::Fresh);
+    }
+
+    /// 旧弹窗已销毁（登记陈旧）→ 直接新建，不尝试销毁/复用
+    #[test]
+    fn plan_popup_dead_old_is_fresh() {
+        assert_eq!(
+            plan_popup_action(Some((50, 42)), 100, false),
+            PopupPlan::Fresh
+        );
+    }
+
+    /// 同目标且旧弹窗存活 → 复用置前（载荷为旧弹窗句柄）
+    #[test]
+    fn plan_popup_same_target_reuses() {
+        assert_eq!(
+            plan_popup_action(Some((100, 42)), 100, true),
+            PopupPlan::Reuse(42)
+        );
+    }
+
+    /// 异目标且旧弹窗存活 → 销毁旧弹窗后新建（载荷为旧弹窗句柄）
+    #[test]
+    fn plan_popup_diff_target_replaces() {
+        assert_eq!(
+            plan_popup_action(Some((150, 42)), 100, true),
+            PopupPlan::Replace(42)
+        );
+    }
 
     /// 颜色候选：5 个变体的 RGBA 互不相同（R16 色块行选择依据）
     #[test]
