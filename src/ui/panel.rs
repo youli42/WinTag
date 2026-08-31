@@ -5,33 +5,48 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{FillRect, ScreenToClient, SetBkColor, SetTextColor, HDC};
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, HTREEITEM, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NM_CLICK,
-    NM_DBLCLK, TVE_EXPAND, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT, TVHITTESTINFO, TVHT_ONITEM,
-    TVHT_ONITEMBUTTON, TVIF_HANDLE, TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW,
-    TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM, TVM_EXPAND,
-    TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SETBKCOLOR, TVM_SETLINECOLOR,
-    TVM_SETTEXTCOLOR, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    NM_DBLCLK, TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVGN_NEXT, TVGN_PARENT, TVGN_ROOT,
+    TVHITTESTINFO, TVHT_ONITEM, TVHT_ONITEMBUTTON, TVIF_HANDLE, TVIF_PARAM, TVIF_STATE, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVIS_EXPANDED, TVITEMW, TVI_LAST, TVI_ROOT, TVM_DELETEITEM,
+    TVM_EXPAND, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SETBKCOLOR,
+    TVM_SETLINECOLOR, TVM_SETTEXTCOLOR, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, GetClassLongPtrW,
-    GetClientRect, GetCursorPos, GetDlgItem, GetParent, GetWindowTextW, IsIconic, IsWindow,
-    PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, EN_CHANGE,
-    ES_AUTOHSCROLL, GCLP_WNDPROC, GWLP_WNDPROC, HWND_TOP, MF_STRING, MINMAXINFO, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE,
+    GetClientRect, GetCursorPos, GetDlgCtrlID, GetDlgItem, GetParent, GetWindowTextW, IsIconic,
+    IsWindow, PostMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, TrackPopupMenu, BN_CLICKED, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    EN_CHANGE, ES_AUTOHSCROLL, GCLP_WNDPROC, GWLP_WNDPROC, HWND_TOP, MF_STRING, MINMAXINFO,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+    WM_CREATE, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NOTIFY, WM_SIZE, WS_CHILD, WS_EX_CLIENTEDGE,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_EDIT_TAG, WM_APP_TAGS_CHANGED};
 use crate::core::tag::TagStore;
+use crate::ui::button::{self, ButtonStyle};
 use crate::ui::layout::dp;
 use crate::ui::theme::{apply_font_to_children, theme_colors};
 
 const IDC_SEARCH_EDIT: i32 = 201;
 const IDC_LIST_VIEW: i32 = 202;
+/// 一键全部展开 / 全部收起按钮（问题 20）
+const IDC_EXPAND_ALL: i32 = 203;
+const IDC_COLLAPSE_ALL: i32 = 204;
+
+/// 键盘焦点循环顺序（问题 22）：搜索框 → 树形列表 → 全部展开 → 全部收起
+const FOCUS_ORDER: [i32; 4] = [
+    IDC_SEARCH_EDIT,
+    IDC_LIST_VIEW,
+    IDC_EXPAND_ALL,
+    IDC_COLLAPSE_ALL,
+];
 
 /// 右键菜单命令 ID（R17，配合 `TPM_RETURNCMD` 直接取回选择）
 const IDM_ACTIVATE: i32 = 301;
@@ -42,6 +57,10 @@ const IDM_REMOVE: i32 = 303;
 const MARGIN: i32 = 12;
 const SEARCH_H: i32 = 28;
 const SEARCH_GAP: i32 = 8;
+/// 按钮行（问题 20）：全部展开 / 全部收起按钮，与搜索框同排右对齐
+const BTN_W: i32 = 76;
+const BTN_H: i32 = 28;
+const BTN_GAP: i32 = 8;
 const WIN_W: i32 = 400;
 const WIN_H: i32 = 640;
 /// 最小宽度：列表宽度随窗口收缩仍可读，允许拖窄到紧凑列表形态
@@ -248,6 +267,50 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     HWND::default()
                 }
             };
+            // 子类化树控件（问题 22）：回车 / Tab 转发父面板统一处理键盘操作
+            //（树自身默认消费回车切换展开，必须拦截才能回车激活选中项）
+            if list_view != HWND::default() {
+                // SAFETY: list_view 为刚创建成功的有效子控件句柄；子类化仅替换
+                // 实例窗口过程，无额外内存操作。函数指针先经 `as *const ()` 再
+                // 转 isize，避免 function_casts_as_integer 警告。
+                unsafe {
+                    let _ = SetWindowLongPtrW(
+                        list_view,
+                        GWLP_WNDPROC,
+                        tree_subclass_proc as *const () as isize,
+                    );
+                }
+            }
+
+            // 按钮行（问题 20）：全部展开 / 全部收起，与搜索框同排右对齐。
+            // 自绘圆角按钮（BS_OWNERDRAW），绘制由 WM_DRAWITEM 分支分发到
+            // ui::button；初始坐标按 WIN_W 估算，WM_SIZE/layout_children 校正。
+            let btn_w = dp(hwnd, BTN_W);
+            let btn_h = dp(hwnd, BTN_H);
+            let btn_gap = dp(hwnd, BTN_GAP);
+            let (_search_w, btn_x, btn_y) = button_row_layout(dp(hwnd, WIN_W), m, btn_w, btn_gap);
+            // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略即可
+            // （按钮不可用不影响面板其余功能，WM_COMMAND 仍走原 ID 路由）。
+            let _ = button::create_button(
+                hwnd,
+                IDC_EXPAND_ALL,
+                "全部展开",
+                btn_x,
+                btn_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Secondary,
+            );
+            let _ = button::create_button(
+                hwnd,
+                IDC_COLLAPSE_ALL,
+                "全部收起",
+                btn_x + btn_w + btn_gap,
+                btn_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Secondary,
+            );
 
             // 暗色时设 DarkMode_Explorer 主题（滚动条随之暗化）；亮色恢复 Explorer。
             // 同时按主题调色板设置背景/文字/连线色。需 comctl32 v6 manifest
@@ -292,9 +355,29 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
             if id == IDC_SEARCH_EDIT && code == EN_CHANGE {
                 refresh_tree(hwnd);
+            } else if code == BN_CLICKED {
+                // 按钮点击（问题 20）：一键全部展开 / 全部收起
+                // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+                if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
+                    match id {
+                        IDC_EXPAND_ALL => expand_all_roots(list_view),
+                        IDC_COLLAPSE_ALL => collapse_all_roots(list_view),
+                        _ => {}
+                    }
+                }
             }
 
             LRESULT(0)
+        }
+        WM_DRAWITEM => {
+            // 自绘按钮（问题 20）：全部展开 / 全部收起按钮由 ui::button 统一
+            // 绘制（暗色主题圆角 + 悬停/按压态 + 键盘焦点框）
+            if button::handle_draw_item(lparam) {
+                LRESULT(1)
+            } else {
+                // SAFETY: 非按钮的 WM_DRAWITEM 透传默认过程。
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_NOTIFY => {
             // SAFETY: WM_NOTIFY 的 lParam 指向通知结构，NM_CLICK/NM_DBLCLK 首字段均为
@@ -324,8 +407,9 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             handle_tree_context_menu(hwnd, msg, wparam, lparam)
         }
         WM_KEYDOWN => {
+            let key = (wparam.0 & 0xFFFF) as u16;
             // Esc 关闭面板（R17）：搜索框聚焦时由其子类化过程转发到达
-            if (wparam.0 & 0xFFFF) as u16 == VK_ESCAPE.0 {
+            if key == VK_ESCAPE.0 {
                 // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
                 let data = unsafe { get_userdata::<PanelData>(hwnd) };
                 if !data.is_null() {
@@ -339,8 +423,19 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 LRESULT(0)
+            } else if key == VK_TAB.0 {
+                // Tab / Shift+Tab 循环焦点（问题 22）：搜索框、树、按钮子类化
+                // 过程均已转发 VK_TAB 到面板，统一在此分发。
+                // SAFETY: GetKeyState 查询虚拟键状态，最高位为 1（负值）表示按下。
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                focus_next_control(hwnd, !shift);
+                LRESULT(0)
+            } else if key == VK_RETURN.0 {
+                // 回车激活树选中项（问题 22）：树子类化过程转发到达
+                activate_caret_item(hwnd);
+                LRESULT(0)
             } else {
-                // SAFETY: 未处理按键透传默认窗口过程。
+                // SAFETY: 未处理按键透传默认窗口过程（保持面板现有语义）。
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
@@ -445,17 +540,87 @@ fn handle_ctlcolor(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRES
     LRESULT(brush.0 as isize)
 }
 
+/// 按钮行布局纯函数（问题 20：一键全部展开 / 全部收起）
+///
+/// 按钮与搜索框同排、右对齐：搜索框占左段，两个按钮（全部展开 / 全部收起）
+/// 依次占据右段。返回值 `(search_w, btn_x, btn_y)`：
+///
+/// - `search_w`：留给搜索框的宽度（按钮左侧到左边距之间，扣除按钮间隔）；
+/// - `btn_x`：第一个按钮（全部展开）的 x 坐标，右对齐；客户区过窄时钳到左边距；
+/// - `btn_y`：按钮行 y 坐标（= 搜索框行 y = `m`）。
+///
+/// 边界保证：客户区极窄时 `search_w` 与 `btn_x` 均经 `.max` 钳位非负。
+pub(crate) fn button_row_layout(
+    client_w: i32,
+    m: i32,
+    btn_w: i32,
+    btn_gap: i32,
+) -> (i32, i32, i32) {
+    let btn_area = btn_w * 2 + btn_gap;
+    // 右对齐：btn_x = client_w - m - 按钮区总宽；过窄时钳到左边距 m
+    let btn_x = (client_w - m - btn_area).max(m);
+    // 搜索框宽度 = 按钮左缘 - 左边距 - 按钮间隔；过窄时钳到 0
+    let search_w = (btn_x - m - btn_gap).max(0);
+    (search_w, btn_x, m)
+}
+
+/// Tab 焦点循环纯函数（问题 22）：计算下一个获得焦点的控件在顺序表中的下标
+///
+/// 从 `order` 中定位 `current`（当前焦点控件 ID，经 `GetDlgCtrlID` 取得）：
+///
+/// - 命中位置 `i`：正向返回 `(i + 1) % n`，反向返回 `(i + n - 1) % n`
+///   （即 i - 1 模 n），首尾天然回绕；
+/// - 不在 `order` 中（未知 ID，异常路径）：返回 0（落到第一个控件）。
+///
+/// 由 [`focus_next_control`] 复用（与 popup 焦点循环同一逻辑，抽为纯函数
+/// 便于单测）。
+pub(crate) fn tab_cycle_index(current: i32, order: &[i32], forward: bool) -> usize {
+    match order.iter().position(|&id| id == current) {
+        Some(i) => {
+            let n = order.len();
+            let delta = if forward { 1 } else { n - 1 };
+            (i + delta) % n
+        }
+        None => 0,
+    }
+}
+
+/// 在面板子控件间循环切换键盘焦点（Tab 正向 / Shift+Tab 反向，问题 22）
+///
+/// 按 [`FOCUS_ORDER`] 顺序从当前焦点控件取下一个（经 [`tab_cycle_index`]）；
+/// 焦点不在已知控件上（异常路径）时落到第一个控件（搜索框）。
+fn focus_next_control(hwnd: HWND, forward: bool) {
+    // SAFETY: GetFocus 查询调用线程当前焦点窗口，无失败路径（无焦点返回 NULL）。
+    let current = unsafe { GetFocus() };
+    // SAFETY: current 为本线程焦点窗口句柄（可能为 NULL，查询返回 0 无副作用）。
+    let cur_id = unsafe { GetDlgCtrlID(current) };
+    let next_idx = tab_cycle_index(cur_id, &FOCUS_ORDER, forward);
+    // SAFETY: GetDlgItem 按 ID 查询本窗口子控件，失败返回 Err 被忽略。
+    if let Ok(next) = unsafe { GetDlgItem(hwnd, FOCUS_ORDER[next_idx]) } {
+        // SAFETY: next 为存活子控件句柄；SetFocus 失败仅返回 Err，忽略。
+        unsafe {
+            let _ = SetFocus(next);
+        }
+    }
+}
+
 /// 子控件布局（WM_SIZE / WM_CREATE 末尾统一调用）
 ///
 /// 修正原 WM_SIZE 的 bug（SetWindowPos 缺 SWP_NOMOVE，控件被吸到 (0,0)），
-/// 恢复四边 MARGIN 内边距：搜索框顶部对齐、列表占剩余空间。
+/// 恢复四边 MARGIN 内边距：搜索框顶部对齐、按钮（问题 20）与搜索框同排
+/// 右对齐、列表占剩余空间。
 fn layout_children(hwnd: HWND, width: i32, height: i32) {
     let m = dp(hwnd, MARGIN);
     let search_h = dp(hwnd, SEARCH_H);
-    let list_y = m + search_h + dp(hwnd, SEARCH_GAP);
-    let content_w = (width - 2 * m).max(1);
+    let btn_w = dp(hwnd, BTN_W);
+    let btn_h = dp(hwnd, BTN_H);
+    let btn_gap = dp(hwnd, BTN_GAP);
+    // 按钮与搜索框同排：行高取两者较大者（BTN_H == SEARCH_H 时列表 y 不变）
+    let row_h = btn_h.max(search_h);
+    let list_y = m + row_h + dp(hwnd, SEARCH_GAP);
+    let (search_w, btn_x, btn_y) = button_row_layout(width, m, btn_w, btn_gap);
 
-    // 搜索框：保持原位置（m, m），仅调整宽度
+    // 搜索框：保持原位置（m, m），宽度按按钮行布局压缩
     // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
     if let Ok(search_edit) = unsafe { GetDlgItem(hwnd, IDC_SEARCH_EDIT) } {
         // SAFETY: SetWindowPos 带 SWP_NOMOVE 保留原位置（m,m），仅改尺寸；
@@ -467,16 +632,50 @@ fn layout_children(hwnd: HWND, width: i32, height: i32) {
                 HWND_TOP,
                 0,
                 0,
-                content_w,
+                search_w,
                 search_h,
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOZORDER,
             );
         }
     }
-    // 列表：占搜索框下方到客户区底边
+    // 按钮行（问题 20）：全部展开 / 全部收起，搜索框右侧依次排布
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    if let Ok(expand_btn) = unsafe { GetDlgItem(hwnd, IDC_EXPAND_ALL) } {
+        // SAFETY: SetWindowPos 移动到按钮行位置并调整尺寸；SWP_NOZORDER 保留 Z 序。
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+        unsafe {
+            let _ = SetWindowPos(
+                expand_btn,
+                HWND_TOP,
+                btn_x,
+                btn_y,
+                btn_w,
+                btn_h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+    // SAFETY: 同上，GetDlgItem 按子控件 ID 查询，失败时忽略。
+    if let Ok(collapse_btn) = unsafe { GetDlgItem(hwnd, IDC_COLLAPSE_ALL) } {
+        // SAFETY: SetWindowPos 移动收起按钮到展开按钮右侧并调整尺寸。
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+        unsafe {
+            let _ = SetWindowPos(
+                collapse_btn,
+                HWND_TOP,
+                btn_x + btn_w + btn_gap,
+                btn_y,
+                btn_w,
+                btn_h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+    // 列表：占按钮行下方到客户区底边
     // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
     if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
         let list_h = (height - list_y - m).max(1);
+        let content_w = (width - 2 * m).max(1);
         // SAFETY: SWP_NOMOVE 保留原位置（m, list_y），仅改尺寸。
         use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
         unsafe {
@@ -599,6 +798,52 @@ fn handle_tree_click(hwnd: HWND) {
     }
 
     activate_target(hwnd, data, list_view, ht.hItem);
+}
+
+/// 回车激活树当前选中项（问题 22）：取 `TVGN_CARET` 选中项 → 子项上溯到
+/// 根项 → 置前目标窗口
+///
+/// 键盘焦点在树控件上时，方向键移动选中项（`TVGN_CARET` 随之更新），回车
+/// 经树子类化过程转发到面板 `WM_KEYDOWN` 分支后调用本函数。选中项为详情
+/// 子项时上溯到其根项（与右键菜单 [`handle_tree_context_menu`] 同一规则）。
+fn activate_caret_item(hwnd: HWND) {
+    // SAFETY: 面板窗口由 create_panel 创建，窗口存活期间 PanelData 有效。
+    let data = unsafe { get_userdata::<PanelData>(hwnd) };
+    if data.is_null() {
+        return;
+    }
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    let Ok(list_view) = (unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) }) else {
+        return;
+    };
+    // SAFETY: TVM_GETNEXTITEM(TVGN_CARET) 只读查询当前选中项，无选中时返回 0。
+    let selected = unsafe {
+        SendMessageW(
+            list_view,
+            TVM_GETNEXTITEM,
+            WPARAM(TVGN_CARET as usize),
+            LPARAM(0),
+        )
+    };
+    if selected.0 == 0 {
+        return;
+    }
+    // 命中详情子项 → 上溯到根项（键盘激活与右键菜单同规则）
+    // SAFETY: selected 为 TVM_GETNEXTITEM 返回的有效句柄，TVM_GETNEXTITEM 只读查询。
+    let parent = unsafe {
+        SendMessageW(
+            list_view,
+            TVM_GETNEXTITEM,
+            WPARAM(TVGN_PARENT as usize),
+            LPARAM(selected.0),
+        )
+    };
+    let root_item = if parent.0 != 0 {
+        HTREEITEM(parent.0)
+    } else {
+        HTREEITEM(selected.0)
+    };
+    activate_target(hwnd, data, list_view, root_item);
 }
 
 /// 将根项对应的目标窗口置前（临时置顶：提到最前并聚焦，不常驻顶层）
@@ -805,27 +1050,69 @@ fn handle_tree_context_menu(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     LRESULT(0)
 }
 
-/// 面板搜索框子类化过程：Esc 键转发父面板（关闭面板，R17），其余透传
+/// 面板搜索框子类化过程：Esc / Tab 键转发父面板（R17 / 问题 22），其余透传
 ///
-/// 标准 EDIT 类过程会吞掉 Esc，不转发则搜索框聚焦时 Esc 无法关闭面板。
+/// 标准 EDIT 类过程会吞掉 Esc，不转发则搜索框聚焦时 Esc 无法关闭面板；
+/// 单行 EDIT 在非 dialog 父窗口下 Tab 也不会自动切换焦点，需手动转发给
+/// 父面板的 `WM_KEYDOWN` 分支统一循环焦点。
 unsafe extern "system" fn search_edit_subclass_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_KEYDOWN && (wparam.0 & 0xFFFF) as u16 == VK_ESCAPE.0 {
-        // SAFETY: GetParent 返回创建时指定的父窗口。
-        if let Ok(parent) = unsafe { GetParent(hwnd) } {
-            // SAFETY: PostMessageW 为线程安全标准 API，异步投递。
-            unsafe {
-                let _ = PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+    if msg == WM_KEYDOWN {
+        let key = (wparam.0 & 0xFFFF) as u16;
+        if key == VK_ESCAPE.0 || key == VK_TAB.0 {
+            // SAFETY: GetParent 返回创建时指定的父窗口。
+            if let Ok(parent) = unsafe { GetParent(hwnd) } {
+                // SAFETY: PostMessageW 为线程安全标准 API，异步投递。
+                unsafe {
+                    let _ = PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+                }
             }
+            return LRESULT(0);
         }
-        return LRESULT(0);
     }
     // SAFETY: GetClassLongPtrW(GCLP_WNDPROC) 返回 EDIT 类原始窗口过程，
     // 函数指针↔整数 transmute 往返在 Windows ABI 下良定义。
+    let orig = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
+    let orig_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+        unsafe { std::mem::transmute(orig) };
+    orig_proc(hwnd, msg, wparam, lparam)
+}
+
+/// 树控件子类化过程（问题 22）：回车 / Tab / Esc 转发父面板统一处理，其余透传
+///
+/// SysTreeView32 自身会消费回车（切换展开）、Tab（项目内导航）等按键；为统一键盘
+/// 语义（回车激活选中项、Tab 循环焦点、Esc 关闭面板——焦点在树时 Esc 不会向父窗口
+/// 冒泡，必须在此拦截，否则已验收的 R17「Esc 关闭面板」从面板默认状态失效），
+/// 在此拦截 `VK_RETURN` / `VK_TAB` / `VK_ESCAPE` 转发给父面板的 `WM_KEYDOWN`
+/// 分支处理，其余消息透传树类原始窗口过程。
+unsafe extern "system" fn tree_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN {
+        let key = (wparam.0 & 0xFFFF) as u16;
+        // Tab/Esc 转发镜像 button_subclass_proc（panel 既有按钮子类化转发三者），
+        // 回车为树选中项激活。
+        if key == VK_RETURN.0 || key == VK_TAB.0 || key == VK_ESCAPE.0 {
+            // SAFETY: GetParent 返回创建时指定的父面板窗口。
+            if let Ok(parent) = unsafe { GetParent(hwnd) } {
+                // SAFETY: PostMessageW 为线程安全标准 API，异步投递。
+                unsafe {
+                    let _ = PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+                }
+            }
+            return LRESULT(0);
+        }
+    }
+    // 其余消息透传 SysTreeView32 类原始窗口过程（子类化仅替换实例过程，类过程不变）
+    // SAFETY: GetClassLongPtrW(GCLP_WNDPROC) 返回树类默认窗口过程，签名与
+    // 窗口过程一致；transmute 为函数指针↔整数往返转换，Windows ABI 下良定义。
     let orig = unsafe { GetClassLongPtrW(hwnd, GCLP_WNDPROC) };
     let orig_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
         unsafe { std::mem::transmute(orig) };
@@ -837,9 +1124,10 @@ unsafe extern "system" fn search_edit_subclass_proc(
 /// 每个标签一个根项（文本 = "标题 | 窗口名称"，`lParam` = 目标窗口句柄），
 /// 根项下挂备注详情子项（R15）："备注：" 标签行 + 备注完整内容——TreeView
 /// 项为单行，多行备注逐行拆为独立子项才能完整显示（备注为空时显示"（无）"）。
-/// 重建前记录已展开根项（按目标窗口句柄），重建后恢复展开状态，供标签变更
-/// 广播触发的自动刷新不打断浏览。搜索匹配字段与旧列表视图一致：标题 / 备注 /
-/// 窗口标题 / 进程名。
+/// 重建前记录各根项展开/折叠状态（按目标窗口句柄），重建后按
+/// [`root_expand_default`] 恢复：已折叠的保持折叠、已展开的保持展开、新出现
+/// 的根项默认展开（问题 19），供标签变更广播触发的自动刷新不打断浏览。
+/// 搜索匹配字段与旧列表视图一致：标题 / 备注 / 窗口标题 / 进程名。
 fn refresh_tree(hwnd: HWND) {
     // SAFETY: 面板窗口生命周期内 PanelData 有效（create_panel 创建，WM_DESTROY 回收）。
     let data = unsafe { get_userdata::<PanelData>(hwnd) };
@@ -870,8 +1158,9 @@ fn refresh_tree(hwnd: HWND) {
         return;
     };
 
-    // 重建前记录已展开根项对应的目标窗口句柄（TVM_DELETEITEM 会失效旧项句柄）
-    let expanded = collect_expanded_targets(list_view);
+    // 重建前记录各根项的展开/折叠状态（TVM_DELETEITEM 会失效旧项句柄，
+    // 必须在清空前完成遍历）
+    let (expanded, collapsed) = collect_tree_snapshot(list_view);
 
     // 清空整棵树（TVI_ROOT 表示根）
     // SAFETY: 向树视图发送清空消息，参数为编译期常量 TVI_ROOT。
@@ -957,8 +1246,9 @@ fn refresh_tree(hwnd: HWND) {
             }
         }
 
-        // 恢复重建前该根项的展开状态（按目标窗口句柄匹配）
-        if expanded.contains(target_hwnd) {
+        // 恢复重建前该根项的展开状态（按目标窗口句柄匹配）；
+        // 未知目标（首次出现）默认展开（问题 19）
+        if root_expand_default(&expanded, &collapsed, *target_hwnd) {
             // SAFETY: parent 为本次插入返回的有效项句柄，TVM_EXPAND 仅切换展开态。
             unsafe {
                 let _ = SendMessageW(
@@ -972,14 +1262,14 @@ fn refresh_tree(hwnd: HWND) {
     }
 }
 
-/// 收集树中所有已展开根项的目标窗口句柄（lParam）
+/// 沿根项兄弟链遍历整棵树（`TVGN_ROOT` → `TVGN_NEXT`）
 ///
-/// 从根项起沿兄弟链遍历（`TVGN_ROOT` → `TVGN_NEXT`），逐项读取
-/// `TVIS_EXPANDED` 状态，供 [`refresh_tree`] 重建后恢复展开状态。
-fn collect_expanded_targets(list_view: HWND) -> HashSet<isize> {
-    let mut expanded = HashSet::new();
-    // SAFETY: TVM_GETNEXTW/TVGN_* 为只读遍历，参数为常量或消息返回的项句柄；
-    // 树控件存活（GetDlgItem 已确认），返回 0 表示遍历结束。
+/// 对每个根项调用 `f`；`TVM_GETNEXTITEM` 返回 0 时遍历结束。供
+/// [`collect_tree_snapshot`] 与 [`expand_all_roots`]/[`collapse_all_roots`]
+/// 复用同一遍历骨架，避免三处重复实现漂移。
+fn for_each_root(list_view: HWND, mut f: impl FnMut(HTREEITEM)) {
+    // SAFETY: TVM_GETNEXTITEM 为只读遍历，参数为常量或消息返回的项句柄；
+    // 树控件存活（调用方经 GetDlgItem 确认），返回 0 表示遍历结束。
     let mut item = unsafe {
         SendMessageW(
             list_view,
@@ -989,9 +1279,60 @@ fn collect_expanded_targets(list_view: HWND) -> HashSet<isize> {
         )
     };
     while item.0 != 0 {
+        f(HTREEITEM(item.0));
+        // SAFETY: 同上，TVGN_NEXT 沿兄弟链推进，返回 0 时退出循环。
+        item = unsafe {
+            SendMessageW(
+                list_view,
+                TVM_GETNEXTITEM,
+                WPARAM(TVGN_NEXT as usize),
+                LPARAM(item.0),
+            )
+        };
+    }
+}
+
+/// 一键展开树中全部根项（问题 20）
+fn expand_all_roots(list_view: HWND) {
+    set_all_roots_expanded(list_view, true);
+}
+
+/// 一键收起树中全部根项（问题 20）
+fn collapse_all_roots(list_view: HWND) {
+    set_all_roots_expanded(list_view, false);
+}
+
+/// 对全部根项统一设置展开 / 收起状态（TVM_EXPAND + TVE_EXPAND/TVE_COLLAPSE）
+fn set_all_roots_expanded(list_view: HWND, expand: bool) {
+    let flag = if expand {
+        TVE_EXPAND.0 as usize
+    } else {
+        TVE_COLLAPSE.0 as usize
+    };
+    for_each_root(list_view, |item| {
+        // SAFETY: item 为遍历返回的有效项句柄（当前树内），TVM_EXPAND 仅
+        // 切换该项的展开/收起态，无副作用。
+        unsafe {
+            let _ = SendMessageW(list_view, TVM_EXPAND, WPARAM(flag), LPARAM(item.0));
+        }
+    });
+}
+
+/// 收集树中所有根项的目标窗口句柄（lParam）及其展开/折叠状态
+///
+/// 从根项起沿兄弟链遍历（`TVGN_ROOT` → `TVGN_NEXT`），逐项读取
+/// `TVIS_EXPANDED` 状态，返回 `(展开集合, 折叠集合)` 供 [`refresh_tree`]
+/// 重建后经 [`root_expand_default`] 决策每个根项的展开状态。
+///
+/// 必须在 `TVM_DELETEITEM` 清空之前调用：遍历读到的项句柄属于旧树，
+/// 清空后全部失效。
+fn collect_tree_snapshot(list_view: HWND) -> (HashSet<isize>, HashSet<isize>) {
+    let mut expanded = HashSet::new();
+    let mut collapsed = HashSet::new();
+    for_each_root(list_view, |item| {
         let mut tvi = TVITEMW {
             mask: TVIF_HANDLE | TVIF_STATE | TVIF_PARAM,
-            hItem: HTREEITEM(item.0),
+            hItem: item,
             stateMask: TVIS_EXPANDED,
             ..Default::default()
         };
@@ -1006,18 +1347,27 @@ fn collect_expanded_targets(list_view: HWND) -> HashSet<isize> {
         }
         if tvi.state.0 & TVIS_EXPANDED.0 != 0 {
             expanded.insert(tvi.lParam.0);
+        } else {
+            collapsed.insert(tvi.lParam.0);
         }
-        // SAFETY: 同上，TVGN_NEXT 沿兄弟链推进，返回 0 时退出循环。
-        item = unsafe {
-            SendMessageW(
-                list_view,
-                TVM_GETNEXTITEM,
-                WPARAM(TVGN_NEXT as usize),
-                LPARAM(item.0),
-            )
-        };
-    }
-    expanded
+    });
+    (expanded, collapsed)
+}
+
+/// 判定重建后根项是否默认展开（问题 19：树形列表默认展开详情）
+///
+/// 决策规则：
+/// 1. 目标句柄仅出现在 `collapsed` → `false`（保留用户手动折叠）；
+/// 2. 目标句柄仅出现在 `expanded` 或两集合均不含（首次出现）→ `true`；
+/// 3. 不变式：正常快照下 `expanded` 与 `collapsed` 互斥，若同一句柄
+///    意外出现在两集合中，`expanded` 优先 → `true`。
+pub(crate) fn root_expand_default(
+    expanded: &HashSet<isize>,
+    collapsed: &HashSet<isize>,
+    target: isize,
+) -> bool {
+    // 不在折叠集 → 展开（含首次出现的未知目标）；两集合同含时 expanded 优先
+    !collapsed.contains(&target) || expanded.contains(&target)
 }
 
 /// 重新应用主题到面板的树形列表（供 main.rs reapply_theme 调用）
@@ -1056,11 +1406,141 @@ pub fn toggle_panel(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
         }
+        // 面板打开后把键盘焦点交给树控件（问题 22）：Tab 循环与回车激活
+        // 从树开始，方向键即可浏览标签项。
+        // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+        if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
+            // SAFETY: list_view 为面板存活子控件，SetForegroundWindow 已激活
+            // 面板；SetFocus 失败仅返回 Err，忽略。
+            unsafe {
+                let _ = SetFocus(list_view);
+            }
+        }
     } else {
         // SAFETY: data 已校验非空，隐藏面板。
         unsafe {
             (*data).visible = false;
             let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未知目标（两集合均不含）：首次出现，默认展开（问题 19）
+    #[test]
+    fn unknown_target_expands_by_default() {
+        let expanded = HashSet::new();
+        let collapsed = HashSet::new();
+        assert!(root_expand_default(&expanded, &collapsed, 42));
+    }
+
+    /// 用户手动折叠过的目标：保持折叠
+    #[test]
+    fn collapsed_target_stays_collapsed() {
+        let expanded = HashSet::new();
+        let collapsed = HashSet::from([42]);
+        assert!(!root_expand_default(&expanded, &collapsed, 42));
+    }
+
+    /// 已展开的目标：保持展开
+    #[test]
+    fn expanded_target_stays_expanded() {
+        let expanded = HashSet::from([42]);
+        let collapsed = HashSet::new();
+        assert!(root_expand_default(&expanded, &collapsed, 42));
+    }
+
+    /// 两集合同含同一句柄时 expanded 优先（文档不变式，正常快照互斥）
+    #[test]
+    fn expanded_takes_priority_when_in_both_sets() {
+        let expanded = HashSet::from([42]);
+        let collapsed = HashSet::from([42]);
+        assert!(root_expand_default(&expanded, &collapsed, 42));
+    }
+
+    /// 按钮行布局（问题 20）：常规宽度下按钮右对齐，btn_x + 按钮区 + 右边距 == client_w
+    #[test]
+    fn button_row_normal_width_right_aligns() {
+        let (search_w, btn_x, btn_y) = button_row_layout(400, 12, 64, 8);
+        // 按钮区总宽 = 2 * 64 + 8 = 136；btn_x = 400 - 12 - 136 = 252
+        assert_eq!(btn_x, 252);
+        assert_eq!(btn_x + 64 * 2 + 8 + 12, 400);
+        // 搜索框宽度 = client_w - 2*m - 按钮区 - 间隔 = 400 - 24 - 136 - 8 = 232
+        assert_eq!(search_w, 232);
+        // 按钮与搜索框同行（y = m）
+        assert_eq!(btn_y, 12);
+    }
+
+    /// 最小宽度（MIN_W）下按钮与搜索框仍为正宽（问题 20 边界）
+    #[test]
+    fn button_row_min_width_keeps_positive_sizes() {
+        let (search_w, btn_x, btn_y) = button_row_layout(MIN_W, 12, 64, 8);
+        assert!(search_w > 0);
+        assert!(btn_x >= 12);
+        assert_eq!(btn_y, 12);
+    }
+
+    /// 极窄客户区：搜索框宽度钳到 0、按钮左缘钳到左边距（问题 20 边界）
+    #[test]
+    fn button_row_extremely_narrow_clamps() {
+        let (search_w, btn_x, btn_y) = button_row_layout(100, 12, 64, 8);
+        assert_eq!(search_w, 0);
+        assert_eq!(btn_x, 12);
+        assert_eq!(btn_y, 12);
+    }
+
+    /// btn_y 恒等于搜索框行 y（m），不随宽度变化
+    #[test]
+    fn button_row_y_is_margin_always() {
+        for w in [160, 300, 400, 800] {
+            assert_eq!(button_row_layout(w, 12, 64, 8).2, 12);
+        }
+    }
+
+    /// Tab 循环（问题 22）：当前焦点在顺序表中，正向返回下一个下标
+    #[test]
+    fn tab_cycle_forward_returns_next_index() {
+        let order = [201, 202, 203, 204];
+        assert_eq!(tab_cycle_index(201, &order, true), 1);
+        assert_eq!(tab_cycle_index(202, &order, true), 2);
+        assert_eq!(tab_cycle_index(203, &order, true), 3);
+    }
+
+    /// Tab 反向（Shift+Tab，问题 22）：返回前一个下标（i-1 模 n）
+    #[test]
+    fn tab_cycle_backward_returns_previous_index() {
+        let order = [201, 202, 203, 204];
+        assert_eq!(tab_cycle_index(202, &order, false), 0);
+        assert_eq!(tab_cycle_index(203, &order, false), 1);
+        assert_eq!(tab_cycle_index(204, &order, false), 2);
+    }
+
+    /// 回绕（问题 22）：最后一个正向 → 0；第一个反向 → n-1
+    #[test]
+    fn tab_cycle_wraps_around_both_directions() {
+        let order = [201, 202, 203, 204];
+        assert_eq!(tab_cycle_index(204, &order, true), 0);
+        assert_eq!(tab_cycle_index(201, &order, false), 3);
+    }
+
+    /// 未知控件 ID（不在顺序表中，问题 22）：落到第一个控件下标 0
+    #[test]
+    fn tab_cycle_unknown_id_returns_first() {
+        let order = [201, 202, 203, 204];
+        assert_eq!(tab_cycle_index(999, &order, true), 0);
+        assert_eq!(tab_cycle_index(-1, &order, false), 0);
+    }
+
+    /// 真实焦点顺序表（FOCUS_ORDER）正向/反向往返一致（问题 22）
+    #[test]
+    fn tab_cycle_round_trip_on_focus_order() {
+        for &id in FOCUS_ORDER.iter() {
+            let fwd = tab_cycle_index(id, &FOCUS_ORDER, true);
+            let back = tab_cycle_index(FOCUS_ORDER[fwd], &FOCUS_ORDER, false);
+            assert_eq!(FOCUS_ORDER[back], id);
         }
     }
 }
