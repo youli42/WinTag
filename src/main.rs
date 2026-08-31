@@ -9,12 +9,13 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{BOOL, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic, IsWindow,
     IsWindowVisible, PostMessageW, RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
     WS_OVERLAPPED,
 };
 
@@ -31,6 +32,46 @@ static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
 static PANEL_HWND: OnceLock<isize> = OnceLock::new();
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
+/// 隐藏窗口句柄（供 Ctrl+C 处理线程定向投递 WM_QUIT，触发主消息循环优雅退出）
+static CTRL_C_WND: OnceLock<isize> = OnceLock::new();
+
+/// 判断 Ctrl+C 处理函数是否应接管本次控制台事件（仅 CTRL_C_EVENT 且窗口已就绪时接管）
+///
+/// 纯函数、无副作用，便于单元测试。其余事件（CTRL_BREAK/CTRL_CLOSE/CTRL_LOGOFF/CTRL_SHUTDOWN）
+/// 一律交回默认处理器，避免在系统关闭/注销等阶段做重活导致进程响应失败。
+fn ctrl_c_handled(ctrl_type: u32, window_ready: bool) -> bool {
+    ctrl_type == CTRL_C_EVENT && window_ready
+}
+
+/// Ctrl+C（CTRL_C_EVENT）控制台处理器
+///
+/// 目标：把 Ctrl+C 从"CRT 默认以 0xC000013A 强制终止"改为"走主消息循环优雅退出"。
+/// 该回调由 CRT 在**独立线程**上调用，因此不能用 `PostQuitMessage`（它只投递到当前线程队列）；
+/// 必须定向 `PostMessageW(hwnd, WM_QUIT)` 到主线程拥有的隐藏窗口，令 `GetMessageW` 返回 0，
+/// `main` 正常返回 `Ok(())`，`winevent_hooks` Drop 注销 WinEvent hook，退出码为 0。
+///
+/// 返回 `TRUE` 表示已处理（阻止默认终止）；返回 `FALSE` 表示未接管（交回默认处理器）。
+///
+/// # Safety
+///
+/// - 本函数作为 `HANDLER_ROUTINE` 注册，运行在 CRT 为控制台事件创建的独立线程上；
+/// - 仅调用线程安全的 `PostMessageW`，并把 `CTRL_C_WND`（`OnceLock`，启动时 set 后不再变）
+///   读入局部变量，不访问任何可变共享状态；
+/// - `CTRL_C_WND` 在调用 `SetConsoleCtrlHandler` 之前 set，故回调触发时窗口必已登记。
+unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> BOOL {
+    if ctrl_c_handled(ctrl_type, CTRL_C_WND.get().is_some()) {
+        if let Some(&h) = CTRL_C_WND.get() {
+            let _ = PostMessageW(
+                HWND(h as *mut std::ffi::c_void),
+                WM_QUIT,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            return TRUE;
+        }
+    }
+    FALSE
+}
 
 fn main() -> anyhow::Result<()> {
     println!("WinTag 启动中...");
@@ -57,6 +98,14 @@ fn main() -> anyhow::Result<()> {
 
     // 创建隐藏窗口（热键 + 覆盖层管理 + WinEvent 消息中转）
     let hwnd = create_hidden_window()?;
+
+    // 注册 Ctrl+C 处理器（问题 3）：先登记窗口句柄（handler 触发时须已就绪），再注册。
+    // 失败不致命：回退到 CRT 默认终止（仍能退出，只是非零码且不执行 drop 清理）。
+    let _ = CTRL_C_WND.set(hwnd.0 as isize);
+    // SAFETY: CTRL_C_WND 已 set；handler 只做 PostMessageW/WM_QUIT 线程安全投递。
+    if unsafe { SetConsoleCtrlHandler(Some(ctrl_c_handler), TRUE) }.is_err() {
+        eprintln!("[退出] Ctrl+C 处理器注册失败，回退默认终止行为");
+    }
 
     // 初始化覆盖层存储（OnceLock 仅首次设置生效，重复调用忽略）
     if OVERLAY_STORE.get().is_none() {
@@ -656,5 +705,34 @@ fn reapply_theme(hidden_hwnd: HWND) {
                 let _ = overlay.sync_position();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CTRL_C_EVENT 且隐藏窗口已就绪 → 应接管（返回 TRUE）
+    #[test]
+    fn ctrl_c_handled_takes_event_when_c_and_ready() {
+        assert!(ctrl_c_handled(CTRL_C_EVENT, true));
+    }
+
+    /// CTRL_C_EVENT 但窗口未就绪 → 不应接管（返回 FALSE）
+    #[test]
+    fn ctrl_c_handled_ignores_c_when_window_not_ready() {
+        assert!(!ctrl_c_handled(CTRL_C_EVENT, false));
+    }
+
+    /// 其它控制台事件（如 CTRL_CLOSE_EVENT=2）即使窗口就绪也不接管
+    #[test]
+    fn ctrl_c_handled_ignores_non_c_event() {
+        assert!(!ctrl_c_handled(2, true));
+    }
+
+    /// 未知事件编号不接管
+    #[test]
+    fn ctrl_c_handled_ignores_unknown_event() {
+        assert!(!ctrl_c_handled(999, true));
     }
 }
