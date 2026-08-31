@@ -432,3 +432,63 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 - **验证**：`cargo build` / `cargo clippy -- -D warnings` / `cargo fmt -- --check` 全部通过；`cargo test` 67 用例（37 单元 + 30 冒烟）全绿。
 
 ---
+
+## D21：扩展规划总纲——分阶段功能增强蓝图（2026-08-31，只读规划未实施）
+
+- **决策**：为 WinTag 追加一批功能增强与使用性问题修复，按分阶段路线图推进（P1 Quick 稳定+地基 → P2 Short 托盘+可配置 → P3 Medium 工作区+洞察）。本决策仅登记**调研结论与架构约定**，不含代码改动；具体实现由后续决策（D22/D23）与任务执行落实。
+- **背景（用户需求 4）**：① 创建托盘替代纯命令行常驻；② 添加图表；③ 添加分组/工作区（批量置顶）；④ 允许自定义快捷键；以及一组使用性问题：窗口移动标签不跟随、概览面板（无默认展开详情 / 无一键展开收起 / 不能靠边隐藏 / 无法纯键盘操作）。
+- **备选方案**：一次性全量实现（否决——改动面大、风险高、难以独立验收）；按依赖与价值分阶段（采纳）。
+- **理由**：
+  1. 项目处于快速开发期（D9），分阶段能保证每个阶段独立可交付、可回归验证；
+  2. P1 先修日常 bug 与使用性问题（标签跟随、面板四项），是后续一切增强的地基；
+  3. P2 托盘+可配置达成"后台常驻 + 用户主动权"；P3 分组/图表在 P1 的树/面板数据流就绪后才可行。
+- **架构约定（贯穿各阶段）**：
+  - 新消息常量（`common/mod.rs`，WM_APP+1..7 已占）：`WM_APP+8`=`WM_APP_TRAY`、`WM_APP+9`=`WM_APP_HOTKEYS_CHANGED`、`WM_APP+10`=`WM_APP_BATCH_ACTIVATE`；
+  - 数据模型扩展：`Settings` 新字段一律 `#[serde(default)]`（镜像 `show_badge_title`，否则旧配置缺字段整体回退默认）；`Tag` 增 `group: String`；
+  - 配置路径解析链：`--config-dir` CLI > `WINTAG_CONFIG_DIR` env > `<exe_dir>/config`（仅当存在或可写）> `%APPDATA%`，`OnceLock` memoize 读写一致，读穿透旧 `%APPDATA%`（D9 不复制）；
+  - 依赖方向与既有模式：托盘/图表/分组全部手写 Win32（D1），`ui→core→sys` 不变，注入模式沿用 `set_tag_store`/`set_show_title` 先例。
+- **影响与后续跟进**：本决策对应 `doc/issues-and-requirements.md` 的 R18-R20、问题 18-22；各阶段落地时补齐对应决策记录与提交。
+
+---
+
+## D22：系统托盘 + 配置路径解析链（P2 核心，2026-08-31）
+
+- **决策**：托盘与配置路径两块独立改动，均沿用手写 Win32（D1）与既有注入/广播模式。
+- **托盘**（`src/sys/tray.rs`）：
+  - `Shell_NotifyIconW(dwmessage: NOTIFY_ICON_MESSAGE, lpdata: *const NOTIFYICONDATAW)`；`NOTIFY_ICON_MESSAGE`（`NIM_ADD=0`/`NIM_MODIFY=1`/`NIM_DELETE=2`）；`NOTIFY_ICON_DATA_FLAGS`（`NIF_*`，支持 `BitOr`）；`NOTIFYICONDATAW` 字段 `cbSize/hWnd/uID/uFlags/uCallbackMessage(u32)/hIcon/szTip[128]`；
+  - `uCallbackMessage = WM_APP+8`（`WM_APP_TRAY`），单线程消息泵直达 `hidden_wndproc` 无额外线程；
+  - **不调 `NIM_SETVERSION`**（保持 `uVersion=0` → 原生 `WM_LBUTTONUP`/`WM_RBUTTONUP` 透传，右键在 `WM_RBUTTONUP` 里 `TrackPopupMenu` 最简；VERSION_4 会变 `WM_CONTEXTMENU` 徒增分支）；
+  - `NIM_ADD` 须晚于 `create_hidden_window()`（需要 hWnd），建议热键注册后；
+  - 图标：v1 用系统图标 `LoadIconW(None, IDI_WINLOGO)`（零新增 feature/资源）；真实 `.ico` 经 `build.rs` winresource `.icon(1, "assets\\wintag.ico")` + `LoadIconW(GetModuleHandleW(None), MAKEINTRESOURCEW(1))` 升级。图标所有权：Shell 不接管 `hIcon`，自加载的须在 `NIM_DELETE` 后 `DestroyIcon`，系统图标不销毁；
+  - **已知限制**：Explorer 重启吞图标——`RegisterWindowMessageW("TaskbarCreated")` 广播重新 `NIM_ADD`（约 15 行，v1 实现，失败则登记为已知限制）。
+- **配置路径解析链**（`src/core/settings.rs`）：
+  - 不把 `<exe_dir>/config` 当无条件默认（Program Files 只读 + 升级覆盖丢配置）；做「运行时探测可写性 + 显式覆盖优先 + `%APPDATA%` 兜底」解析链，`resolve_config_root()` `OnceLock` memoize（读写一致）；
+  - 优先级：`--config-dir` CLI > `WINTAG_CONFIG_DIR` env > `<exe_dir>/config`（仅当存在或 `create_dir_all` 探测可写）> `%APPDATA%\WinTag\config.toml`；
+  - 定位 exe_dir：`std::env::current_exe()?.parent()`（内部即 `GetModuleFileNameW`，无需额外 Win32 调用）；
+  - 用户指定机制：**env/CLI**（配置读取前解析，无"鸡生蛋"）；**排除设置页内改**（会让"读配置找位置"与"改配置写位置"互相依赖）；
+  - 迁移：**不做一次性复制**（D9），改**读穿透**——解析路径不存在时 best-effort 读旧 `%APPDATA%`，命中打印提示；
+  - `parse_str` 为路径无关纯函数，sanitize 逻辑与既有 6 单测不受影响。
+- **备选方案**：设置页内改配置位置（否决：鸡生蛋）；无条件用 exe 目录（否决：Program Files 只读）。
+- **理由**：Program Files 自 Vista 对非提权进程只读，WinTag 不应常驻提权；探测制既满足"默认到 exe 目录"需求又不牺牲健壮性。
+- **影响与后续跟进**：新增 `sys::tray.rs`；`Settings` 结构体**不**加配置路径字段（启动时解析）；`doc/issues-and-requirements.md` R18 对应。
+
+---
+
+## D23：自定义快捷键 + 分组/工作区 + 图表（P2/P3，2026-08-31）
+
+- **决策**：三项功能，模型与 UI 均沿既有模式扩展。
+- **自定义快捷键**（R1）：
+  - `Settings` 增 `#[serde(default)] pub hotkeys: HotkeyMap`；新 `src/core/hotkey_config.rs`（纯 serde：`HotkeyAction`/`HotkeyBinding{modifiers,vk}`/`HotkeyMap`，`Default`=现硬编码值）；
+  - `hotkey.rs` 注册改读全局配置（`register_all` → `register_from_settings`），`from_id`/`from_message` 语义不变（唯一耦合点），新增 `reload_hotkeys`（`UnregisterHotKey` + 重注册）；
+  - 设置页"快捷键"分页：录制按钮（`WM_KEYDOWN` 修饰键掩码 Ctrl/Shift/Alt + VK）、冲突检测、保存后发 `WM_APP_HOTKEYS_CHANGED`（`WM_APP+9`）广播热更新。
+- **分组/工作区**（R19，纯会话不持久化）：
+  - `Tag` 增 `pub group: String`（空串=未分组）；**UI 已确认：分组控件置于新建标签弹窗标题输入框下方，允许直接输入或从已有分组下拉选择，编辑时预填原分组**；
+  - `refresh_tree` 按分组聚类（组头根项 `lParam=0` 标记 → 标签项 `lParam`=目标 HWND → 备注子项；组名排序，未分组置末）；
+  - 组头右键"置前整个分组"批量置前：遍历 `OVERLAY_STORE` 调 `sync_position`+`refresh`（复用现成批量入口 `main.rs` reapply_theme 段），经 `WM_APP_BATCH_ACTIVATE`（`WM_APP+10`）+ `common` 共享槽（`OnceLock<Mutex<Option<String>>>` 注入模式）传组名；
+  - **纯会话不持久化**：分组名与标签一起随进程退出清空，仅 UI 偏好持久化（D9/D10 边界）。
+- **图表**（R20，默认假设待确认）：新 `src/ui/charts.rs` 独立窗口、GDI 柱状图（纯函数 `bar_layout()` 可单测）；刷新链镜像面板（`WM_APP_TAGS_CHANGED` 仅可见时转发）；从托盘菜单入口打开。默认假设=按分组计数柱状图，时间线需给 `Tag` 加 `created_at`（待拍板）。
+- **备选方案**：分组元数据持久化（否决：D9 纯会话原则，仅 UI 偏好持久化；工作区记忆另立例外）；图表时间线（默认不选，需加字段）。
+- **理由**：三项均复用既有渲染/树/注入/广播模式，无新架构；分组纯会话契合 D9；`#[serde(default)]` 保证旧配置兼容。
+- **影响与后续跟进**：新增 `src/core/hotkey_config.rs`、`src/ui/charts.rs`；`common/mod.rs` 加 `WM_APP+9/+10`；`doc/issues-and-requirements.md` R19/R20 对应。图表形态待用户确认后定稿。
+
+---

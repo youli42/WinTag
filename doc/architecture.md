@@ -54,6 +54,12 @@ ui → core → sys
 - 处理高 DPI 缩放 (`GetDpiForWindow`)
 - 管理覆盖层生命周期（创建/销毁/隐藏）
 
+#### tray.rs（规划中，D22）
+- 系统托盘图标（`Shell_NotifyIcon` + `NOTIFYICONDATAW`），`uCallbackMessage=WM_APP+8`
+- 左键单击 → 打开设置页（经 `WM_APP_OPEN_SETTINGS`），右键 `TrackPopupMenu`（打开设置/概览面板/退出）
+- 用 `TrayCommand` 枚举返回命令、由 main 接 ui，保持 `ui→core→sys` 依赖方向
+- 图标所有权：Shell 不接管 `hIcon`，自加载的在 `NIM_DELETE` 后 `DestroyIcon`；`TaskbarCreated` 广播重新 `NIM_ADD`
+
 ### core/ — 数据核心层
 
 负责业务逻辑与数据管理，不涉及 UI 渲染。所有数据仅存在于内存中，无持久化。
@@ -66,8 +72,13 @@ ui → core → sys
       title: String,        // 必填，快速索引
       note: String,         // 选填，长文本描述
       color: Color,         // 标记颜色
+      group: String,        // 分组，空串=未分组（规划中，D23，纯会话）
   }
   ```
+
+#### hotkey_config.rs（规划中，D23）
+- 自定义快捷键数据模型（纯 serde）：`HotkeyAction`/`HotkeyBinding{modifiers,vk}`/`HotkeyMap`
+- 绑定"快捷键 ↔ 功能"，`Default` = 现硬编码值（Ctrl+Shift+N/M/S），持久化到配置（UI 偏好）
 
 #### matcher.rs
 - 以窗口句柄（HWND）为键的标签查找
@@ -90,9 +101,14 @@ ui → core → sys
 - 提供编辑/删除按钮
 - 自动跟随标记位置
 
+#### charts.rs（规划中，D23）
+- 统计图表独立窗口（GDI 柱状图），纯函数 `bar_layout()` 可单测
+- 刷新链镜像面板（`WM_APP_TAGS_CHANGED` 仅可见时转发）
+- 默认假设：按分组计数柱状图（与 R19 分组契合，待确认形态）
+
 ### hotkey.rs
 - 注册全局热键 (`RegisterHotKey`)
-- 两个热键：`Ctrl+Shift+M` 打开概览面板，`Ctrl+Shift+N` 快速标记当前窗口
+- 三个热键：`Ctrl+Shift+M` 打开概览面板，`Ctrl+Shift+N` 快速标记当前窗口，`Ctrl+Shift+S` 打开设置（规划中支持自定义，D23）
 - 处理热键消息，触发对应操作
 
 ## 数据流

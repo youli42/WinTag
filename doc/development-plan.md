@@ -53,6 +53,11 @@
 - [ ] 性能优化与内存泄漏检查
 - [ ] 错误处理完善
 - [ ] 用户配置（热键自定义、默认颜色等）— 已实现配置持久化与主题/圆角设置（设置页，见 [D10](./decision-records.md)）；热键编辑 UI 与默认颜色自定义待后续（见 [issues-and-requirements.md R1](./issues-and-requirements.md)）
+- [ ] 面板增强（默认展开、一键展开收起、贴边隐藏、纯键盘操作）— 规划中，见 [issues-and-requirements.md 问题 19-22](./issues-and-requirements.md)
+- [ ] 标签分组 / 工作区（纯会话）— 规划中，见 [issues-and-requirements.md R19](./issues-and-requirements.md) 与 [D23](./decision-records.md)
+- [ ] 统计图表 — 规划中（形态待定），见 [issues-and-requirements.md R20](./issues-and-requirements.md)
+
+> 扩展规划（托盘、分组、图表、自定义快捷键、面板增强与标签跟随修复）已归档于 [issues-and-requirements.md 四、扩展规划](./issues-and-requirements.md) 与 [决策记录 D21-D23](./decision-records.md)。
 
 **验证标准**：在多种边缘情况下稳定运行，无内存泄漏
 
@@ -63,7 +68,7 @@
 | M1: 项目搭建 | 第 1 周 | ✅ 可编译运行的基础框架 + 窗口检测 + 热键 + 标签存储 |
 | M2: MVP | 第 2-3 周 | ✅ 覆盖层跟随（位置同步/最小化显隐）+ 悬停便签 + 编辑删除（遗留项见 [决策记录](./decision-records.md) 功能级登记） |
 | M3: 覆盖层 | 第 4-5 周 | ✅ 窗口上可见标记和便签（已完成，见阶段二勾选） |
-| M4: 发布 | 第 6 周 | 🚧 进行中 — 待完成：托盘图标、全屏降级、窗口激活闪烁反馈、管理员权限窗口兼容（见 [决策记录](./decision-records.md) F1-F4；F5/F6 已随 T9 落地） |
+| M4: 发布 | 第 6 周 | 🚧 进行中 — 待完成：托盘图标（已规划，见 [D22](./decision-records.md)）、全屏降级、窗口激活闪烁反馈、管理员权限窗口兼容（见 [决策记录](./decision-records.md) F1-F4；F5/F6 已随 T9 落地） |
 
 ## 风险与对策
 
