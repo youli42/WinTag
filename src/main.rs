@@ -364,7 +364,8 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 事件由 WinEvent 回调转发而来（wParam = 目标窗口, lParam = 事件编号）
             let target_hwnd = wparam.0 as isize;
             let event = lparam.0 as u32;
-            handle_winevent(target_hwnd, event);
+            // 传入隐藏窗口句柄：MoveStart/MoveEnd 需重设兜底轮询周期加速/恢复
+            handle_winevent(hwnd, target_hwnd, event);
             LRESULT(0)
         }
         common::WM_APP_OPEN_SETTINGS => {
@@ -462,7 +463,7 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// 处理 WinEvent 事件：按动作分类驱动覆盖层同步 / 显隐 / 清理
-fn handle_winevent(target_hwnd: isize, event: u32) {
+fn handle_winevent(hidden_hwnd: HWND, target_hwnd: isize, event: u32) {
     use sys::win_event::WinEventAction;
     match sys::win_event::classify(event) {
         // 位置变化与前台切换都走同步：sync_position 内部使用 HWND_TOPMOST 天然置顶
@@ -488,7 +489,41 @@ fn handle_winevent(target_hwnd: isize, event: u32) {
             // 目标窗口正在销毁：不做任何窗口查询，直接清理覆盖层与标签
             forget_target(target_hwnd);
         }
+        WinEventAction::MoveStart => {
+            // 移动/缩放开始：加速兜底轮询（500→100ms），弥补拖拽期间
+            // LOCATIONCHANGE 合并/提权窗口 UIPI 拦截事件导致的位置滞后（问题 18）。
+            // 仅对已标记窗口加速，避免全局误触。
+            let has_overlay = OVERLAY_STORE.get().is_some_and(|s| {
+                s.lock()
+                    .map(|m| m.contains_key(&target_hwnd))
+                    .unwrap_or(false)
+            });
+            if has_overlay {
+                set_poll_interval(hidden_hwnd, 100);
+            }
+        }
+        WinEventAction::MoveEnd => {
+            // 移动/缩放结束：强制最终同步（GetWindowRect 规避 DWM 陈旧值）+ 恢复轮询周期。
+            with_overlay(target_hwnd, |overlay| {
+                if let Err(e) = overlay.sync_position_force() {
+                    eprintln!("[WinEvent] 移动结束同步覆盖层失败: {}", e);
+                }
+            });
+            set_poll_interval(hidden_hwnd, 500);
+        }
         WinEventAction::Ignore => {}
+    }
+}
+
+/// 重设兜底轮询定时器周期（问题 18：拖拽期间加速到 100ms，结束后恢复 500ms）
+///
+/// `SetTimer` 以同一 ID 重复设置会直接改写周期（无需先 KillTimer），失败静默
+/// （窗口仍存活，事件同步仍是主路径）。
+fn set_poll_interval(hwnd: HWND, interval_ms: u32) {
+    // SAFETY: hwnd 为主线程创建的隐藏窗口且存活；SetTimer 仅改定时器周期，
+    // 失败返回 NULL（0），忽略即可（下一事件/既有定时器仍会兜底）。
+    unsafe {
+        let _ = SetTimer(hwnd, TIMER_POLL_OVERLAYS, interval_ms, None);
     }
 }
 

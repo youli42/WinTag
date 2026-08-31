@@ -28,6 +28,14 @@ pub enum WinEventAction {
     BringToTop,
     /// 触发移除窗口记录。
     Forget,
+    /// 窗口移动/缩放**开始**：主线程可据此**加速**兜底轮询（500ms→100ms），
+    /// 弥补拖拽期间 `EVENT_OBJECT_LOCATIONCHANGE` 合并导致的位置滞后/丢失，
+    /// 以及提权目标窗口 UIPI 拦截事件后仅靠事件同步的缺失（问题 18）。
+    MoveStart,
+    /// 窗口移动/缩放**结束**：主线程据此执行**强制最终同步**（`sync_position_force`，
+    /// 优先取 `GetWindowRect` 规避 DWM extended frame bounds 拖拽中的陈旧值），
+    /// 并恢复兜底轮询周期（100ms→500ms）。
+    MoveEnd,
     /// 不产生任何动作。
     Ignore,
 }
@@ -35,6 +43,8 @@ pub enum WinEventAction {
 // 说明：Windows 事件常量在 windows-rs 0.58 中可能并非全部对外暴露，
 // 因此这里采用 Win32 规范中的稳定字面量并配以中文注释，避免构建期常量缺失。
 const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003; // 系统前台窗口切换
+const EVENT_SYSTEM_MOVESIZESTART: u32 = 0x000A; // 系统移动/缩放开始（拖动窗口标题栏）
+const EVENT_SYSTEM_MOVESIZEEND: u32 = 0x000B; // 系统移动/缩放结束
 const EVENT_SYSTEM_MINIMIZESTART: u32 = 0x0016; // 系统最小化开始
 const EVENT_SYSTEM_MINIMIZEEND: u32 = 0x0017; // 系统最小化结束
 
@@ -68,6 +78,8 @@ pub fn classify(event: u32) -> WinEventAction {
             WinEventAction::Show
         }
         EVENT_SYSTEM_FOREGROUND => WinEventAction::BringToTop,
+        EVENT_SYSTEM_MOVESIZESTART => WinEventAction::MoveStart,
+        EVENT_SYSTEM_MOVESIZEEND => WinEventAction::MoveEnd,
         _ => WinEventAction::Ignore,
     }
 }
@@ -182,6 +194,8 @@ unsafe extern "system" fn win_event_callback(
     // 若消息队列中已存在未处理的 WM_APP_WINEVENT，说明主线程尚未消化上一批事件，
     // 跳过本次投递（主循环处理时以队列中最新的消息为准，中间状态可合并丢弃）。
     // 这避免消息队列无限堆积，将同步频率收敛到主循环的处理速度。
+    // 例外：MOVESIZEEND 是"移动结束的最终同步"信号，若被合并丢弃会导致角标停在
+    // 拖拽中途的陈旧位置（问题 18）；故该事件**不参与合并丢弃**，必保投递。
     // SAFETY: 回调运行在安装线程（主线程）消息泵内，PeekMessageW 仅查询本线程
     // 队列、不取出消息，无副作用；PM_NOREMOVE 保证消息保留在队列中。
     let mut probe = MSG::default();
@@ -195,7 +209,7 @@ unsafe extern "system" fn win_event_callback(
         )
         .as_bool()
     };
-    if has_pending {
+    if has_pending && event != EVENT_SYSTEM_MOVESIZEEND {
         return;
     }
 
@@ -248,6 +262,15 @@ mod tests {
         assert_eq!(classify(EVENT_SYSTEM_MINIMIZEEND), WinEventAction::Show);
         assert_eq!(classify(EVENT_OBJECT_SHOW), WinEventAction::Show);
         assert_eq!(classify(EVENT_OBJECT_UNCLOAKED), WinEventAction::Show);
+    }
+
+    #[test]
+    fn classify_move_start_end() {
+        assert_eq!(
+            classify(EVENT_SYSTEM_MOVESIZESTART),
+            WinEventAction::MoveStart
+        );
+        assert_eq!(classify(EVENT_SYSTEM_MOVESIZEEND), WinEventAction::MoveEnd);
     }
 
     #[test]

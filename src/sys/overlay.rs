@@ -359,30 +359,63 @@ impl Overlay {
             unsafe { GetWindowRect(self.target_hwnd, &mut rect) }?;
         }
 
+        self.sync_to_rect(&rect)
+    }
+
+    /// 移动/缩放**结束**的强制最终同步（问题 18）。
+    ///
+    /// 与 [`Overlay::sync_position`] 语义一致，但目标窗口矩形**始终经 `GetWindowRect`**
+    /// 获取，不经 `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`。原因：拖拽期间
+    /// DWM 的 extended frame bounds 可能返回陈旧值（尚未随窗口帧更新），导致角标停留在
+    /// 拖拽中途位置；`GetWindowRect` 直接读窗口对象当前位置，是移动结束后的权威坐标。
+    ///
+    /// 由 `EVENT_SYSTEM_MOVESIZEEND`（classify → `WinEventAction::MoveEnd`）在
+    /// `main::handle_winevent` 中触发。
+    pub fn sync_position_force(&self) -> Result<()> {
+        // SAFETY: 同上（sync_position），只读查询。
+        let target_visible = unsafe {
+            !IsIconic(self.target_hwnd).as_bool() && IsWindowVisible(self.target_hwnd).as_bool()
+        };
+        if !target_visible {
+            self.hide();
+            return Ok(());
+        }
+
+        let mut rect = RECT::default();
+        // SAFETY: self.target_hwnd 由本 Overlay 持有且窗口存活；GetWindowRect 为只读查询，
+        // 句柄失效时返回错误由 `?` 向上传播。
+        unsafe { GetWindowRect(self.target_hwnd, &mut rect) }?;
+        self.sync_to_rect(&rect)
+    }
+
+    /// 按已取得的目标矩形同步覆盖层位置与 z 序（`sync_position`/`sync_position_force` 共用）
+    ///
+    /// 覆盖层窗口仅跟随目标窗口左上角位置；尺寸由绘制自适应（`SWP_NOSIZE`）。
+    /// 每次同步都执行 `SetWindowPos`：若按位置去重早退，目标窗口被激活压住
+    /// 覆盖层（同属 topmost 带时后者在前）后 z 序永远无法恢复，角标就此
+    /// 被遮挡不再显示。事件合并（win_event.rs）+ 500ms 轮询已节制调用频率，
+    /// 单次 `SetWindowPos` 开销可忽略。
+    ///
+    /// z 序（R19）：
+    /// - 始终置顶（默认）：insertAfter = `HWND_TOPMOST`，每次同步重申置顶；
+    /// - 跟随目标：与目标窗口同一 z 带、插到目标**正前方一格**。
+    ///
+    /// 注意 `SetWindowPos` 的 `hWndInsertAfter` 语义是「被移动窗口跟在它之后（背后）」，
+    /// 所以「插到目标正上方」必须把 `hWndInsertAfter` 设为目标的前邻窗口
+    /// （`GW_HWNDPREV`），而非目标本身——否则会把覆盖层排到目标背后、被目标自身挡住。
+    /// 目标前邻为 NULL（目标处于其 z 带顶端）时用 `HWND_TOP`（== NULL，置于带顶）。
+    ///
+    /// 带位一致性：创建时的 `WS_EX_TOPMOST` 仅按当时开关拼接，置顶开关来回切换不会
+    /// 改动已有覆盖层的样式；这里按「目标是否 topmost」对齐覆盖层带位，既保证
+    /// 「跟随目标」语义（目标被其他窗口盖住时角标随之被遮挡），也避免表头遗留的
+    /// topmost 样式让角标在取消置顶后仍悬浮最上层。
+    fn sync_to_rect(&self, rect: &RECT) -> Result<()> {
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
         if w <= 0 || h <= 0 {
             return Ok(());
         }
 
-        // 覆盖层窗口仅跟随目标窗口左上角位置；尺寸由绘制自适应（SWP_NOSIZE）。
-        // 每次同步都执行 SetWindowPos：若按位置去重早退，目标窗口被激活压住
-        // 覆盖层（同属 topmost 带时后者在前）后 z 序永远无法恢复，角标就此
-        // 被遮挡不再显示。事件合并（win_event.rs）+ 500ms 轮询已节制调用频率，
-        // 单次 SetWindowPos 开销可忽略。
-        // z 序（R19）：
-        // - 始终置顶（默认）：insertAfter = HWND_TOPMOST，每次同步重申置顶；
-        // - 跟随目标：与目标窗口同一 z 带、插到目标**正前方一格**。
-        //
-        // 注意 SetWindowPos 的 hWndInsertAfter 语义是「被移动窗口跟在它之后（背后）」，
-        // 所以「插到目标正上方」必须把 hWndInsertAfter 设为目标的前邻窗口
-        // （GW_HWNDPREV），而非目标本身——否则会把覆盖层排到目标背后、被目标自身挡住。
-        // 目标前邻为 NULL（目标处于其 z 带顶端）时用 HWND_TOP（== NULL，置于带顶）。
-        //
-        // 带位一致性：创建时的 WS_EX_TOPMOST 仅按当时开关拼接，置顶开关来回切换不会
-        // 改动已有覆盖层的样式；这里按「目标是否 topmost」对齐覆盖层带位，既保证
-        // 「跟随目标」语义（目标被其他窗口盖住时角标随之被遮挡），也避免表头遗留的
-        // topmost 样式让角标在取消置顶后仍悬浮最上层。
         let target_topmost = unsafe {
             (GetWindowLongPtrW(self.target_hwnd, GWL_EXSTYLE) as isize & WS_EX_TOPMOST.0 as isize)
                 != 0
