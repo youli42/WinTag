@@ -211,22 +211,6 @@ fn main() -> anyhow::Result<()> {
     // 登记主线程侧发送端，供 request_exit 等按需向 iced 线程发送命令
     let _ = ICED_CMD_TX.set(cmd_tx);
 
-    // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）。
-    // 创建失败时句柄为 NULL 且 ui::settings::settings_hwnd() 全局记录缺失，
-    // 热键/托盘打开设置时经 ensure_settings_window 懒创建重试，故仅保活不读取。
-    let _settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
-        settings: Arc::clone(&settings),
-        hidden_hwnd: hwnd.0 as isize,
-        visible: false,
-        theme_combo: HWND::default(),
-        corner_combo: HWND::default(),
-        theme_edit: HWND::default(),
-        corner_edit: HWND::default(),
-        title_check: HWND::default(),
-        top_check: HWND::default(),
-        balloon_check: HWND::default(),
-    });
-
     // 安装 WinEvent 事件监听：绑定隐藏窗口为转发目标，事件经 WM_APP_WINEVENT 分发。
     // _winevent_hooks 作为 main 局部变量存活至退出，Drop 时自动注销 hook
     // （下划线前缀：值不再被读取，仅借 Drop 生命周期保活）。
@@ -299,15 +283,8 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     hotkey::Hotkey::OpenSettings => {
-                        // 设置窗口未创建时先懒创建（失败静默）
-                        let shwnd = ensure_settings_window(hwnd.0 as isize);
-                        if shwnd != HWND::default() {
-                            ui::settings::toggle_settings(
-                                shwnd,
-                                hwnd.0 as isize,
-                                Arc::clone(&settings),
-                            );
-                        }
+                        // D27 G2：设置窗迁至 iced 线程，主线程只发命令
+                        send_iced(crate::ui::iced_proto::IcedCommand::OpenSettings);
                     }
                 }
             }
@@ -432,15 +409,8 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         common::WM_APP_OPEN_SETTINGS => {
-            // 打开设置窗口请求：未创建时先懒创建，再切换显隐。
-            // 隐藏窗口句柄即本窗口（hwnd），供设置页保存后广播主题变更回传。
-            let shwnd = ensure_settings_window(hwnd.0 as isize);
-            if shwnd != HWND::default() {
-                // 取全局设置实例（未注入时回退默认实例，保证 toggle 不 panic）
-                let settings = core::settings::global_settings()
-                    .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
-                ui::settings::toggle_settings(shwnd, hwnd.0 as isize, settings);
-            }
+            // D27 G2：设置窗迁至 iced 线程，主线程只发命令
+            send_iced(crate::ui::iced_proto::IcedCommand::OpenSettings);
             LRESULT(0)
         }
         common::WM_APP_EDIT_TAG => {
@@ -695,30 +665,14 @@ fn handle_quick_tag(store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
     }
 }
 
-/// 确保设置窗口已创建，返回其窗口句柄（懒创建）
+/// 向 iced 线程发送一条命令（D27；通道未就绪时静默）
 ///
-/// 已创建（[`ui::settings::settings_hwnd`] 非 None）时直接复用；
-/// 未创建时用当前全局设置（未注入时回退默认实例）调用
-/// [`ui::settings::create_settings`] 创建（初始隐藏，由调用方切换显隐）。
-/// 创建失败返回默认（NULL）句柄，调用方自行决定是否忽略。
-fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
-    if let Some(sh) = ui::settings::settings_hwnd() {
-        return HWND(sh as *mut std::ffi::c_void);
+/// 跨线程命令经 `ICED_CMD_TX` 发送（仅主线程调用）；iced 线程退出/通道断开时
+/// `send` 返回 Err，静默忽略不影响主线程消息泵。
+fn send_iced(cmd: crate::ui::iced_proto::IcedCommand) {
+    if let Some(tx) = ICED_CMD_TX.get() {
+        let _ = tx.send(cmd);
     }
-    let settings = core::settings::global_settings()
-        .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
-    ui::settings::create_settings(ui::settings::SettingsData {
-        settings,
-        hidden_hwnd,
-        visible: false,
-        theme_combo: HWND::default(),
-        corner_combo: HWND::default(),
-        theme_edit: HWND::default(),
-        corner_edit: HWND::default(),
-        title_check: HWND::default(),
-        top_check: HWND::default(),
-        balloon_check: HWND::default(),
-    })
 }
 
 /// 排空托盘图标/菜单事件与 iced 事件三通道并分发高层命令（D26/D27）。
@@ -749,12 +703,26 @@ fn pump_background_events(
 
 /// 分发 iced 线程回投的界面事件（D27）
 ///
-/// 当前仅退出确认流：确认 → 以 confirmed=true 重入规范退出流；取消 → 无动作
-/// （iced 线程已在点击"取消"时自行关闭确认窗，主线程无需介入）。
+/// - `ConfirmExit`：以 confirmed=true 重入规范退出流；
+/// - `CancelExit`：无动作（iced 已自行关闭确认窗）；
+/// - `SettingsChanged`：写入全局设置 + 持久化 + 触发 `reapply_theme`。
 fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
     match event {
         ui::iced_proto::GuiEvent::ConfirmExit => request_exit(hwnd, true),
         ui::iced_proto::GuiEvent::CancelExit => {}
+        ui::iced_proto::GuiEvent::SettingsChanged(cfg) => {
+            // 写回全局设置（镜像原设置页 save_and_hide 的保存段）
+            if let Some(settings) = core::settings::global_settings() {
+                if let Ok(mut guard) = settings.lock() {
+                    *guard = cfg;
+                }
+            }
+            if let Err(err) = cfg.save() {
+                eprintln!("[配置写入失败] {err:?}");
+            }
+            // 广播主题变更，令覆盖层/tooltip/各窗口即时生效
+            reapply_theme(hwnd);
+        }
     }
 }
 
@@ -770,13 +738,8 @@ fn dispatch_tray_command(hwnd: HWND, cmd: sys::tray::TrayCommand) {
             }
         }
         sys::tray::TrayCommand::OpenSettings => {
-            let shwnd = ensure_settings_window(hwnd.0 as isize);
-            if shwnd != HWND::default() {
-                // 取全局设置实例（未注入时回退默认实例，保证 toggle 不 panic）
-                let settings = core::settings::global_settings()
-                    .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
-                ui::settings::toggle_settings(shwnd, hwnd.0 as isize, settings);
-            }
+            // D27 G2：设置窗迁至 iced 线程，主线程只发命令
+            send_iced(crate::ui::iced_proto::IcedCommand::OpenSettings);
         }
         sys::tray::TrayCommand::QuickTag => {
             if let Some(store) = GLOBAL_TAG_STORE.get() {
@@ -805,9 +768,7 @@ fn request_exit(hwnd: HWND, confirmed: bool) {
         // 用户在确认窗点"退出"后 iced 回发 GuiEvent::ConfirmExit，主线程
         // dispatch_iced_event 以 confirmed=true 重入本函数完成退出；
         // 点"取消"则 iced 自行关闭窗口，本轮直接返回。
-        if let Some(tx) = ICED_CMD_TX.get() {
-            let _ = tx.send(ui::iced_proto::IcedCommand::ShowConfirm { count: tag_count });
-        }
+        send_iced(ui::iced_proto::IcedCommand::ShowConfirm { count: tag_count });
         return;
     }
     // SAFETY: PostMessageW 为线程安全投递 API；WM_QUIT 投递给本线程隐藏窗口，
@@ -867,28 +828,10 @@ fn reapply_theme(hidden_hwnd: HWND) {
         }
     }
 
-    // 设置窗口（经 settings_hwnd；未创建时跳过）
-    if let Some(sh) = ui::settings::settings_hwnd() {
-        let settings_hwnd = HWND(sh as *mut std::ffi::c_void);
-        // SAFETY: settings_hwnd 由 create_settings 成功后写入，窗口存活。
-        let _ = ui::theme::apply_dark_mode(settings_hwnd, dark);
-        let _ = ui::theme::apply_corner_preference(settings_hwnd, cfg.corner);
-        // 子控件主题变体热更新（D17）：下拉框/复选框随主题切换
-        ui::theme::apply_control_theme(settings_hwnd, dark);
-        // SAFETY: 同面板——RDW_ERASE 触发 WM_ERASEBKGND 让设置窗口背景按新调色板重绘，
-        // RDW_ALLCHILDREN 连 owner-draw 下拉框/按钮子控件一并带擦除重绘。
-        unsafe {
-            let _ = RedrawWindow(
-                settings_hwnd,
-                None,
-                HRGN::default(),
-                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-            );
-        }
-    }
-
     // D27 G1：原生层偏好一次性重注入（设置保存广播后热更新；覆盖层/tooltip/托盘共用）
     sys::native_prefs::set_native_prefs(apply_native_prefs(cfg, system_dark));
+    // D27：主题变更补发 iced（各 iced 窗口主题热更新）
+    send_iced(ui::iced_proto::IcedCommand::ApplyTheme { dark });
     // 强制所有已存在的覆盖层重绘并重申 z 序：主题切换后角标描边色 / 标题条配色 /
     // 置顶开关即时生效。
     if let Some(store) = OVERLAY_STORE.get() {

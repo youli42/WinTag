@@ -2,7 +2,7 @@
 //!
 //! 本模块运行在**独立线程**（`main.rs` 以 `std::thread` 启动），用 [`iced::daemon`]
 //! 的多窗口模型承担 `confirm` / `settings` / `popup` / `panel` 四个窗口。阶段 G0
-//! 仅落地退出确认窗（最小闭环），其余窗口由后续阶段（G2-G4）逐步迁入。
+//! 落地退出确认窗（最小闭环）、G2 迁移设置窗，其余窗口由后续阶段（G3-G4）迁入。
 //!
 //! 线程模型：主线程（Win32 消息泵）与本模块（iced 线程）经一对 crossbeam 通道
 //! 双向通信——主线程发 [`IcedCommand`]、本模块回 [`GuiEvent`]，契约见
@@ -18,17 +18,21 @@
 use std::cell::RefCell;
 
 use iced::futures::StreamExt;
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, checkbox, column, combo_box, container, row, text};
 use iced::window;
-use iced::{Element, Size, Subscription, Task, Theme};
+use iced::{Element, Length, Size, Subscription, Task, Theme};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::core::settings::{CornerPreference, Settings, ThemeMode};
 use crate::ui::iced_proto::{GuiEvent, IcedCommand};
 
 /// 退出确认窗口的目标尺寸（逻辑像素，iced 自管 DPI）
 const CONFIRM_W: f32 = 380.0;
 const CONFIRM_H: f32 = 160.0;
+/// 设置窗口目标尺寸
+const SETTINGS_W: f32 = 420.0;
+const SETTINGS_H: f32 = 480.0;
 
 /// 退出确认窗的状态
 struct ConfirmState {
@@ -36,6 +40,18 @@ struct ConfirmState {
     id: window::Id,
     /// 提示文本（"确定退出？将丢弃 N 个标签/便签"）
     message: String,
+}
+
+/// 设置窗的状态（含可编辑草稿与两个下拉框的持久状态）
+struct SettingsWindow {
+    /// 窗口 id
+    id: window::Id,
+    /// 可编辑草稿（`Settings` 全字段为可拷贝标量）
+    draft: Settings,
+    /// 主题下拉框的持久 widget 状态
+    theme_state: combo_box::State<ThemeMode>,
+    /// 圆角下拉框的持久 widget 状态
+    corner_state: combo_box::State<CornerPreference>,
 }
 
 /// iced 应用状态（运行在 iced 线程，单线程访问，无需 `Send`）
@@ -49,7 +65,9 @@ pub struct WinTagApp {
     cmd_stream: RefCell<Option<iced::futures::channel::mpsc::UnboundedReceiver<IcedCommand>>>,
     /// 当前显示的退出确认窗（`None` = 未显示）
     confirm: Option<ConfirmState>,
-    /// 是否暗色主题（启动时解析；热更新在后续阶段经 `ApplyTheme` 接入）
+    /// 当前显示的设置窗（`None` = 未显示）
+    settings: Option<SettingsWindow>,
+    /// 是否暗色主题（启动时解析；经 `ApplyTheme` 热更新）
     dark: bool,
 }
 
@@ -58,14 +76,29 @@ pub struct WinTagApp {
 pub enum Message {
     /// 主线程经跨线程通道送达的指令
     Command(IcedCommand),
-    /// 确认窗创建完成（窗口 id 就绪）
-    WindowOpened(window::Id),
-    /// 确认窗被关闭（用户点关闭按钮 / 系统关闭）
+    /// 空操作（如窗口创建任务完成）
+    Noop,
+    /// 窗口被关闭（用户点关闭按钮 / 系统关闭）
     WindowClosed(window::Id),
-    /// 点击"退出"确认按钮（默认动作）
+    /// 点击"退出"确认按钮（确认窗默认动作）
     ConfirmPressed,
-    /// 点击"取消"按钮
+    /// 点击"取消"按钮（确认窗）
     CancelPressed,
+    // ---- 设置窗交互 ----
+    /// 主题下拉框选择变更
+    SettingsThemeSelected(ThemeMode),
+    /// 圆角下拉框选择变更
+    SettingsCornerSelected(CornerPreference),
+    /// "角标显示标题"复选框
+    SettingsTitleToggled(bool),
+    /// "角标始终置顶"复选框
+    SettingsTopToggled(bool),
+    /// "气泡提示"复选框
+    SettingsBalloonToggled(bool),
+    /// 点击"保存"（发出 [`GuiEvent::SettingsChanged`] 并关闭窗口）
+    SettingsSavePressed,
+    /// 点击"取消"（关闭窗口，不保存）
+    SettingsCancelPressed,
 }
 
 impl WinTagApp {
@@ -73,7 +106,7 @@ impl WinTagApp {
     ///
     /// 启动时派生桥接线程：阻塞接收主线程的 [`IcedCommand`] 并转发进
     /// `futures` 无界通道，供 `subscription` 作为异步流消费。初始不显示任何窗口
-    /// （`iced::daemon` 在零窗口下保持存活，按需 `ShowConfirm` 打开）。
+    /// （`iced::daemon` 在零窗口下保持存活，按需打开窗口）。
     pub fn new(
         gui_tx: Sender<GuiEvent>,
         cmd_rx: Receiver<IcedCommand>,
@@ -94,16 +127,19 @@ impl WinTagApp {
                 gui_tx,
                 cmd_stream: RefCell::new(Some(bridge_rx)),
                 confirm: None,
+                settings: None,
                 dark,
             },
             Task::none(),
         )
     }
 
-    /// 每窗口标题（确认窗显示"退出确认"，其余未显示窗口回退"WinTag"）
+    /// 每窗口标题
     pub fn title(&self, window: window::Id) -> String {
         if self.confirm.as_ref().is_some_and(|c| c.id == window) {
             "退出确认".to_string()
+        } else if self.settings.as_ref().is_some_and(|c| c.id == window) {
+            "设置".to_string()
         } else {
             "WinTag".to_string()
         }
@@ -113,14 +149,13 @@ impl WinTagApp {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Command(cmd) => self.handle_command(cmd),
-            Message::WindowOpened(id) => {
-                // window::open 已同步返回 id，此处仅确认窗口就绪（无额外动作）
-                let _ = self.confirm.as_ref().is_some_and(|c| c.id == id);
-                Task::none()
-            }
+            Message::Noop => Task::none(),
             Message::WindowClosed(id) => {
                 if self.confirm.as_ref().is_some_and(|c| c.id == id) {
                     self.confirm = None;
+                }
+                if self.settings.as_ref().is_some_and(|c| c.id == id) {
+                    self.settings = None;
                 }
                 Task::none()
             }
@@ -132,6 +167,43 @@ impl WinTagApp {
                 let _ = self.gui_tx.send(GuiEvent::CancelExit);
                 self.close_confirm()
             }
+            // ---- 设置窗 ----
+            Message::SettingsThemeSelected(v) => {
+                if let Some(sw) = &mut self.settings {
+                    sw.draft.theme = v;
+                }
+                Task::none()
+            }
+            Message::SettingsCornerSelected(v) => {
+                if let Some(sw) = &mut self.settings {
+                    sw.draft.corner = v;
+                }
+                Task::none()
+            }
+            Message::SettingsTitleToggled(v) => {
+                if let Some(sw) = &mut self.settings {
+                    sw.draft.show_badge_title = v;
+                }
+                Task::none()
+            }
+            Message::SettingsTopToggled(v) => {
+                if let Some(sw) = &mut self.settings {
+                    sw.draft.badge_always_top = v;
+                }
+                Task::none()
+            }
+            Message::SettingsBalloonToggled(v) => {
+                if let Some(sw) = &mut self.settings {
+                    sw.draft.show_balloon = v;
+                }
+                Task::none()
+            }
+            Message::SettingsSavePressed => {
+                let draft = self.settings.as_ref().map(|s| s.draft).unwrap_or_default();
+                let _ = self.gui_tx.send(GuiEvent::SettingsChanged(draft));
+                self.close_settings()
+            }
+            Message::SettingsCancelPressed => self.close_settings(),
         }
     }
 
@@ -140,6 +212,11 @@ impl WinTagApp {
         match cmd {
             IcedCommand::ShowConfirm { count } => self.open_confirm(count),
             IcedCommand::CloseConfirm => self.close_confirm(),
+            IcedCommand::OpenSettings => self.open_settings(),
+            IcedCommand::ApplyTheme { dark } => {
+                self.dark = dark;
+                Task::none()
+            }
         }
     }
 
@@ -153,7 +230,7 @@ impl WinTagApp {
             ..window::Settings::default()
         });
         self.confirm = Some(ConfirmState { id, message });
-        open.map(Message::WindowOpened)
+        open.map(|_| Message::Noop)
     }
 
     /// 关闭确认窗（并将其从状态移除；`window::close` 返回关闭任务）
@@ -165,7 +242,44 @@ impl WinTagApp {
         }
     }
 
-    /// 按窗口渲染界面（阶段 G0：仅确认窗）
+    /// 打开设置窗：读全局设置快照预填表单并创建设置窗口
+    fn open_settings(&mut self) -> Task<Message> {
+        let cfg = crate::core::settings::global_settings()
+            .and_then(|s| s.lock().ok().map(|guard| *guard))
+            .unwrap_or_default();
+        let (id, open) = window::open(window::Settings {
+            position: window::Position::Centered,
+            size: Size::new(SETTINGS_W, SETTINGS_H),
+            resizable: false,
+            ..window::Settings::default()
+        });
+        self.settings = Some(SettingsWindow {
+            id,
+            draft: cfg,
+            theme_state: combo_box::State::new(vec![
+                ThemeMode::System,
+                ThemeMode::Light,
+                ThemeMode::Dark,
+            ]),
+            corner_state: combo_box::State::new(vec![
+                CornerPreference::Default,
+                CornerPreference::Round,
+                CornerPreference::SmallRound,
+            ]),
+        });
+        open.map(|_| Message::Noop)
+    }
+
+    /// 关闭设置窗
+    fn close_settings(&mut self) -> Task<Message> {
+        if let Some(sw) = self.settings.take() {
+            window::close(sw.id)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// 按窗口渲染界面
     pub fn view<'a>(&'a self, window_id: window::Id) -> Element<'a, Message> {
         if let Some(confirm) = &self.confirm {
             if confirm.id == window_id {
@@ -179,18 +293,23 @@ impl WinTagApp {
                         .spacing(8),
                     ]
                     .spacing(16)
-                    .width(iced::Fill)
-                    .height(iced::Fill)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
                     .padding(16),
                 )
                 .into();
+            }
+        }
+        if let Some(sw) = &self.settings {
+            if sw.id == window_id {
+                return settings_view(sw);
             }
         }
         // 尚未创建的实际窗口：渲染空容器（iced 要求每窗口都有 view）
         container(text("")).into()
     }
 
-    /// 主题（阶段 G0：按启动时解析的明暗状态选取 iced 内建主题）
+    /// 主题（按当前明暗状态选取 iced 内建主题，经 `ApplyTheme` 热更新）
     pub fn theme(&self, _window: window::Id) -> Theme {
         if self.dark {
             Theme::Dark
@@ -213,4 +332,45 @@ impl WinTagApp {
         });
         Subscription::batch([cmd_sub, window::close_events().map(Message::WindowClosed)])
     }
+}
+
+/// 设置窗视图（主题/圆角下拉 + 三个复选框 + 保存/取消）
+fn settings_view(sw: &SettingsWindow) -> Element<'_, Message> {
+    let theme = combo_box::ComboBox::new(
+        &sw.theme_state,
+        "主题",
+        Some(&sw.draft.theme),
+        Message::SettingsThemeSelected,
+    )
+    .width(Length::Fill);
+    let corner = combo_box::ComboBox::new(
+        &sw.corner_state,
+        "圆角",
+        Some(&sw.draft.corner),
+        Message::SettingsCornerSelected,
+    )
+    .width(Length::Fill);
+
+    container(
+        column![
+            text("主题"),
+            theme,
+            text("圆角"),
+            corner,
+            checkbox("角标显示标题", sw.draft.show_badge_title)
+                .on_toggle(Message::SettingsTitleToggled),
+            checkbox("角标始终置顶", sw.draft.badge_always_top)
+                .on_toggle(Message::SettingsTopToggled),
+            checkbox("气泡提示", sw.draft.show_balloon).on_toggle(Message::SettingsBalloonToggled),
+            row![
+                button(text("取消")).on_press(Message::SettingsCancelPressed),
+                button(text("保存")).on_press(Message::SettingsSavePressed),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .width(Length::Fill)
+        .padding(16),
+    )
+    .into()
 }

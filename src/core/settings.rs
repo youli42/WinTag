@@ -29,6 +29,12 @@ impl ThemeMode {
     }
 }
 
+impl std::fmt::Display for ThemeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label_cn())
+    }
+}
+
 /// 窗口圆角偏好（供设置页下拉框选择）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CornerPreference {
@@ -48,6 +54,12 @@ impl CornerPreference {
             CornerPreference::Round => "圆角",
             CornerPreference::SmallRound => "小圆角",
         }
+    }
+}
+
+impl std::fmt::Display for CornerPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label_cn())
     }
 }
 

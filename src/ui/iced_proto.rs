@@ -8,14 +8,18 @@
 //! - 主线程 → iced 线程经 [`IcedCommand`]；iced 线程 → 主线程经 [`GuiEvent`]；
 //! - 全项目仅此一对跨线程通道，后续新增窗口/消息都复用，**禁止新增 channel**；
 //! - 同一消息只有一个出口：原生 `WM_APP_*` 只负责「进主循环」，出主循环走本通道。
+//!
+//! 本模块依赖方向：`ui → core`（可引用 `core::settings::Settings`），但不依赖
+//! iced / Win32。
+
+use crate::core::settings::Settings;
 
 /// 主线程 → iced 线程：请求 iced 执行某个界面动作。
 ///
 /// 由 `main.rs` 经 crossbeam 通道发送到 iced 线程，`ui::iced_app` 在
 /// `subscription` 中消费后驱动的 `update`。
 ///
-/// 阶段 G0 仅承载退出确认流程；后续阶段（G2-G4）依次扩展设置页 / 标签弹窗 /
-/// 概览面板的指令变体。
+/// 阶段 G0 仅承载退出确认流程；G2 起扩展设置页指令。
 #[derive(Debug, Clone)]
 pub enum IcedCommand {
     /// 打开"退出确认"窗口（`count` = 待丢弃的标签/便签数量）。
@@ -27,6 +31,16 @@ pub enum IcedCommand {
     ///
     /// 供主线程请求强制收起确认窗（如再次请求退出被取消时的收尾）。
     CloseConfirm,
+    /// 打开设置窗口（G2）。
+    ///
+    /// iced 线程收到后读取全局设置的当前快照（`core::settings::global_settings`）
+    /// 预填表单，并创建设置窗口。
+    OpenSettings,
+    /// 应用主题（G2：`dark` = 是否暗色）。
+    ///
+    /// 主线程在 `reapply_theme`（设置保存广播/系统主题切换）后发送，
+    /// iced 线程据此更新各 iced 窗口的主题。
+    ApplyTheme { dark: bool },
 }
 
 /// iced 线程 → 主线程：iced 产出的界面事件，由主线程 `pump_background_events`
@@ -42,4 +56,8 @@ pub enum GuiEvent {
     ConfirmExit,
     /// 用户取消退出（点击"取消" / Esc / 关闭窗口）。
     CancelExit,
+    /// 用户在设置页点击"保存"（`Settings` = 保存后的完整设置，G2）。
+    ///
+    /// 主线程写入全局设置 + 持久化 + 触发 `reapply_theme`。
+    SettingsChanged(Settings),
 }
