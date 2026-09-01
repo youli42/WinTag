@@ -15,10 +15,8 @@
 //! `futures` 的无界通道；`subscription` 则消费该无界通道，实现「主线程 → iced」。
 //! 桥接通道仅在本模块内部存在，不属于对外信道，符合「总线最小化」铁律。
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 
-use iced::futures::StreamExt;
 use iced::keyboard::key::{Key, Named};
 use iced::widget::{
     button, checkbox, column, combo_box, container, row, scrollable, text, text_input,
@@ -112,9 +110,9 @@ struct PanelState {
 pub struct WinTagApp {
     /// 回传 iced 事件的发送器（iced 线程 → 主线程）
     gui_tx: Sender<GuiEvent>,
-    /// crossbeam（同步）→ `futures`（异步）的桥接接收端；首个 `subscription`
-    /// 调用时取出并移入订阅流，之后为 `None`（订阅由固定 id 常驻，不再重建）。
-    cmd_stream: RefCell<Option<iced::futures::channel::mpsc::UnboundedReceiver<IcedCommand>>>,
+    /// 主线程命令接收端（crossbeam；`update` 经稳定的 `time::every` 订阅周期性排空，
+    /// 避免依赖「单次构建的异步流/订阅」被 iced Tracker 剪除——首个命令后再无响应）。
+    cmd_rx: crossbeam_channel::Receiver<IcedCommand>,
     /// 当前显示的退出确认窗（`None` = 未显示）
     confirm: Option<ConfirmState>,
     /// 当前显示的设置窗（`None` = 未显示）
@@ -130,10 +128,10 @@ pub struct WinTagApp {
 /// iced 应用的消息（`Send + Debug + 'static`，iced 事件循环要求）
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// 主线程经跨线程通道送达的指令
-    Command(IcedCommand),
     /// 空操作（如窗口创建任务完成）
     Noop,
+    /// 周期 tick：排空主线程命令队列（`cmd_rx`）并逐条处理
+    Pump,
     /// 窗口被关闭（用户点关闭按钮 / 系统关闭）
     WindowClosed(window::Id),
     /// 点击"退出"确认按钮（确认窗默认动作）
@@ -198,20 +196,10 @@ impl WinTagApp {
         cmd_rx: Receiver<IcedCommand>,
         dark: bool,
     ) -> (Self, Task<Message>) {
-        let (bridge_tx, bridge_rx) = iced::futures::channel::mpsc::unbounded();
-        // SAFETY: 桥接线程独占 cmd_rx（克隆），阻塞 recv 到主线程退出；
-        // bridge_tx 关闭（主线程 drop 时）即收到 Disconnected 退出循环。
-        std::thread::spawn(move || {
-            while let Ok(cmd) = cmd_rx.recv() {
-                if bridge_tx.unbounded_send(cmd).is_err() {
-                    break;
-                }
-            }
-        });
         (
             Self {
                 gui_tx,
-                cmd_stream: RefCell::new(Some(bridge_rx)),
+                cmd_rx,
                 confirm: None,
                 settings: None,
                 popup: None,
@@ -240,7 +228,7 @@ impl WinTagApp {
     /// 状态更新：处理跨线程指令与界面事件，返回驱动窗口/退出流程的 [`Task`]
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Command(cmd) => self.handle_command(cmd),
+            Message::Pump => self.drain_commands(),
             Message::Noop => Task::none(),
             Message::WindowClosed(id) => {
                 if self.confirm.as_ref().is_some_and(|c| c.id == id) {
@@ -410,6 +398,22 @@ impl WinTagApp {
                 let _ = self.gui_tx.send(GuiEvent::PanelExit);
                 Task::none()
             }
+        }
+    }
+
+    /// 排空主线程命令队列（crossbeam `try_recv`），逐条经 [`Self::handle_command`] 处理
+    ///
+    /// 由稳定的 `iced::time::every` 订阅周期触发；命令订阅不依赖「单次构建的异步流」，
+    /// 因此不会被 iced Tracker 剪除——首个命令后仍持续可用。
+    fn drain_commands(&mut self) -> Task<Message> {
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            tasks.push(self.handle_command(cmd));
+        }
+        if tasks.is_empty() {
+            Task::none()
+        } else {
+            Task::batch(tasks)
         }
     }
 
@@ -648,18 +652,12 @@ impl WinTagApp {
         }
     }
 
-    /// 订阅：合并「主线程指令流」「窗口关闭事件流」与「Esc 取消弹窗」
+    /// 订阅：合并「主线程命令周期轮询」「窗口关闭事件」与「Esc/Enter 键盘」
     pub fn subscription(&self) -> Subscription<Message> {
-        let mut slot = self.cmd_stream.borrow_mut();
-        // 首调用取出桥接接收端，构建常驻订阅流；之后返回 None
-        let cmd_sub = slot.take().map_or_else(Subscription::none, |rx| {
-            Subscription::run_with_id(
-                "wintag-main-cmd",
-                iced::futures::stream::unfold(rx, |mut rx| async move {
-                    rx.next().await.map(|cmd| (Message::Command(cmd), rx))
-                }),
-            )
-        });
+        // 命令经稳定的 `time::every` tick 轮询 `cmd_rx`，避免依赖一次性的异步订阅流
+        //（会被 iced Tracker 剪除而失效）。tick 也顺带保证零窗口时事件循环持续运转。
+        let pump_sub =
+            iced::time::every(std::time::Duration::from_millis(60)).map(|_| Message::Pump);
         let esc_sub = iced::keyboard::on_key_press(|key, _modifiers| {
             if key == Key::Named(Named::Escape) {
                 Some(Message::PopupCancelPressed)
@@ -675,7 +673,7 @@ impl WinTagApp {
             }
         });
         Subscription::batch([
-            cmd_sub,
+            pump_sub,
             window::close_events().map(Message::WindowClosed),
             esc_sub,
             enter_sub,
