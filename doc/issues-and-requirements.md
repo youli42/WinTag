@@ -306,7 +306,7 @@
 | 2026-09-01 | 托盘常驻化（D24）：Windows 子系统 + 单实例保护（守护窗口类）+ 默认托盘常驻零窗口启动 + 启动气泡可开关（show_balloon）+ `--no-tray` 禁用 + 有标签退出弹定制主题确认窗（ui/confirm）+ 托盘右键四项菜单/左键与气泡打开面板 + 面板底部"退出"按钮 + 设置页"气泡提示"开关 | `425303d` feat(tray) |
 | 2026-09-01 | 底部控件客户区裁切修复（D25）：`ui::layout` 新增 `TITLEBAR_H`/`client_height()` 统一从窗口外高抵扣标题栏边框；`confirm`/`popup`/`settings` 底部按钮行改用客户区高度定位，修复退出确认窗"退出/取消"按钮溢出客户区被裁切 | `425303d` fix(ui) |
 | 2026-09-01 | 托盘底层迁移（D26）：托盘自 `Shell_NotifyIconW` 手写迁至 `tray-icon`(tauri)（`TrayIconBuilder`+`Menu(MenuItem)`+嵌入资源图标，事件经 `TrayIconEvent`/`MenuEvent` crossbeam 通道由主循环 `try_recv` 轮询）；气泡由 `NIF_INFO`+`NIM_MODIFY` 迁至 `notify-rust`（Windows TOAST）；`TaskbarCreated` 重注册由 tray-icon 内部接管、删除 `WM_APP_TRAY` 常量；图标取自新增 `assets/icon.ico`（winresource ID=1，`Icon::from_resource`） | —（并行迁移，见 decision-records D26） |
-| 2026-09-01 | 图形界面重构登记（D27）：四个图形界面窗口（panel/popup/settings/confirm）迁至 iced（tiny-skia 软件渲染器 + 独立线程通道通信，含总线最小化：`NativePrefs`/`NativeBridge` 收敛 + `pump_background_events` 单一分发表 + 托盘不绕 iced）、`ui/button`/`ui/layout` 删除、`ui/theme` 拆分；覆盖层/托盘/热键/事件监听与 Win32 消息泵保持纯 Win32 不变（详见 [decision-records.md D27](./decision-records.md)，分阶段执行方案见 [iced-migration.md](./iced-migration.md)） | —（文档登记，未实施） |
+| 2026-09-01 | 图形界面重构登记（D27）：四个图形界面窗口（panel/popup/settings/confirm）迁至 iced（tiny-skia 软件渲染器 + 独立线程通道通信，含总线最小化：`NativePrefs`/`NativeBridge` 收敛 + `pump_background_events` 单一分发表 + 托盘不绕 iced）、`ui/button`/`ui/layout` 删除、`ui/theme` 拆分；覆盖层/托盘/热键/事件监听与 Win32 消息泵保持纯 Win32 不变（详见 [decision-records.md D27](./decision-records.md)，分阶段执行方案见 [iced-migration.md](./iced-migration.md)） | ✅ 已实施（G0-G5）：`feat(ui)` D27 G0-G4 + `docs(ui)` G5 |
 
 ---
 
