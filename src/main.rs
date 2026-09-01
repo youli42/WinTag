@@ -42,6 +42,13 @@ static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
 static PANEL_HWND: OnceLock<isize> = OnceLock::new();
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
+/// 主线程 → iced 线程的命令发送端（D27）
+///
+/// 镜像 `GLOBAL_TAG_STORE` 的注入模式：`main` 启动时写入一次，供
+/// `request_exit`（有标签且未确认时弹退出确认窗）等按需发送
+/// [`ui::iced_proto::IcedCommand`]，维持「主窗口对象只在主线程持有」的约定。
+static ICED_CMD_TX: OnceLock<crossbeam_channel::Sender<ui::iced_proto::IcedCommand>> =
+    OnceLock::new();
 
 /// 判定单实例冲突：`CreateMutexW` 返回的句柄因同名命名互斥量已存在
 /// （`GetLastError == ERROR_ALREADY_EXISTS`）时，说明另一 WinTag 实例正在运行。
@@ -162,6 +169,31 @@ fn main() -> anyhow::Result<()> {
     sys::overlay::set_show_title(cfg.show_badge_title);
     sys::overlay::set_badge_always_top(cfg.badge_always_top);
 
+    // D27：启动 iced 线程（四个 GUI 窗口的宿主，阶段 G0 仅退出确认窗）。
+    // 主线程与 iced 线程经一对 crossbeam 通道双向通信：主线程发 IcedCommand、
+    // iced 线程回 GuiEvent，契约见 ui::iced_proto。iced 以独立线程跑
+    // `iced::daemon`，主线程 Win32 消息泵不受影响；线程退出随进程结束。
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ui::iced_proto::IcedCommand>();
+    let (gui_tx, gui_rx) = crossbeam_channel::unbounded::<ui::iced_proto::GuiEvent>();
+    let gui_dark = dark;
+    let _ = std::thread::Builder::new()
+        .name("wintag-gui".to_string())
+        .spawn(move || {
+            let result = iced::daemon(
+                ui::iced_app::WinTagApp::title,
+                ui::iced_app::WinTagApp::update,
+                ui::iced_app::WinTagApp::view,
+            )
+            .subscription(ui::iced_app::WinTagApp::subscription)
+            .theme(ui::iced_app::WinTagApp::theme)
+            .run_with(move || ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark));
+            if let Err(err) = result {
+                eprintln!("[iced] 启动失败: {err:?}");
+            }
+        });
+    // 登记主线程侧发送端，供 request_exit 等按需向 iced 线程发送命令
+    let _ = ICED_CMD_TX.set(cmd_tx);
+
     // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）。
     // 创建失败时句柄为 NULL 且 ui::settings::settings_hwnd() 全局记录缺失，
     // 热键/托盘打开设置时经 ensure_settings_window 懒创建重试，故仅保活不读取。
@@ -232,10 +264,10 @@ fn main() -> anyhow::Result<()> {
             anyhow::bail!("GetMessage 错误");
         }
 
-        // D26：托盘事件经 tray-icon 的 crossbeam channel 投递（事件在上一轮
-        // DispatchMessageW 调起 tray-icon 内部 WndProc 时已写入 channel）。
-        // 此处非阻塞 try_recv 排空两 channel 并分发到现有窗口动作。
-        poll_tray_events(hwnd);
+        // D26：托盘事件经 tray-icon 的 crossbeam channel 投递；D27：iced 线程
+        // 事件经另一条 crossbeam channel 回投。此处非阻塞 try_recv 排空三通道
+        // 并分发到现有窗口动作。
+        pump_background_events(hwnd, &gui_rx);
 
         if msg.message == WM_HOTKEY {
             let hotkey = hotkey::from_message(msg.message, msg.wParam.0, msg.lParam.0);
@@ -672,13 +704,17 @@ fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
     })
 }
 
-/// 排空托盘图标/菜单事件 channel 并分发高层命令（D26）。
+/// 排空托盘图标/菜单事件与 iced 事件三通道并分发高层命令（D26/D27）。
 ///
-/// tray-icon 把图标点击/菜单选择事件写入静态 crossbeam channel；主线程在
-/// 消息循环 `GetMessageW` 返回后非阻塞 `try_recv` 排空，经
-/// [`sys::tray`] 纯映射为 [`TrayCommand`] 后复用 [`dispatch_tray_command`]
-/// 分发到现有窗口动作（镜像热键分发语义）。
-fn poll_tray_events(hwnd: HWND) {
+/// tray-icon 把图标点击/菜单选择事件写入静态 crossbeam channel；iced 线程把
+/// 界面事件写入主线程侧的 crossbeam channel。主线程在消息循环 `GetMessageW`
+/// 返回后非阻塞 `try_recv` 排空并分发——托盘事件经 [`sys::tray`] 纯映射为
+/// [`TrayCommand`] 复用 [`dispatch_tray_command`]，iced 事件经
+/// [`dispatch_iced_event`] 落到退出流（镜像热键分发语义）。
+fn pump_background_events(
+    hwnd: HWND,
+    gui_rx: &crossbeam_channel::Receiver<ui::iced_proto::GuiEvent>,
+) {
     while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
         if let Some(cmd) = sys::tray::icon_event_to_command(&event) {
             dispatch_tray_command(hwnd, cmd);
@@ -688,6 +724,20 @@ fn poll_tray_events(hwnd: HWND) {
         if let Some(cmd) = sys::tray::menu_id_to_command(&event.id) {
             dispatch_tray_command(hwnd, cmd);
         }
+    }
+    while let Ok(event) = gui_rx.try_recv() {
+        dispatch_iced_event(hwnd, event);
+    }
+}
+
+/// 分发 iced 线程回投的界面事件（D27）
+///
+/// 当前仅退出确认流：确认 → 以 confirmed=true 重入规范退出流；取消 → 无动作
+/// （iced 线程已在点击"取消"时自行关闭确认窗，主线程无需介入）。
+fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
+    match event {
+        ui::iced_proto::GuiEvent::ConfirmExit => request_exit(hwnd, true),
+        ui::iced_proto::GuiEvent::CancelExit => {}
     }
 }
 
@@ -734,10 +784,13 @@ fn request_exit(hwnd: HWND, confirmed: bool) {
         .map(|tags| tags.len())
         .unwrap_or(0);
     if should_confirm_exit(tag_count > 0, confirmed) {
-        // 弹确认窗：确认后该窗投递 WM_APP_EXIT(wParam=1) 回来，本轮直接返回。
-        // 创建失败（返回 NULL）时不阻塞退出路径之外的任何功能，用户可再次请求。
-        let msg = format!("确定退出？将丢弃 {tag_count} 个标签/便签");
-        let _ = ui::confirm::create_confirm(&msg, hwnd.0 as isize);
+        // 交由 iced 线程弹退出确认窗（D27：四窗迁至 iced，Win32 confirm 不再用）。
+        // 用户在确认窗点"退出"后 iced 回发 GuiEvent::ConfirmExit，主线程
+        // dispatch_iced_event 以 confirmed=true 重入本函数完成退出；
+        // 点"取消"则 iced 自行关闭窗口，本轮直接返回。
+        if let Some(tx) = ICED_CMD_TX.get() {
+            let _ = tx.send(ui::iced_proto::IcedCommand::ShowConfirm { count: tag_count });
+        }
         return;
     }
     // SAFETY: PostMessageW 为线程安全投递 API；WM_QUIT 投递给本线程隐藏窗口，

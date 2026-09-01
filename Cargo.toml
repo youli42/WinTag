@@ -28,6 +28,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 tray-icon = "0.24"
 notify-rust = "4"
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "multi-window"] }
+crossbeam-channel = "0.5.16"
 
 [build-dependencies]
 winresource = "0.1.31"

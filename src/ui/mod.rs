@@ -1,5 +1,7 @@
 pub mod button;
 pub mod confirm;
+pub mod iced_app;
+pub mod iced_proto;
 pub mod layout;
 pub mod panel;
 pub mod popup;
