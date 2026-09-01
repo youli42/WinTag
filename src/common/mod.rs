@@ -9,10 +9,54 @@
 //!
 //! 依赖方向约定：`任意模块 → common`，禁止反向依赖。
 
+use std::sync::{Mutex, OnceLock};
+
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, LoadCursorW, SetWindowLongPtrW, GWLP_USERDATA, IDC_ARROW, WM_APP,
 };
+
+/// 调试日志文件路径（`%TEMP%\wintag-debug.log`）
+fn debug_log_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("wintag-debug.log")
+}
+
+/// 追加一行调试日志（进程级串行化，避免多线程写坏行）
+///
+/// 主要用于排查 GUI 启动/窗口创建问题（`windows_subsystem = "windows"` 下
+/// 控制台不可见，`eprintln` 无输出）。日志路径见 [`debug_log_path`]。
+pub fn debug_log(msg: &str) {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = LOCK.get_or_init(|| Mutex::new(())).lock();
+    if guard.is_err() {
+        return;
+    }
+    let line = format!("[{}] {msg}\n", now_iso());
+    let path = debug_log_path();
+    // 若失败静默（日志仅辅助诊断，不影响运行）
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 当前本地时间（`YYYY-MM-DD HH:MM:SS`）用于日志前缀
+fn now_iso() -> String {
+    // 无 chrono 依赖：用 std 时间戳换算为近似本地时间字符串
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 仅作日志标记，精确到秒即可（不做时区换算，保持简单）
+    format!("t{secs}")
+}
 
 /// 自定义消息：创建覆盖层（wParam = 目标窗口句柄）
 ///

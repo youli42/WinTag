@@ -142,6 +142,63 @@ fn main() -> anyhow::Result<()> {
     let settings: Arc<Mutex<Settings>> = Arc::new(Mutex::new(core::settings::load()));
     core::settings::set_global_settings(Arc::clone(&settings));
 
+    // 建立主线程(iced) ↔ Win32 工作线程的跨线程通道
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ui::iced_proto::IcedCommand>();
+    let (gui_tx, gui_rx) = crossbeam_channel::unbounded::<ui::iced_proto::GuiEvent>();
+    let _ = ICED_CMD_TX.set(cmd_tx);
+    common::debug_log("main：iced 通道已建立（cmd_tx/gui_rx）");
+
+    // iced 暗色判定（主线程 iced 主题用；Win32 工作线程内部会自行解析同源设置）
+    let gui_dark = {
+        let s = settings.lock().ok().map(|g| *g).unwrap_or_default();
+        let sysdark = ui::theme::detect_system_dark();
+        s.theme == ThemeMode::Dark || (s.theme == ThemeMode::System && sysdark)
+    };
+
+    // Win32 消息泵移入工作线程：winit 0.30 要求 iced 事件循环必须在进程主线程创建/运行，
+    // 故 iced 跑主线程、隐藏窗口/热键/覆盖层/托盘/事件监听跑独立 Win32 线程。
+    std::thread::Builder::new()
+        .name("wintag-win32".to_string())
+        .spawn(move || {
+            common::debug_log("=== Win32 工作线程启动 ===");
+            let result = run_win32_worker(no_tray, gui_rx);
+            match &result {
+                Ok(()) => common::debug_log("=== Win32 工作线程结束（WM_QUIT 退出流）==="),
+                Err(e) => common::debug_log(&format!("=== Win32 工作线程出错: {e:?} ===")),
+            }
+            // 主线程阻塞在 iced，进程退出统一由本线程结束触发
+            std::process::exit(0);
+        })?;
+
+    // 主线程运行 iced daemon（winit 要求主线程创建/运行事件循环；阻塞至此）
+    common::debug_log("=== 主线程启动 iced daemon ===");
+    let result = iced::daemon(
+        ui::iced_app::WinTagApp::title,
+        ui::iced_app::WinTagApp::update,
+        ui::iced_app::WinTagApp::view,
+    )
+    .subscription(ui::iced_app::WinTagApp::subscription)
+    .theme(ui::iced_app::WinTagApp::theme)
+    .run_with(move || ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark));
+    match &result {
+        Ok(()) => common::debug_log("=== iced daemon 返回 Ok ==="),
+        Err(e) => common::debug_log(&format!("=== iced daemon 返回 Err: {e:?} ===")),
+    }
+    result.map_err(|e| anyhow::anyhow!("iced 启动失败: {e}"))?;
+    Ok(())
+}
+
+/// Win32 工作线程主体：隐藏窗口 + 覆盖层 + 托盘 + 热键 + WinEvent + 消息泵
+///
+/// 由于 winit 0.30 要求 iced 事件循环必须在进程主线程创建/运行，故 iced 跑在主线程；
+/// 原本挂在主线程的 Win32 消息泵（隐藏窗口热键/覆盖层/托盘/timer/WinEvent）整体移入
+/// 本工作线程。窗口与消息均为线程亲和，各线程各跑各的窗口，互不干扰：经
+/// [`send_iced`] 发命令、经 `pump_background_events` 轮询 `gui_rx` 收 iced 事件。
+/// 返回 `Ok` 即收到 WM_QUIT 退出流（调用方随后 `process::exit(0)`）。
+fn run_win32_worker(
+    no_tray: bool,
+    gui_rx: crossbeam_channel::Receiver<ui::iced_proto::GuiEvent>,
+) -> anyhow::Result<()> {
     // 创建隐藏窗口（热键 + 覆盖层管理 + WinEvent 消息中转）
     let hwnd = create_hidden_window()?;
 
@@ -160,9 +217,9 @@ fn main() -> anyhow::Result<()> {
     sys::overlay::set_message_target(hwnd.0 as isize);
 
     // 解析并注入主题：按配置主题 + 系统深浅色解析调色板并应用到隐藏窗口。
-    // 面板/设置窗口在各自 WM_CREATE 中读取同一全局调色板（theme_colors），
-    // 此处先 set_theme 保证创建期 WM_CTLCOLOR* 取到正确配色。
-    let cfg = settings.lock().ok().map(|guard| *guard).unwrap_or_default();
+    let cfg = core::settings::global_settings()
+        .and_then(|s| s.lock().ok().map(|guard| *guard))
+        .unwrap_or_default();
     let system_dark = ui::theme::detect_system_dark();
     let colors = ui::theme::resolve_colors(cfg.theme, system_dark);
     ui::theme::set_theme(colors);
@@ -173,51 +230,18 @@ fn main() -> anyhow::Result<()> {
     let _ = ui::theme::apply_dark_mode(hwnd, dark);
     let _ = ui::theme::apply_corner_preference(hwnd, cfg.corner);
 
-    // 注入 tooltip 配色与标题条显示开关（Mutex/AtomicBool 可热更新：
-    // reapply_theme 在设置保存广播后重新注入，新内容即时采用新配色/开关）
-    // D27 G1：原生层偏好一次性注入（覆盖层/tooltip/托盘气泡共用一份 NativePrefs，
-    // 替代散落的 set_show_title/set_badge_always_top/set_tooltip_theme/set_balloon_enabled）
+    // D27 G1：原生层偏好一次性注入（覆盖层/tooltip/托盘气泡共用一份 NativePrefs）
     sys::native_prefs::set_native_prefs(apply_native_prefs(cfg, system_dark));
 
-    // D27：启动 iced 线程（四个 GUI 窗口的宿主，阶段 G0 仅退出确认窗）。
-    // 主线程与 iced 线程经一对 crossbeam 通道双向通信：主线程发 IcedCommand、
-    // iced 线程回 GuiEvent，契约见 ui::iced_proto。iced 以独立线程跑
-    // `iced::daemon`，主线程 Win32 消息泵不受影响；线程退出随进程结束。
-    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ui::iced_proto::IcedCommand>();
-    let (gui_tx, gui_rx) = crossbeam_channel::unbounded::<ui::iced_proto::GuiEvent>();
-    let gui_dark = dark;
-    let _ = std::thread::Builder::new()
-        .name("wintag-gui".to_string())
-        .spawn(move || {
-            let result = iced::daemon(
-                ui::iced_app::WinTagApp::title,
-                ui::iced_app::WinTagApp::update,
-                ui::iced_app::WinTagApp::view,
-            )
-            .subscription(ui::iced_app::WinTagApp::subscription)
-            .theme(ui::iced_app::WinTagApp::theme)
-            .run_with(move || ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark));
-            if let Err(err) = result {
-                eprintln!("[iced] 启动失败: {err:?}");
-            }
-        });
-    // 登记主线程侧发送端，供 request_exit 等按需向 iced 线程发送命令
-    let _ = ICED_CMD_TX.set(cmd_tx);
-
     // 安装 WinEvent 事件监听：绑定隐藏窗口为转发目标，事件经 WM_APP_WINEVENT 分发。
-    // _winevent_hooks 作为 main 局部变量存活至退出，Drop 时自动注销 hook
-    // （下划线前缀：值不再被读取，仅借 Drop 生命周期保活）。
+    // _winevent_hooks 作为本线程局部变量存活至退出，Drop 时自动注销 hook。
     sys::win_event::bind_hidden(hwnd);
     let _winevent_hooks = sys::win_event::install()?;
 
     // 注册全局热键
     hotkey::register_all(hwnd)?;
 
-    // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式
-    // （概览面板/热键/设置均不受影响）。D26 由 tray-icon 承担，事件经
-    // crossbeam channel 投递，由下方消息循环 try_recv 轮询分发。
-    // TrayIcon 参考计数、最后实例 drop 时自动从系统托盘移除；以 main 局部
-    // 变量持有至进程退出（退出流经 WM_QUIT 循环退出后即 drop）。
+    // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式。
     let _tray = if !no_tray {
         Some(sys::tray::create_tray()?)
     } else {
@@ -225,16 +249,12 @@ fn main() -> anyhow::Result<()> {
     };
 
     // 兜底轮询定时器：捕获 WinEvent 事件丢失 / 最小化窗口可见性误判
-    // SAFETY: SetTimer 在消息循环前调用，hwnd 为存活窗口；失败仅返回 0，忽略即可
-    // （事件驱动同步仍是主路径）。
+    // SAFETY: SetTimer 在消息循环前调用，hwnd 为存活窗口；失败仅返回 0，忽略即可。
     unsafe {
         let _ = SetTimer(hwnd, TIMER_POLL_OVERLAYS, 500, None);
     }
 
     // 启动气泡：托盘创建成功后经一次性定时器（1500ms）推迟到消息循环就绪后弹出。
-    // 直接 NIM_MODIFY 常被 shell 在图标注册初期丢弃；延迟到循环内再弹更稳，
-    // WM_TIMER 收到 TIMER_BALLOON 时 KillTimer 转为一次性。开关判定复用
-    // sys::tray 纯函数（--no-tray 或配置关闭气泡时跳过）。
     if sys::tray::should_show_balloon(no_tray, cfg.show_balloon) {
         // SAFETY: hwnd 为存活隐藏窗口；SetTimer 失败返回 0，忽略（气泡丢失非致命）。
         unsafe {
@@ -647,8 +667,11 @@ fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
 /// 跨线程命令经 `ICED_CMD_TX` 发送（仅主线程调用）；iced 线程退出/通道断开时
 /// `send` 返回 Err，静默忽略不影响主线程消息泵。
 fn send_iced(cmd: crate::ui::iced_proto::IcedCommand) {
+    common::debug_log(&format!("main::send_iced -> {cmd:?}"));
     if let Some(tx) = ICED_CMD_TX.get() {
         let _ = tx.send(cmd);
+    } else {
+        common::debug_log("main::send_iced 失败：ICED_CMD_TX 未注入");
     }
 }
 
