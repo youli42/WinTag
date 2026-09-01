@@ -569,3 +569,54 @@ fn test_tag_store_large_hwnd() {
     assert!(matcher::find_tag(&store, max_hwnd).is_some());
     assert!(matcher::find_tag(&store, isize::MIN).is_none());
 }
+
+// ============================================================
+// D27 iced 协议层跨线程契约（Send/Debug/Clone）
+// ============================================================
+
+#[test]
+fn test_iced_proto_variants_send_debug_clone() {
+    use wintag::ui::iced_proto::{GuiEvent, IcedCommand, TagRow};
+
+    fn assert_send<T: Send + std::fmt::Debug>() {}
+    assert_send::<IcedCommand>();
+    assert_send::<GuiEvent>();
+    assert_send::<TagRow>();
+
+    let tag = Tag {
+        title: "t".to_string(),
+        note: "n".to_string(),
+        color: TagColor::Orange,
+        window_title: "w".to_string(),
+        process_name: "p".to_string(),
+    };
+    let cmd = IcedCommand::EditTag {
+        target: 1,
+        position: (2, 3),
+        tag: tag.clone(),
+    };
+    let _ = format!("{cmd:?}");
+    let _ = cmd.clone();
+
+    let ev = GuiEvent::TagSaved { target: 1, tag };
+    let _ = format!("{ev:?}");
+    let _ = ev.clone();
+}
+
+#[test]
+fn test_iced_proto_plan_popup_action() {
+    use wintag::ui::iced_proto::{plan_popup_action, PopupPlan};
+    assert_eq!(plan_popup_action(None, 100, true), PopupPlan::Fresh);
+    assert_eq!(
+        plan_popup_action(Some((98, 42)), 100, false),
+        PopupPlan::Fresh
+    );
+    assert_eq!(
+        plan_popup_action(Some((100, 42)), 100, true),
+        PopupPlan::Reuse(42)
+    );
+    assert_eq!(
+        plan_popup_action(Some((150, 42)), 100, true),
+        PopupPlan::Replace(42)
+    );
+}
