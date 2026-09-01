@@ -3,27 +3,57 @@
 ## 分层架构
 
 ```
-┌─────────────────────────────────────────┐
-│              UI Layer (ui/)              │
-│  ┌──────────┐  ┌────────────────────┐   │
-│  │  panel   │  │      popup         │   │
-│  │ 概览面板  │  │  悬浮便签浮窗        │   │
-│  └──────────┘  └────────────────────┘   │
-├─────────────────────────────────────────┤
-│          Data Core Layer (core/)         │
+┌──────────────────────────────────────────┐
+│         UI Layer (ui/) — iced 线程        │
+│  ┌──────────┬──────────┬───────────────┐ │
+│  │  panel   │  popup   │ settings/confirm│
+│  │ 概览面板  │ 标签弹窗  │ 设置/退出确认   │ │
+│  │ (iced)   │ (iced)   │ (iced)        │ │
+│  └──────────┴──────────┴───────────────┘ │
+│  iced_proto.rs（IcedCommand / GuiEvent）  │
+├──────────────────────────────────────────┤
+│          Data Core Layer (core/)          │
 │  ┌──────────┐  ┌────────────────────┐    │
 │  │   tag    │  │      matcher       │    │
 │  │ 数据结构  │  │  窗口句柄匹配       │    │
 │  └──────────┘  └────────────────────┘    │
-├─────────────────────────────────────────┤
-│        System Service Layer (sys/)       │
-│  ┌──────────┐  ┌────────────────────┐   │
-│  │  window  │  │     overlay        │   │
-│  │ 窗口监听  │  │  透明覆盖层绘制      │   │
-│  └──────────┘  └────────────────────┘   │
-│       windows-rs (Win32 API)            │
-└─────────────────────────────────────────┘
+├──────────────────────────────────────────┤
+│        System Service Layer (sys/)        │
+│  ┌──────────┐  ┌────────────────────┐    │
+│  │  window  │  │     overlay        │    │
+│  │ 窗口监听  │  │  透明覆盖层绘制      │    │
+│  │  win_event│  │     （角标/title）  │    │
+│  └──────────┘  └────────────────────┘    │
+│       windows-rs (Win32 API)             │
+└──────────────────────────────────────────┘
 ```
+
+说明：D27 起 `ui/` 的四个 GUI 窗口（panel/popup/settings/confirm）改由 **iced** 在独立线程承担；`sys/overlay`、`sys/tray`、`sys/win_event`、`hotkey` 与 `main.rs` 的 Win32 消息泵**保持纯 Win32 不变**（在外部窗口上打标的核心能力无法用 iced 表达）。
+
+## 线程模型（D27）
+
+```
+主线程（不变）：GetMessageW 消息泵
+ ├─ 隐藏窗口 WndProc（热键/覆盖层/WinEvent/退出流）
+ ├─ sys::win_event / sys::overlay / hotkey / sys::tray（原生，仅与主线程对话）
+ ├─ pump_background_events(hwnd)：单一阶段收拢 tray×2 + iced×1 的 try_recv
+ └─ reapply_theme：原生覆盖层经 NativePrefs 重注入 + 发 IcedCommand::ApplyTheme
+
+GUI 线程（新增 std::thread）：iced_app.run()
+ ├─ 多窗口 window0=panel / window1=settings / window2=popup / window3=confirm
+ ├─ subscription：from_main_rx.unfold() → IcedCommand
+ ├─ update 产出 GuiEvent → 发送器回主线程
+ └─ theme：ThemeMode+system_dark → iced Theme（继承现有橙强调色）
+```
+
+跨线程通信经 `src/ui/iced_proto.rs` 的纯协议层（`IcedCommand` 主→iced、`GuiEvent` iced→主）。**对外通道全项目仅 3 条且不可再减**：Win32 消息泵（原生覆盖层/热键/托盘必需）、tray-icon 两接收器（crate 强制）、iced 收发一对（跨线程必需）。**托盘不绕 iced、iced 不拥有 overlay/tray/hotkey**；后续窗口都复用同一对 `IcedCommand`/`GuiEvent`，不新增 channel。`TagStore`/`Settings` 以 `Arc<Mutex>` 共享。
+
+### 原生层注入收敛（D27）
+
+为消除 sys 层「改一条偏好要同步改 N 个 setter」的漂移，原生层注入由 7 个 `set_*` 收敛为两处、各注入一次：
+
+- **`NativePrefs`**（纯值结构）：`show_title` / `badge_always_top` / `tooltip_theme` / `balloon_enabled`，主线程于启动与 `reapply_theme` 时一次性写入；替代 `set_show_title`/`set_badge_always_top`/`set_tooltip_theme`/`set_balloon_enabled`。
+- **`NativeBridge`**（回传能力）：封装覆盖层「上报 edit_tag / 激活窗口」的事件出口，替代 `set_message_target`/`set_tag_store` 的单向注入；由主线程持有、按需向 iced 线程转发。
 
 ## 依赖方向
 
@@ -31,7 +61,7 @@
 ui → core → sys
 ```
 
-禁止反向依赖。`sys` 层不感知 `core` 和 `ui`，`core` 层不感知 `ui`。
+禁止反向依赖。`sys` 层不感知 `core` 和 `ui`，`core` 层不感知 `ui`。`ui/iced_proto.rs` 为叶子纯协议层（无 iced/Win32 依赖），供主线程与 iced 线程共用。
 
 ## 模块职责
 
@@ -54,11 +84,11 @@ ui → core → sys
 - 处理高 DPI 缩放 (`GetDpiForWindow`)
 - 管理覆盖层生命周期（创建/销毁/隐藏）
 
-#### tray.rs（规划中，D22）
-- 系统托盘图标（`Shell_NotifyIcon` + `NOTIFYICONDATAW`），`uCallbackMessage=WM_APP+8`
-- 左键单击 → 打开设置页（经 `WM_APP_OPEN_SETTINGS`），右键 `TrackPopupMenu`（打开设置/概览面板/退出）
-- 用 `TrayCommand` 枚举返回命令、由 main 接 ui，保持 `ui→core→sys` 依赖方向
-- 图标所有权：Shell 不接管 `hIcon`，自加载的在 `NIM_DELETE` 后 `DestroyIcon`；`TaskbarCreated` 广播重新 `NIM_ADD`
+#### tray.rs（D24 落地，D26 底层迁至 tray-icon）
+- 系统托盘图标：`TrayIconBuilder` + `Menu(MenuItem)`（tray-icon/tauri），图标取自嵌入资源 `assets/icon.ico`（winresource ID=1）
+- 事件经 `TrayIconEvent`/`MenuEvent` crossbeam channel 由主线程 `try_recv` 轮询分发；左键单击打开概览面板、右键四项菜单（打开概览面板/设置页/快速标记/退出）
+- 启动气泡经 `notify-rust`（Windows TOAST），开关 `show_balloon` 由主线程注入
+- `TrayCommand` 纯逻辑层（`icon_event_to_command`/`menu_id_to_command`，零 Win32）供单测；main 接 ui，保持 `ui→core→sys` 依赖方向
 
 ### core/ — 数据核心层
 
@@ -85,26 +115,32 @@ ui → core → sys
 - 窗口句柄失效时自动清理对应标签
 - 简洁的 HashMap 存储，无状态外溢
 
-### ui/ — 用户界面层
+### ui/ — 用户界面层（D27：四窗迁至 iced，独立线程）
 
-负责所有用户可见的界面元素。
+自 `D27` 起，四个 GUI 窗口改由 **iced**（`tiny-skia` 软件渲染器）在独立线程渲染，不再手写 Win32 窗口类 / `WM_CTLCOLOR*` / `WM_DRAWITEM` / `BS_OWNERDRAW` 自绘 / 子类化。`ui/button.rs`（自绘圆角按钮）与 `ui/layout.rs`（DPI 缩放）整体删除（iced 自管 DPI 与主题）。
 
-#### panel.rs
-- 全局概览面板主窗口
-- 列表/网格展示所有已标记窗口
-- 搜索过滤功能
-- 双击/点击跳转到对应窗口
+#### iced_proto.rs（纯协议层，无 iced/Win32 依赖）
+- `IcedCommand`（主线程 → iced 线程）：`ShowPanel` / `HidePanel` / `OpenSettings` / `EditTag{target, position, title, note, color}` / `RefreshTags` / `ApplyTheme{dark, accent}` / `ShowConfirm{count}` / `CloseConfirm`
+- `GuiEvent`（iced 线程 → 主线程）：`TagSaved{target, tag}` / `SettingsChanged` / `EditTagRequested` / `ActivateWindow` / `RemoveTag` / `ExpandAll` / `CollapseAll` / `ConfirmExit` / `CancelExit` / `PanelVisibilityChanged`
 
-#### popup.rs
-- 悬浮便签浮窗
-- 鼠标悬停触发显示
-- 提供编辑/删除按钮
-- 自动跟随标记位置
+#### iced_app.rs
+- `iced::Application` 实现 + 多窗口管理（panel / settings / popup / confirm）
+- `subscription` 经 `from_main_rx.unfold()` 消费 `IcedCommand`，`update` 产出 `GuiEvent` 回主线程
+
+#### panel.rs（iced）
+- 概览面板：搜索框 + 标签列表（点击/回车置前目标窗口、展开显示完整备注）+ 全部展开/收起 + 退出按钮 + 右键 置前/编辑/移除
+
+#### popup.rs（iced）
+- 标签编辑弹窗：标题/备注输入、5 颜色块、确认/取消；`window::Position::Specific(position)` 光标附近定位 + 预填聚焦标题
+
+#### settings.rs（iced）
+- 设置页：主题/圆角下拉框 + 角标显示标题/始终置顶/气泡提示复选框 + 保存/取消；保存发 `GuiEvent::SettingsChanged`
+
+#### confirm.rs（iced）
+- 退出确认弹窗：消息文本 + 退出/取消按钮；回车确认、Esc 取消、Tab 循环焦点；确认发 `GuiEvent::ConfirmExit`
 
 #### charts.rs（规划中，D23）
-- 统计图表独立窗口（GDI 柱状图），纯函数 `bar_layout()` 可单测
-- 刷新链镜像面板（`WM_APP_TAGS_CHANGED` 仅可见时转发）
-- 默认假设：按分组计数柱状图（与 R19 分组契合，待确认形态）
+- 统计图表独立窗口（柱状图），纯函数 `bar_layout()` 可单测；默认假设：按分组计数柱状图（与 R19 分组契合，待确认形态）
 
 ### hotkey.rs
 - 注册全局热键 (`RegisterHotKey`)

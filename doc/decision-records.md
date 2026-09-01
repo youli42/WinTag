@@ -560,3 +560,37 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
   - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（新增 4 个托盘单测用例）。
 
 ---
+
+## D27：四个 GUI 窗口迁至 iced（tiny-skia 渲染器 + 独立线程 channel 通信，2026-09-01）
+
+- **决策**：把 `ui/panel`（概览面板）、`ui/popup`（标签编辑弹窗）、`ui/settings`（设置页）、`ui/confirm`（退出确认）四个**自绘 Win32 窗口**迁至 [iced](https://github.com/iced-rs/iced)（`tiny-skia` 软件渲染器），用其声明式 widget + 主题 + 高 DPI 取代手写的 `WNDCLASSW`/`CreateWindowExW`/`WM_CTLCOLOR*`/`WM_DRAWITEM`/`BS_OWNERDRAW` 自绘/子类化/控件布局。**其余层面保持纯 Win32 不变**：
+  - `sys/overlay`（透明覆盖层/角标/标题条/tooltip）、`sys/tray`（托盘）、`sys/win_event`、`sys/window`、`hotkey`、`main.rs` Win32 消息泵——**均不迁移**；
+  - 架构改为 **iced 跑在独立线程、主线程保留 `GetMessageW` 消息泵，二者经 crossbeam channel 双向通信**（镜像 D26 `tray-icon` 的 channel 轮询模式）；
+  - `ui/button.rs`、`ui/layout.rs` 整体删除；`ui/theme.rs` 拆分为「纯调色板常量（留供覆盖层注入 + iced 主题映射）+ DWM `apply_dark_mode`/`apply_corner_preference`（保留给原生覆盖层/隐藏窗口）」；
+  - **机制收敛（总线最小化）**：为约束「跨线程/跨层接口不随迁入 iced 而膨胀」，D27 同时落地四条约束——① 7 个 `set_*` 注入 setter（`set_tag_store`/`set_message_target`/`set_tooltip_theme`/`set_show_title`/`set_badge_always_top`/`set_balloon_enabled`/`set_global_settings`）收敛为**一个 `NativePrefs` 纯值结构**（`show_title`/`badge_always_top`/`tooltip_theme`/`balloon_enabled`）+ **一个 `NativeBridge`**（封装覆盖层「上报 edit_tag / 激活窗口」的回传能力），主线程一次性注入，消除「改一条 UI 偏好要同步改 N 个 setter」的牵连；② 主循环散落的 `try_recv`（tray×2 + iced×1）收进**单一 `pump_background_events(hwnd)` 阶段**，循环体读起来是「来源 → action」一张表；③ **托盘不绕 iced**：托盘是原生层、只与主线程对话，iced 只管理四个面板，二者不直连、iced 不拥有 overlay/tray/hotkey；④ iced 侧**不镜像 `WM_APP_*` 的 UI 消息**——原生消息只负责「进主循环」，出主循环一律走 iced channel，同一条消息只有一个出口、不双写。
+- **背景**：WinTag 的 GUI 由四套手写 Win32 窗口构成，合计约 4000 行（panel 1511 / popup 1111 / settings 965 / confirm 469）+ `button.rs` 401 + `theme.rs` 624。每一套都重复实现窗口类注册、`WM_CREATE` 建子控件、`WM_CTLCOLOR*` 配色、`WM_ERASEBKGND` 背景、`WM_GETMINMAXINFO` 固定尺寸、`WM_DRAWITEM` 自绘（按钮/颜色块/下拉框）、Tab/Esc/回车键盘语义、DPI 缩放（`ui::layout::dp`）。这种「一窗一个 WndProc 全手写」的模式，在 D11-D25 期间**每一轮都要跨四窗重复修相同的问题**（D18 配色 `wParam`/`lParam` 误用、D25 客户区高度漏扣、dark-mode 控件变体 `apply_control_theme` 四处调用）。iced 恰好把这类样板收敛为声明式 widget，并补上目前四窗缺少的现代能力（文本自适应、平滑滚动、可移植主题）。
+- **备选方案**：
+  1. **egui/eframe**（否决）：D1 已明确移除 egui；egui 即时模式对「树形面板/搜索框/下拉框」的控件语义不如 elm-architecture 的 iced 清晰，且即时模式与 Win32 原生窗口共存时易重绘漂移；
+  2. **tauri + WebView**（否决）：引入完整前端链，对 4 个面板过重，与 WinTag「轻量常驻 + 零浏览器进程」定位冲突；`--no-tray` 纯命令行模式也不应背着 WebView；
+  3. **winit + softbuffer**（否决）：只换窗口壳，仍要手写全部 widget/样式/布局，不解决重复劳动根因；
+  4. **继续手写（纯重构收口）**（否决）：即便把 theme/layout/button 收口成共享工具，四个窗口仍是 4000+ 行手写 WndProc，D18/D25 那类跨窗同病仍会复发；
+  5. **iced 全量替换**（否决）：覆盖层/托盘/热键/事件监听无法用 iced 表达（iced/winit 整窗模型无法在外部窗口上做逐像素透明层——正是 D1 否决 winit 的理由）；`Application::run` 自带消息泵会与现有 `GetMessageW` 主循环冲突；
+  6. **iced 跑独立线程 + channel（采纳）**：只移植四窗，复用 D26 已验证的跨线程 channel 分发模式。
+- **理由**：
+  1. **边界干净**：覆盖层/托盘/热键/事件监听是「在外部窗口上打标」的产品核心，必须留在 Win32；四窗是纯「模态/常驻窗口」，与 iced 控件语义一一对应。边界正好落在「是否需要贴目标窗口」；
+  2. **命中重复痛点**：D11-D25 每次修复都在四窗重复铺开，iced 一次消灭这类样板代码；后续 D23 的「分组下拉/快捷键录制/图表」可直接用 iced 控件实现；
+  3. **线程冲突可控**：`Application::run` 阻塞一个线程，主线程消息泵不受影响；`TagStore`/`Settings` 已是 `Arc<Mutex>`（Send），跨线程安全；channel 协议与 D26 `TrayCommand` 纯逻辑层同构；
+  4. **性能匹配**：四窗为低频交互窗口，`tiny-skia` 无 GPU 初始化、二进制小、无 wgpu 设备枚举，适合常驻托盘工具；
+  5. **保留 D1 的有效部分**：D1 否决 winit 的三条理由针对覆盖层与消息泵；迁四窗并不违背其精神，overlay/tray/win_event/hotkey/main 消息泵仍是纯 Win32。
+- **影响与后续跟进**：
+  - `Cargo.toml` 增 `iced`（`tiny-skia` renderer，版本按 MSRV 与稳定版校验后定稿）与 `crossbeam-channel`（已随 tray-icon 传递，补显式声明；与项目 `windows 0.58`、tray-icon 的 `windows-sys 0.61` 两套 Win32 绑定并存，无运行时冲突）；
+  - 新增 `src/ui/iced_proto.rs`：纯协议层（无 iced/Win32 依赖），`IcedCommand`（主→iced：`ShowPanel`/`HidePanel`/`OpenSettings`/`EditTag`/`RefreshTags`/`ApplyTheme`/`ShowConfirm`/`CloseConfirm`）与 `GuiEvent`（iced→主：`TagSaved`/`SettingsChanged`/`EditTagRequested`/`ActivateWindow`/`RemoveTag`/`ExpandAll`/`CollapseAll`/`ConfirmExit`/`CancelExit`/`PanelVisibilityChanged`）；`Tag`/`Settings`/`TagColor` 均 `Clone+Send` 可跨线程；
+  - 新增 `src/ui/iced_app.rs`：`iced::Application` 实现 + 多窗口（panel/settings/popup/confirm），`subscription` 经 `from_main_rx.unfold()` 消费 `IcedCommand`，`update` 产出 `GuiEvent` 经发送器回主线程；
+  - `main.rs`：删 `PANEL_HWND`/`settings_hwnd`/`ensure_settings_window`/`toggle_settings` 的窗口句柄路径，改由「面板/设置可见状态 + 发送 IcedCommand」；`handle_quick_tag`/`WM_APP_EDIT_TAG`/托盘 `QuickTag` 的 `create_popup` 改为发 `EditTag`（`clamp_to_work` 光标定位保留在主线程计算）；`WM_APP_TAGS_CHANGED` 改发 `RefreshTags`；`poll_tray_events`/`dispatch_tray_command`/`handle_winevent` 的 UI 出口改 `tx_iced.send(...)`；`reapply_theme` 在原生覆盖层重注入外补发 `ApplyTheme`；新增 `pump_background_events(hwnd)`（收拢 tray×2 + iced×1 的 `try_recv`，替代原 `poll_tray_events`；后续 D23 若加图表/快捷键窗口，均复用同一对 `IcedCommand`/`GuiEvent`，**不新增 channel**）；
+  - `request_exit` 的 `create_confirm` → `ShowConfirm{count}`；`ConfirmExit` 回主线程走既有 `WM_APP_EXIT(wParam=1)` 退出流（复用 `should_confirm_exit`）；
+  - 删除 `src/ui/button.rs`、`src/ui/layout.rs`；`ui/theme.rs` 拆分（纯调色板 `light_colors`/`dark_colors`/`blend` 留作覆盖层 `set_tooltip_theme` 注入 + iced 主题映射；DWM `apply_*` 保留）；sys 层注入点收敛为 `NativePrefs`/`NativeBridge` 各一次；
+  - **回归面**：Tab 循环、Esc 取消、回车保存/确认、颜色块选择、树形列表展开、右键 置前/编辑/移除——迁到 iced 后是**行为重写**而非逐行搬运，需在 `tests/smoke.rs` 与手动验收单逐项覆盖；
+  - `doc/architecture.md` 按「一层 UI 由 iced 承担 + 覆盖层/托盘仍由 sys 层 Win32 承担」更新分层图与模块职责；`doc/iced-migration.md` 新增**分阶段执行方案**（里程碑、逐阶段任务、文件级改动、验证门禁、可维护性约定）；`AGENTS.md` 同步；
+  - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（本决策仅登记设计；分阶段实施见 `doc/iced-migration.md`）。
+
+---
