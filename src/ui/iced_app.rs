@@ -166,6 +166,8 @@ pub enum Message {
     PopupSavePressed,
     /// 取消（点击"取消" / Esc / 关闭窗口）
     PopupCancelPressed,
+    /// 回车（全局键盘：确认窗=确认退出，设置窗=保存；弹窗输入框已用 on_submit）
+    EnterPressed,
     // ---- 概览面板交互 ----
     /// 搜索框内容变更
     PanelSearchChanged(String),
@@ -352,6 +354,19 @@ impl WinTagApp {
                     Task::none()
                 }
             }
+            // 回车：确认窗=确认退出；设置窗=保存；弹窗输入框已用 on_submit 提交，不重复处理。
+            Message::EnterPressed => {
+                if self.confirm.is_some() {
+                    let _ = self.gui_tx.send(GuiEvent::ConfirmExit);
+                    return self.close_confirm();
+                }
+                if self.settings.is_some() {
+                    let draft = self.settings.as_ref().map(|s| s.draft).unwrap_or_default();
+                    let _ = self.gui_tx.send(GuiEvent::SettingsChanged(draft));
+                    return self.close_settings();
+                }
+                Task::none()
+            }
             // ---- 概览面板 ----
             Message::PanelSearchChanged(s) => {
                 if let Some(p) = &mut self.panel {
@@ -436,7 +451,7 @@ impl WinTagApp {
             search: String::new(),
             expanded: HashSet::new(),
         });
-        open.map(|_| Message::Noop)
+        Task::batch([open.map(|_| Message::Noop), window::gain_focus(id)])
     }
 
     /// 隐藏概览面板（关闭窗口；其后 WindowClosed 会上报 PanelVisibilityChanged(false)）
@@ -460,6 +475,10 @@ impl WinTagApp {
 
     /// 打开退出确认窗（居中 + 定尺寸；返回驱动窗口创建的 Task）
     fn open_confirm(&mut self, count: usize) -> Task<Message> {
+        // 已显示：置前聚焦（避免重复开窗，热键触达可见）
+        if let Some(c) = &self.confirm {
+            return window::gain_focus(c.id);
+        }
         let message = format!("确定退出？将丢弃 {count} 个标签/便签");
         let (id, open) = window::open(window::Settings {
             position: window::Position::Centered,
@@ -468,7 +487,7 @@ impl WinTagApp {
             ..window::Settings::default()
         });
         self.confirm = Some(ConfirmState { id, message });
-        open.map(|_| Message::Noop)
+        Task::batch([open.map(|_| Message::Noop), window::gain_focus(id)])
     }
 
     /// 关闭确认窗（并将其从状态移除；`window::close` 返回关闭任务）
@@ -482,6 +501,10 @@ impl WinTagApp {
 
     /// 打开设置窗：读全局设置快照预填表单并创建设置窗口
     fn open_settings(&mut self) -> Task<Message> {
+        // 已显示：置前聚焦（避免重复开窗，热键触达可见）
+        if let Some(sw) = &self.settings {
+            return window::gain_focus(sw.id);
+        }
         let cfg = crate::core::settings::global_settings()
             .and_then(|s| s.lock().ok().map(|guard| *guard))
             .unwrap_or_default();
@@ -505,7 +528,7 @@ impl WinTagApp {
                 CornerPreference::SmallRound,
             ]),
         });
-        open.map(|_| Message::Noop)
+        Task::batch([open.map(|_| Message::Noop), window::gain_focus(id)])
     }
 
     /// 关闭设置窗
@@ -572,6 +595,7 @@ impl WinTagApp {
         Task::batch([
             open.map(|_| Message::Noop),
             text_input::focus::<Message>(title_id),
+            window::gain_focus(id),
         ])
     }
 
@@ -643,10 +667,18 @@ impl WinTagApp {
                 None
             }
         });
+        let enter_sub = iced::keyboard::on_key_press(|key, _modifiers| {
+            if key == Key::Named(Named::Enter) {
+                Some(Message::EnterPressed)
+            } else {
+                None
+            }
+        });
         Subscription::batch([
             cmd_sub,
             window::close_events().map(Message::WindowClosed),
             esc_sub,
+            enter_sub,
         ])
     }
 }

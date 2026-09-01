@@ -90,6 +90,25 @@ fn apply_native_prefs(cfg: Settings, system_dark: bool) -> sys::native_prefs::Na
     }
 }
 
+/// 读取系统中文字体字节（供 iced 加载以渲染 CJK 字形，避免方块）
+///
+/// iced/cosmic-text 默认字体不含 CJK 字形，中文显示为方块（tofu）。此处按
+/// 常见系统字体路径取微软雅黑（.ttc）等，交给 `iced::daemon(...).font(...)`
+/// 注册为应用字体；失败时返回空（中文仍可能为方块，但程序功能不受影响）。
+fn load_cjk_font() -> Vec<u8> {
+    for path in [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyhl.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            return bytes;
+        }
+    }
+    Vec::new()
+}
+
 fn main() -> anyhow::Result<()> {
     // 命令行参数处理（D22/R1）：`--config-dir` 由 core::settings::config_root()
     // 解析链消费（内部读取 args_os 并 memoize，见 settings.rs）；`--no-tray`
@@ -161,10 +180,20 @@ fn main() -> anyhow::Result<()> {
         .name("wintag-win32".to_string())
         .spawn(move || {
             common::debug_log("=== Win32 工作线程启动 ===");
-            let result = run_win32_worker(no_tray, gui_rx);
-            match &result {
-                Ok(()) => common::debug_log("=== Win32 工作线程结束（WM_QUIT 退出流）==="),
-                Err(e) => common::debug_log(&format!("=== Win32 工作线程出错: {e:?} ===")),
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_win32_worker(no_tray, gui_rx)
+            }));
+            match result {
+                Ok(Ok(())) => common::debug_log("=== Win32 工作线程结束（WM_QUIT 退出流）==="),
+                Ok(Err(e)) => common::debug_log(&format!("=== Win32 工作线程出错: {e:?} ===")),
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "未知 panic".to_string());
+                    common::debug_log(&format!("=== Win32 工作线程 PANIC: {msg} ==="));
+                }
             }
             // 主线程阻塞在 iced，进程退出统一由本线程结束触发
             std::process::exit(0);
@@ -172,11 +201,14 @@ fn main() -> anyhow::Result<()> {
 
     // 主线程运行 iced daemon（winit 要求主线程创建/运行事件循环；阻塞至此）
     common::debug_log("=== 主线程启动 iced daemon ===");
+    let cjk_font_bytes = load_cjk_font();
     let result = iced::daemon(
         ui::iced_app::WinTagApp::title,
         ui::iced_app::WinTagApp::update,
         ui::iced_app::WinTagApp::view,
     )
+    .font(cjk_font_bytes)
+    .default_font(iced::Font::with_name("Microsoft YaHei"))
     .subscription(ui::iced_app::WinTagApp::subscription)
     .theme(ui::iced_app::WinTagApp::theme)
     .run_with(move || ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark));
@@ -286,6 +318,7 @@ fn run_win32_worker(
         if msg.message == WM_HOTKEY {
             let hotkey = hotkey::from_message(msg.message, msg.wParam.0, msg.lParam.0);
             if let Some(hk) = hotkey {
+                common::debug_log(&format!("WM_HOTKEY 命中: {hk:?}"));
                 match hk {
                     hotkey::Hotkey::QuickTag => {
                         handle_quick_tag(Arc::clone(&store_clone), hwnd.0 as isize);
