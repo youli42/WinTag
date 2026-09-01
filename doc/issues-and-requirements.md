@@ -32,7 +32,7 @@
 - **现象**：退出时提示：
   `error: process didn't exit successfully: target\debug\wintag.exe (exit code: 0xc000013a, STATUS_CONTROL_C_EXIT)`
 - **现状**：程序是控制台子系统程序，Ctrl+C 直接触发 CRT 的默认控制台终止处理，未安装
-  `SetConsoleCtrlHandler` 优雅退出路径；WinEvent hook 虽由 Drop 注销，但进程仍以非 0 退出码结束。
+  `SetConsoleCtrlHandler` 优雅退出路径；WinEvent 钩子虽由 Drop 注销，但进程仍以非 0 退出码结束。
 - **期望**：收到 Ctrl+C（`CTRL_C_EVENT`）时执行清理后以 0 退出码正常退出（或至少消除报错）。
 
 ### 4. 悬浮角标内容过长被截断
@@ -90,7 +90,7 @@
 - **9.3 概览面板的表头还是默认不显示**：✅ 已修复。`DarkMode_Explorer` 主题使 SysHeader32 表头暗色可见，`LVS_EX_DOUBLEBUFFER` 消除闪烁。
 - **9.4 按钮都是亮色主题**：✅ 已修复。`src/ui/button.rs` 自绘圆角按钮（`BS_OWNERDRAW` + `WM_DRAWITEM`），accent/secondary 两档样式，hover/pressed 状态。
 - **9.5 侧边进度条还是亮色主题**：✅ 已修复（尽力而为）。`DarkMode_Explorer` 主题使 ListView 滚动条暗化；EDIT 滚动条随 manifest+v6 大部分生效。
-- **9.6 设置页面和标记页面的布局无法跟随窗口缩放变化**：✅ 已修复。popup/settings 加 `WM_GETMINMAXINFO` 固定尺寸（防缩放错乱）；panel 修 `WM_SIZE` 的 `SWP_NOMOVE` bug + 布局节奏；全部坐标经 `dp()` DPI 缩放。
+- **9.6 设置页面和标记页面的布局无法跟随窗口缩放变化**：✅ 已修复。popup/settings 加 `WM_GETMINMAXINFO` 固定尺寸（防缩放错乱）；panel 修 `WM_SIZE` 的 `SWP_NOMOVE` 缺陷 + 布局节奏；全部坐标经 `dp()` DPI 缩放。
 - **9.7 黑色主题背景过黑，亮色字体太亮**：✅ 已修复。`dark_colors()` 调整为灰黑档（bg `#202020`、fg `#E6E6E6`、edit/tooltip `#2F2F2F`），对比柔和。
 - **9.8 按钮/表格/输入框样式过时（Win7 以前风格）**：✅ 已修复。comctl32 v6 manifest + 自绘圆角按钮 + 扩展调色板 + DarkMode_Explorer，整体现代化（扁平、圆角、现代配色）。
 
@@ -258,7 +258,7 @@
 - **已定位缺口（按优先级）**：
   1. **提权目标 UIPI 拦截事件**（已登记遗留 F4）：`WINEVENT_OUTOFCONTEXT` 钩子收不到提权进程事件 → 事件路径静默，`z` 序也受限（`GetWindowRect`/`IsWindow` 读取不受 UIPI 阻，轮询可兜底）；
   2. **全局单槽合并错杀**（`win_event.rs:187-200`）：事件风暴期任意 pending `WM_APP_WINEVENT` 会跳过新事件投递，可能滞后目标窗口事件（但 sync 时重读当前 rect 天然收敛，非永久卡死）；
-  3. **MOVESIZESTART/END 未利用**（`win_event.rs:60-73`）：`0x000A`/`0x000B` 已在 hook 范围但被 `classify` 忽略——无"移动结束最终同步"；
+  3. **MOVESIZESTART/END 未利用**（`win_event.rs:60-73`）：`0x000A`/`0x000B` 已在钩子范围但被 `classify` 忽略——无"移动结束最终同步"；
   4. **DWM extended frame bounds 拖拽中可能陈旧**（`overlay.rs:347-355` 优先用之，回退仅限失败非陈旧）；
   5. **静默失败无重试**（`overlay.rs:364-366` w/h≤0 早退、`:427-437` SetWindowPos 失败静默）。
 - **规划修复**：`MOVESIZESEND`→新增 `MoveEnd` 动作 → `sync_position_force()`（优先 `GetWindowRect` 避陈旧 DWM）；`MOVESIZESTART`→加速轮询 500→100ms，`MoveEnd` 恢复；非静默日志 + `needs_resync` 标志由 `poll_overlays` 消化。
@@ -305,8 +305,8 @@
 | 2026-08-31 | 扩展规划：新增需求 R18（托盘）、R19（分组/工作区）、R20（图表），登记问题 18-22；确认**分组纯会话不持久化**、**v1 系统图标可接受**、**分组控件置于新建标签弹窗标题下方（可输入或选择已有分组）**；规划归档见下文"四、扩展规划"与 [decision-records.md D21-D23](./decision-records.md) | —（文档规划，无代码提交） |
 | 2026-09-01 | 托盘常驻化（D24）：Windows 子系统 + 单实例保护（守护窗口类）+ 默认托盘常驻零窗口启动 + 启动气泡可开关（show_balloon）+ `--no-tray` 禁用 + 有标签退出弹定制主题确认窗（ui/confirm）+ 托盘右键四项菜单/左键与气泡打开面板 + 面板底部"退出"按钮 + 设置页"气泡提示"开关 | `425303d` feat(tray) |
 | 2026-09-01 | 底部控件客户区裁切修复（D25）：`ui::layout` 新增 `TITLEBAR_H`/`client_height()` 统一从窗口外高抵扣标题栏边框；`confirm`/`popup`/`settings` 底部按钮行改用客户区高度定位，修复退出确认窗"退出/取消"按钮溢出客户区被裁切 | `425303d` fix(ui) |
-| 2026-09-01 | 托盘底层迁移（D26）：托盘自 `Shell_NotifyIconW` 手写迁至 `tray-icon`(tauri)（`TrayIconBuilder`+`Menu(MenuItem)`+嵌入资源图标，事件经 `TrayIconEvent`/`MenuEvent` crossbeam channel 由主循环 `try_recv` 轮询）；气泡由 `NIF_INFO`+`NIM_MODIFY` 迁至 `notify-rust`（Windows TOAST）；`TaskbarCreated` 重注册由 tray-icon 内部接管、删除 `WM_APP_TRAY` 常量；图标取自新增 `assets/icon.ico`（winresource ID=1，`Icon::from_resource`） | —（并行迁移，见 decision-records D26） |
-| 2026-09-01 | GUI 重构登记（D27）：四个 GUI 窗口（panel/popup/settings/confirm）迁至 iced（tiny-skia 软件渲染器 + 独立线程 channel 通信，含总线最小化：`NativePrefs`/`NativeBridge` 收敛 + `pump_background_events` 单一 dispatch 表 + 托盘不绕 iced）、`ui/button`/`ui/layout` 删除、`ui/theme` 拆分；覆盖层/托盘/热键/事件监听与 Win32 消息泵保持纯 Win32 不变（详见 [decision-records.md D27](./decision-records.md)，分阶段执行方案见 [iced-migration.md](./iced-migration.md)） | —（文档登记，未实施） |
+| 2026-09-01 | 托盘底层迁移（D26）：托盘自 `Shell_NotifyIconW` 手写迁至 `tray-icon`(tauri)（`TrayIconBuilder`+`Menu(MenuItem)`+嵌入资源图标，事件经 `TrayIconEvent`/`MenuEvent` crossbeam 通道由主循环 `try_recv` 轮询）；气泡由 `NIF_INFO`+`NIM_MODIFY` 迁至 `notify-rust`（Windows TOAST）；`TaskbarCreated` 重注册由 tray-icon 内部接管、删除 `WM_APP_TRAY` 常量；图标取自新增 `assets/icon.ico`（winresource ID=1，`Icon::from_resource`） | —（并行迁移，见 decision-records D26） |
+| 2026-09-01 | 图形界面重构登记（D27）：四个图形界面窗口（panel/popup/settings/confirm）迁至 iced（tiny-skia 软件渲染器 + 独立线程通道通信，含总线最小化：`NativePrefs`/`NativeBridge` 收敛 + `pump_background_events` 单一分发表 + 托盘不绕 iced）、`ui/button`/`ui/layout` 删除、`ui/theme` 拆分；覆盖层/托盘/热键/事件监听与 Win32 消息泵保持纯 Win32 不变（详见 [decision-records.md D27](./decision-records.md)，分阶段执行方案见 [iced-migration.md](./iced-migration.md)） | —（文档登记，未实施） |
 
 ---
 
@@ -325,9 +325,9 @@
 ### 分阶段路线图
 | 阶段 | 主题 | 独立交付价值 | 覆盖 |
 | :--- | :--- | :--- | :--- |
-| P1 Quick | 稳定 + 地基 | 修好日常 bug（标签跟随移动）；面板变可用；配置路径链 | 问题 18-22、R1 地基 |
-| P2 Short | 托盘 + 可配置 | 托盘常驻；教程可发现；自定义快捷键；面板贴边 | R1/R4/R18、问题 21 |
-| P3 Medium | 工作区 + 洞察 | 分组形成工作区（批量置顶）；统计图表 | R19/R20 |
+| P1 快速 | 稳定 + 地基 | 修好日常缺陷（标签跟随移动）；面板变可用；配置路径链 | 问题 18-22、R1 地基 |
+| P2 短期 | 托盘 + 可配置 | 托盘常驻；教程可发现；自定义快捷键；面板贴边 | R1/R4/R18、问题 21 |
+| P3 中期 | 工作区 + 洞察 | 分组形成工作区（批量置顶）；统计图表 | R19/R20 |
 
 ### 关键架构对齐
 - 新消息常量（`common/mod.rs`，WM_APP+1..7 已占）：`WM_APP+8`=`WM_APP_TRAY`（托盘回调）、`WM_APP+9`=`WM_APP_HOTKEYS_CHANGED`（热键重注册广播）、`WM_APP+10`=`WM_APP_BATCH_ACTIVATE`（分组批量置前）。

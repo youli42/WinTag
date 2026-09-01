@@ -28,7 +28,7 @@
 └──────────────────────────────────────────┘
 ```
 
-说明：D27 起 `ui/` 的四个 GUI 窗口（panel/popup/settings/confirm）改由 **iced** 在独立线程承担；`sys/overlay`、`sys/tray`、`sys/win_event`、`hotkey` 与 `main.rs` 的 Win32 消息泵**保持纯 Win32 不变**（在外部窗口上打标的核心能力无法用 iced 表达）。
+说明：D27 起 `ui/` 的四个图形界面窗口（panel/popup/settings/confirm）改由 **iced** 在独立线程承担；`sys/overlay`、`sys/tray`、`sys/win_event`、`hotkey` 与 `main.rs` 的 Win32 消息泵**保持纯 Win32 不变**（在外部窗口上打标的核心能力无法用 iced 表达）。
 
 ## 线程模型（D27）
 
@@ -39,18 +39,18 @@
  ├─ pump_background_events(hwnd)：单一阶段收拢 tray×2 + iced×1 的 try_recv
  └─ reapply_theme：原生覆盖层经 NativePrefs 重注入 + 发 IcedCommand::ApplyTheme
 
-GUI 线程（新增 std::thread）：iced_app.run()
+图形界面线程（新增 std::thread）：iced_app.run()
  ├─ 多窗口 window0=panel / window1=settings / window2=popup / window3=confirm
  ├─ subscription：from_main_rx.unfold() → IcedCommand
  ├─ update 产出 GuiEvent → 发送器回主线程
  └─ theme：ThemeMode+system_dark → iced Theme（继承现有橙强调色）
 ```
 
-跨线程通信经 `src/ui/iced_proto.rs` 的纯协议层（`IcedCommand` 主→iced、`GuiEvent` iced→主）。**对外通道全项目仅 3 条且不可再减**：Win32 消息泵（原生覆盖层/热键/托盘必需）、tray-icon 两接收器（crate 强制）、iced 收发一对（跨线程必需）。**托盘不绕 iced、iced 不拥有 overlay/tray/hotkey**；后续窗口都复用同一对 `IcedCommand`/`GuiEvent`，不新增 channel。`TagStore`/`Settings` 以 `Arc<Mutex>` 共享。
+跨线程通信经 `src/ui/iced_proto.rs` 的纯协议层（`IcedCommand` 主→iced、`GuiEvent` iced→主）。**对外通道全项目仅 3 条且不可再减**：Win32 消息泵（原生覆盖层/热键/托盘必需）、tray-icon 两接收器（crate 强制）、iced 收发一对（跨线程必需）。**托盘不绕 iced、iced 不拥有 overlay/tray/hotkey**；后续窗口都复用同一对 `IcedCommand`/`GuiEvent`，不新增通道。`TagStore`/`Settings` 以 `Arc<Mutex>` 共享。
 
 ### 原生层注入收敛（D27）
 
-为消除 sys 层「改一条偏好要同步改 N 个 setter」的漂移，原生层注入由 7 个 `set_*` 收敛为两处、各注入一次：
+为消除 sys 层「改一条偏好要同步改 N 个设置器」的漂移，原生层注入由 7 个 `set_*` 收敛为两处、各注入一次：
 
 - **`NativePrefs`**（纯值结构）：`show_title` / `badge_always_top` / `tooltip_theme` / `balloon_enabled`，主线程于启动与 `reapply_theme` 时一次性写入；替代 `set_show_title`/`set_badge_always_top`/`set_tooltip_theme`/`set_balloon_enabled`。
 - **`NativeBridge`**（回传能力）：封装覆盖层「上报 edit_tag / 激活窗口」的事件出口，替代 `set_message_target`/`set_tag_store` 的单向注入；由主线程持有、按需向 iced 线程转发。
@@ -86,7 +86,7 @@ ui → core → sys
 
 #### tray.rs（D24 落地，D26 底层迁至 tray-icon）
 - 系统托盘图标：`TrayIconBuilder` + `Menu(MenuItem)`（tray-icon/tauri），图标取自嵌入资源 `assets/icon.ico`（winresource ID=1）
-- 事件经 `TrayIconEvent`/`MenuEvent` crossbeam channel 由主线程 `try_recv` 轮询分发；左键单击打开概览面板、右键四项菜单（打开概览面板/设置页/快速标记/退出）
+- 事件经 `TrayIconEvent`/`MenuEvent` crossbeam 通道由主线程 `try_recv` 轮询分发；左键单击打开概览面板、右键四项菜单（打开概览面板/设置页/快速标记/退出）
 - 启动气泡经 `notify-rust`（Windows TOAST），开关 `show_balloon` 由主线程注入
 - `TrayCommand` 纯逻辑层（`icon_event_to_command`/`menu_id_to_command`，零 Win32）供单测；main 接 ui，保持 `ui→core→sys` 依赖方向
 
@@ -117,7 +117,7 @@ ui → core → sys
 
 ### ui/ — 用户界面层（D27：四窗迁至 iced，独立线程）
 
-自 `D27` 起，四个 GUI 窗口改由 **iced**（`tiny-skia` 软件渲染器）在独立线程渲染，不再手写 Win32 窗口类 / `WM_CTLCOLOR*` / `WM_DRAWITEM` / `BS_OWNERDRAW` 自绘 / 子类化。`ui/button.rs`（自绘圆角按钮）与 `ui/layout.rs`（DPI 缩放）整体删除（iced 自管 DPI 与主题）。
+自 `D27` 起，四个图形界面窗口改由 **iced**（`tiny-skia` 软件渲染器）在独立线程渲染，不再手写 Win32 窗口类 / `WM_CTLCOLOR*` / `WM_DRAWITEM` / `BS_OWNERDRAW` 自绘 / 子类化。`ui/button.rs`（自绘圆角按钮）与 `ui/layout.rs`（DPI 缩放）整体删除（iced 自管 DPI 与主题）。
 
 #### iced_proto.rs（纯协议层，无 iced/Win32 依赖）
 - `IcedCommand`（主线程 → iced 线程）：`ShowPanel` / `HidePanel` / `OpenSettings` / `EditTag{target, position, title, note, color}` / `RefreshTags` / `ApplyTheme{dark, accent}` / `ShowConfirm{count}` / `CloseConfirm`
@@ -128,7 +128,7 @@ ui → core → sys
 - `subscription` 经 `from_main_rx.unfold()` 消费 `IcedCommand`，`update` 产出 `GuiEvent` 回主线程
 
 #### panel.rs（iced）
-- 概览面板：搜索框 + 标签列表（点击/回车置前目标窗口、展开显示完整备注）+ 全部展开/收起 + 退出按钮 + 右键 置前/编辑/移除
+- 概览面板：搜索框 + 标签列表（点击/回车置前目标窗口、展开显示完整备注）+ 全部展开/收起 + 退出按钮 + 右键置前/编辑/移除
 
 #### popup.rs（iced）
 - 标签编辑弹窗：标题/备注输入、5 颜色块、确认/取消；`window::Position::Specific(position)` 光标附近定位 + 预填聚焦标题
@@ -177,7 +177,7 @@ ui → core → sys
 
 ## 状态管理
 
-使用消息传递模式（channel）在各模块间通信：
+使用消息传递模式（通道）在各模块间通信：
 
 ```rust
 enum AppEvent {

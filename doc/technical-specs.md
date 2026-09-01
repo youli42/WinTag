@@ -46,7 +46,7 @@ UpdateLayeredWindow(hwnd, hdc_screen, &ppt_dst, &size, hdc_mem, &ppt_src, ...)
 
 ```rust
 // 使用 windows-rs 注册全局钩子
-let hook = SetWinEventHook(
+let 钩子 = SetWinEventHook(
     EVENT_SYSTEM_FOREGROUND,
     EVENT_OBJECT_LOCATIONCHANGE,
     None,

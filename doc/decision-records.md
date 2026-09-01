@@ -29,17 +29,17 @@
 
 ## D2：SetWinEventHook 在主线程注册并转发
 
-- **决策**：窗口事件监听使用 `SetWinEventHook`，固定 `WINEVENT_OUTOFCONTEXT` + `WINEVENT_SKIPOWNPROCESS` 标志，在主线程（隐藏窗口创建之后、消息循环之前）注册。监听拆分为两个 hook：系统事件段 `0x0003..=0x0017` 与对象事件段 `0x8001..=0x8018`（见 `src/sys/win_event.rs` 第 114 行起 `install`）。回调只做过滤与 `PostMessageW(WM_APP_WINEVENT)` 转发，不执行任何重活。
+- **决策**：窗口事件监听使用 `SetWinEventHook`，固定 `WINEVENT_OUTOFCONTEXT` + `WINEVENT_SKIPOWNPROCESS` 标志，在主线程（隐藏窗口创建之后、消息循环之前）注册。监听拆分为两个钩子：系统事件段 `0x0003..=0x0017` 与对象事件段 `0x8001..=0x8018`（见 `src/sys/win_event.rs` 第 114 行起 `install`）。回调只做过滤与 `PostMessageW(WM_APP_WINEVENT)` 转发，不执行任何重活。
 - **背景**：WinEvent 回调的执行线程取决于注册线程与进程上下文。若在独立线程注册，回调将跑在该线程的消息泵内，需要引入跨线程状态（Send/Sync、Arc 传递、生命周期管理）。
 - **备选方案**：
-  1. 独立线程注册 hook，回调内直接处理或经 channel 转发；
+  1. 独立线程注册钩子，回调内直接处理或经通道转发；
   2. 主线程注册，回调内只转发消息（采纳）。
 - **理由**：
   1. 主线程本就是消息泵，`GetMessageW` 会处理本线程所有窗口消息（见 `src/main.rs` 第 98 行起），回调投递的 `WM_APP_WINEVENT` 自然回到同一线程处理，无需第二个线程，省去 Send/Sync 与生命周期成本；
   2. 覆盖层、面板、弹窗全部在主线程创建与访问，事件处理在主线程落地与现有架构完全一致；
   3. `WINEVENT_SKIPOWNPROCESS` 避免收到本进程（隐藏窗口、覆盖层等）自身产生的事件形成自激循环；
   4. 回调内只做 `should_forward` 过滤（`OBJID_WINDOW` + `CHILDID_SELF`，见 `src/sys/win_event.rs` 第 78 行起）与轻量 `PostMessageW`，不触碰布局/重绘 API，避免阻塞 USER 队列。
-- **影响与后续跟进**：事件处理全部收敛到 `src/main.rs` 的 `handle_winevent`，逻辑单一。`WinEventHooks` 实现 `Drop` 自动注销（第 126 行起）。两个 hook 全部安装失败时 `degraded` 标志置位，退化到纯轮询模式。后续若需监听更多事件段，需评估系统段与对象段的边界划分是否继续成立。
+- **影响与后续跟进**：事件处理全部收敛到 `src/main.rs` 的 `handle_winevent`，逻辑单一。`WinEventHooks` 实现 `Drop` 自动注销（第 126 行起）。两个钩子全部安装失败时 `degraded` 标志置位，退化到纯轮询模式。后续若需监听更多事件段，需评估系统段与对象段的边界划分是否继续成立。
 
 ---
 
@@ -67,7 +67,7 @@
 ## D4：事件驱动为主 + 定时器兜底轮询的混合同步策略
 
 - **决策**：覆盖层位置同步以 WinEvent 事件驱动为主路径，同时在主消息循环挂载一个 500ms 的 `SetTimer` 兜底轮询（`TIMER_POLL_OVERLAYS = 0x1234`，见 `src/main.rs` 第 21 行与第 90 行起）。轮询逻辑 `poll_overlays`（第 285 行起）遍历覆盖层：用 `IsWindow` 校验目标窗口存活，失效则移除覆盖层并删除标签；存活则调用 `overlay.sync_position()` 同步位置。
-- **背景**：WinEvent 事件存在丢失可能（hook 安装失败、进程崩溃、UWP 事件不完整），且最小化窗口的可见性判断容易误判。若完全依赖事件驱动，覆盖层可能停在错误位置或残留为孤儿。
+- **背景**：WinEvent 事件存在丢失可能（钩子安装失败、进程崩溃、UWP 事件不完整），且最小化窗口的可见性判断容易误判。若完全依赖事件驱动，覆盖层可能停在错误位置或残留为孤儿。
 - **备选方案**：
   1. 纯事件驱动，不做轮询；
   2. 纯轮询，放弃事件监听；
@@ -76,7 +76,7 @@
   1. tacky-borders 等项目的实践中，纯事件驱动在事件丢失时覆盖层会漂移，需要用轮询兜底；
   2. 事件驱动保证移动/缩放时的即时响应（毫秒级），500ms 轮询负责纠正漏网之鱼，两者成本互补；
   3. `sync_position` 内部带短路守卫（最小化或不可见直接返回）与变更去重（`last_rect` 矩形一致时跳过 `SetWindowPos`），轮询开销被压到最低（见 `src/sys/overlay.rs` 第 201 行起）；
-  4. 两个 WinEvent hook 全部安装失败时 `is_degraded()` 为真，轮询成为唯一同步路径，系统仍可用（见 `src/main.rs` 第 75 行起打印降级提示）。
+  4. 两个 WinEvent 钩子全部安装失败时 `is_degraded()` 为真，轮询成为唯一同步路径，系统仍可用（见 `src/main.rs` 第 75 行起打印降级提示）。
 - **影响与后续跟进**：轮询频率 500ms 为当前选值，覆盖层数量多时可在 `poll_overlays` 中增加"上次同步时间"节流。`stale` 集合在遍历结束后统一移除（第 308 行起），避免迭代期间修改 HashMap。后续接入 `EVENT_OBJECT_LOCATIONCHANGE` 高频率场景时，需评估去重逻辑是否足够。
 
 ---
@@ -187,7 +187,7 @@
   7. **覆盖层 UpdateLayeredWindow + 角标软件光栅**（`src/sys/badge.rs` 纯函数 SDF 光栅圆边三角形 → `overlay.rs` `UpdateLayeredWindow(ULW_ALPHA)` 32bpp 预乘 RGBA 提交）：替代原 `FillRect(DOT_RECT)` 实心方块 + `LWA_COLORKEY` 色键透明，获得逐像素 alpha 抗锯齿，完成 R2；
   8. **tooltip 圆角分层重绘**（`RoundRect` r=6 + 1px 边框 + 标题加粗/备注正文分层 + 宽度自适应上限 360px）：解决问题 4 固定 300px 截断；
   9. **tooltip 主题热更新**（`TOOLTIP_THEME` 从 `OnceLock` 改 `Mutex`）：主题切换后新建 tooltip 即时采用新配色，修复原 OnceLock 一次性注入的遗留。
-- **背景**：实测反馈（问题 7、9.1-9.8、10、4）系统性指出 UI 粗糙——根因非单点配色，而是 manifest/字体/主题覆盖/角标形态/布局 bug 一批基础设施缺失。D10 的 `WM_CTLCOLOR*` 机制无法覆盖按钮灰面与 ListView 表头/列表体。
+- **背景**：实测反馈（问题 7、9.1-9.8、10、4）系统性指出 UI 粗糙——根因非单点配色，而是 manifest/字体/主题覆盖/角标形态/布局缺陷一批基础设施缺失。D10 的 `WM_CTLCOLOR*` 机制无法覆盖按钮灰面与 ListView 表头/列表体。
 - **备选方案**：
   1. 引入 UI 框架（否决，与 D1 冲突，覆盖层区域级点击穿透仍无法表达）；
   2. 仅调配色不改控件外观（否决，`WM_CTLCOLORBTN` 对标准按钮无效，根因仍在）；
@@ -427,7 +427,7 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
   2. **z 带不匹配**：覆盖层的 `WS_EX_TOPMOST` 只在**创建时**按当时开关拼接，开关来回切换不会更新已有覆盖层的样式。跟随模式下非 topmost 覆盖层永远进不了 topmost 带（按带边界钳制），被压到非 topmost 带顶端、恰好落在目标之下。
   3. **陈旧样式残留**：`reapply_theme` 切换开关时只调 `sync_position()`，**从不移除**已存在覆盖层遗留的 `WS_EX_TOPMOST`，导致取消置顶后角标仍悬浮最上层（置顶未真正关闭），或随目标 z 带错乱被遮挡。
 - **修正**（`sys/overlay.rs`）：`sync_position` 的"跟随目标"分支改为两步——① 先按目标窗口的 topmost 状态**对齐覆盖层 z 带**（目标 topmost 则补设 `HWND_TOPMOST`，否则用 `HWND_NOTOPMOST` 清掉残留样式）；② 把插入点改为目标**前邻窗口** `GetWindow(target, GW_HWNDPREV)`（返回 NULL/失败 → `HWND_TOP`，即目标处于带顶时置于带顶），从而把覆盖层插到目标**正前方一格**。tooltip 使用同一逻辑（对齐到角标窗口带位 + 插到角标前邻），统一修复同类"被角标挡在背后"的缺陷。置顶模式（`HWND_TOPMOST`）行为不变。
-- **实现中遇到的 bug**：
+- **实现中遇到的缺陷**：
   1. windows-rs 0.58 的 `GetWindow` 返回 `Result<HWND, Error>` 而非裸 `HWND`，且前置窗口不存在时值域为 NULL；用 `.ok().filter(|h| !h.0.is_null()).unwrap_or(HWND_TOP)` 兜底（`HWND_TOP` 即 NULL）。
   2. clippy `-D warnings` 报 `let_and_return`：块尾应返回表达式，勿先 `let` 再返回。
   3. tooltip 插入代码位于已存在的 `unsafe` 块内，内层再包 `unsafe` 触发 `unused_unsafe` 警告，需移除冗余嵌套；新增 `SWP_NOMOVE` 导入。
@@ -437,12 +437,12 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 
 ## D21：扩展规划总纲——分阶段功能增强蓝图（2026-08-31，只读规划未实施）
 
-- **决策**：为 WinTag 追加一批功能增强与使用性问题修复，按分阶段路线图推进（P1 Quick 稳定+地基 → P2 Short 托盘+可配置 → P3 Medium 工作区+洞察）。本决策仅登记**调研结论与架构约定**，不含代码改动；具体实现由后续决策（D22/D23）与任务执行落实。
+- **决策**：为 WinTag 追加一批功能增强与使用性问题修复，按分阶段路线图推进（P1 快速稳定+地基 → P2 短期托盘+可配置 → P3 中期工作区+洞察）。本决策仅登记**调研结论与架构约定**，不含代码改动；具体实现由后续决策（D22/D23）与任务执行落实。
 - **背景（用户需求 4）**：① 创建托盘替代纯命令行常驻；② 添加图表；③ 添加分组/工作区（批量置顶）；④ 允许自定义快捷键；以及一组使用性问题：窗口移动标签不跟随、概览面板（无默认展开详情 / 无一键展开收起 / 不能靠边隐藏 / 无法纯键盘操作）。
 - **备选方案**：一次性全量实现（否决——改动面大、风险高、难以独立验收）；按依赖与价值分阶段（采纳）。
 - **理由**：
   1. 项目处于快速开发期（D9），分阶段能保证每个阶段独立可交付、可回归验证；
-  2. P1 先修日常 bug 与使用性问题（标签跟随、面板四项），是后续一切增强的地基；
+  2. P1 先修日常缺陷与使用性问题（标签跟随、面板四项），是后续一切增强的地基；
   3. P2 托盘+可配置达成"后台常驻 + 用户主动权"；P3 分组/图表在 P1 的树/面板数据流就绪后才可行。
 - **架构约定（贯穿各阶段）**：
   - 新消息常量（`common/mod.rs`，WM_APP+1..7 已占）：`WM_APP+8`=`WM_APP_TRAY`、`WM_APP+9`=`WM_APP_HOTKEYS_CHANGED`、`WM_APP+10`=`WM_APP_BATCH_ACTIVATE`；
@@ -495,9 +495,9 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 
 ---
 
-## D24：托盘常驻化 + 单实例保护 + 退出确认 + 气泡开关（2026-09-01，D21 P2 Short 落地）
+## D24：托盘常驻化 + 单实例保护 + 退出确认 + 气泡开关（2026-09-01，D21 P2 短期落地）
 
-- **决策**：将 D21 P2 Short 规划的"托盘+可配置"配置项由只读规划转为落地。五项改动全部沿用既有纯 Win32（D1）与注入/广播模式，不引入新 crate：
+- **决策**：将 D21 P2 短期规划的"托盘+可配置"配置项由只读规划转为落地。五项改动全部沿用既有纯 Win32（D1）与注入/广播模式，不引入新 crate：
   1. **Windows 子系统 + 默认托盘常驻、零窗口启动**：`main.rs` 首行 `#![windows_subsystem = "windows"]`（无控制台，删除 D13 之后的 Ctrl+C 优雅退出 handler——无控制台即无 `SetConsoleCtrlHandler` 可挂）。程序启动不再显示任何窗口，仅创建隐藏窗口（热键/事件中转）+ 托盘图标；
   2. **每次启动弹托盘气泡**（设置项 `show_balloon` 可关）：纯函数 `should_show_balloon(no_tray, show_balloon)`（`sys/tray.rs`）判定；为 `true` 时经一次性定时器 `TIMER_BALLOON=0x1235` 延迟 1500ms（等消息循环就绪，避免图标注册初期 `NIM_MODIFY` 气泡被 shell 丢弃），`WM_TIMER` 分支 `KillTimer` 后调 `sys::tray::show_balloon`（`NIF_INFO` + `NIM_MODIFY`）；
   3. **`--no-tray` 命令行参数**：`parse_cli_no_tray`（逐项 `OsString == "--no-tray"` 相等比较，不做前缀匹配）禁用托盘图标与气泡；此模式下退出走概览面板底部"退出"按钮（`IDC_EXIT`，`WM_APP_EXIT` 请求）；启动时 `NO_TRAY` 全局注入，`TaskbarCreated` 重注册分支与 `request_exit` 的 `remove_tray` 均按其判断；
@@ -507,7 +507,7 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
   7. **回调消息与消息路由**：`uCallbackMessage = WM_APP_TRAY = WM_APP+8`（`common/mod.rs`），托盘回调直达 `hidden_wndproc`；左键单击（`WM_LBUTTONUP=0x0202`）与气泡点击（`NIN_BALLOONUSERCLICK`）经纯函数 `tray_command_from_lparam` 解码为 `TrayCommand::OpenPanel`（打开概览面板）；右键（`WM_RBUTTONUP=0x0205`）在 `WM_RBUTTONUP` 分支 `show_context_menu`（`TrackPopupMenu` + `TPM_RETURNCMD`，四项：打开概览面板/打开设置页/快速标记/退出，取消失败回退 OpenPanel 绝不低于退）；`dispatch_tray_command` 由 main 接 ui（镜像热键分发语义）；
   8. **explorer 重启恢复**：`RegisterWindowMessageW("TaskbarCreated")` 注册动态消息，`hidden_wndproc` 匹配该消息且 `--no-tray` 关闭时重新 `add_tray`（失败登记已知限制）；
   9. **`show_balloon` 持久化**：`Settings` 增 `show_balloon: bool`（`#[serde(default = "default_true")]` 默认 `true`，旧配置缺字段回退 true），持久化于 config.toml；设置页新增"气泡提示"复选框（`IDC_BALLOON_CHECK`，保存/回显与主题/角标开关同路径）；`sys::tray::set_balloon_enabled` 经 `reapply_theme`（`WM_APP_THEME_CHANGED`）热注入，镜像 `set_show_title`/`set_badge_always_top` 模式。
-- **背景**：D21 规划 P2 Short 托盘+可配置、D22 登记托盘设计（Shell_NotifyIconW 方案、TaskbarCreated、图标 v1 用系统图标），但 D22 落地时仅实现配置路径解析链，托盘本体尚未落地。用户需求 4 明确要求"创建托盘替代纯命令行常驻"；同时需要单实例保护（防多实例热键/托盘冲突）与有标签退出确认（防误丢会话内标签）。
+- **背景**：D21 规划 P2 短期托盘+可配置、D22 登记托盘设计（Shell_NotifyIconW 方案、TaskbarCreated、图标 v1 用系统图标），但 D22 落地时仅实现配置路径解析链，托盘本体尚未落地。用户需求 4 明确要求"创建托盘替代纯命令行常驻"；同时需要单实例保护（防多实例热键/托盘冲突）与有标签退出确认（防误丢会话内标签）。
 - **备选方案**：
   1. 托盘图标改用真实 `.ico`（`build.rs` winresource `.icon` + `LoadIconW`）（备选：D22 已给出升级路径，v1 先系统图标，后续升级）；
   2. 单实例用 `CreateMutexW`（否决：windows-rs 0.58 该 API 被 `Win32_Security` feature 门控，项目未启用且本任务不改 Cargo.toml）；
@@ -525,7 +525,7 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 ## D25：底部控件客户区高度折算（layout::TITLEBAR_H / client_height，2026-09-01）
 
 - **决策**：把「`WS_OVERLAPPEDWINDOW` 窗口外高 → 客户区高度」的折算统一收口到 `ui::layout`——新增常量 `TITLEBAR_H = 30`（设计像素，Win11 默认标题栏 + 边框的近似高度）与函数 `client_height(hwnd, window_h_design) = dp(window_h_design) - dp(TITLEBAR_H)`，并令三个顶层浮窗（`confirm`/`popup`/`settings`）的底部按钮行统一以此客户区高度定位。
-- **背景**：`WS_OVERLAPPEDWINDOW` 的外高 = 客户区高 + 标题栏 + 边框，底部控件必须以**客户区高**为基准。此前三个窗口各自内联「-30」且不一致：`popup` 写 `dp(hwnd, WIN_H) - dp(hwnd, 30)`，`settings` 写 `WIN_H - dp(hwnd, 30)`（混用「未缩放外高 + 缩放标题栏」，是高 DPI 下的潜在隐患）；而新建的 `confirm.rs` 直接以窗口外高当客户区高度、未做任何抵扣——退出确认窗的「退出/取消」按钮因此被排到客户区底部之下，渲染时被裁切（实测截图：橙色按钮贴着窗口下缘且被剪掉一半）。三处重复且漂移的魔法数是同一类布局 bug 的温床。
+- **背景**：`WS_OVERLAPPEDWINDOW` 的外高 = 客户区高 + 标题栏 + 边框，底部控件必须以**客户区高**为基准。此前三个窗口各自内联「-30」且不一致：`popup` 写 `dp(hwnd, WIN_H) - dp(hwnd, 30)`，`settings` 写 `WIN_H - dp(hwnd, 30)`（混用「未缩放外高 + 缩放标题栏」，是高 DPI 下的潜在隐患）；而新建的 `confirm.rs` 直接以窗口外高当客户区高度、未做任何抵扣——退出确认窗的「退出/取消」按钮因此被排到客户区底部之下，渲染时被裁切（实测截图：橙色按钮贴着窗口下缘且被剪掉一半）。三处重复且漂移的魔法数是同一类布局缺陷的温床。
 - **备选方案**：
   1. 各窗继续内联 `-30`（否决：魔法数三处漂移，`confirm` 已漏扣造成可见裁切，`settings` 未缩放外高混用是潜在高 DPI 隐患）；
   2. `WM_NCCALCSIZE` 去边框 + 自定义标题栏 / 全量无边框（否决：会打破 `confirm` 与 `popup`/`panel`/`settings` 既有的「原生标题栏 + DWM 沉浸式暗色」统一外观，需自处理拖拽/缩放/标题绘制，改动面远超本次修复范围）。
@@ -539,14 +539,14 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 
 ## D26：托盘底层迁移至 tray-icon(tauri) + 气泡迁至 notify-rust（2026-09-01）
 
-- **决策**：把 `sys/tray.rs` 从手写 `Shell_NotifyIconW` + `NOTIFYICONDATAW` + `CreatePopupMenu`/`AppendMenuW`/`TrackPopupMenu`（D22/D24 落地）整体迁至 [`tray-icon`](https://crates.io/crates/tray-icon)（tauri）——`TrayIconBuilder` + `Menu(MenuItem)` + 嵌入资源图标；图标点击/菜单选择经 `TrayIconEvent`/`MenuEvent` 静态 crossbeam channel 投递，由主线程消息循环 `GetMessageW` 返回后非阻塞 `try_recv` 排空并分发。启动气泡从 `NIF_INFO`+`NIM_MODIFY` 迁至 [`notify-rust`](https://crates.io/crates/notify-rust)（Windows 走 `tauri-winrt-notification` 的 WinRT TOAST）。
+- **决策**：把 `sys/tray.rs` 从手写 `Shell_NotifyIconW` + `NOTIFYICONDATAW` + `CreatePopupMenu`/`AppendMenuW`/`TrackPopupMenu`（D22/D24 落地）整体迁至 [`tray-icon`](https://crates.io/crates/tray-icon)（tauri）——`TrayIconBuilder` + `Menu(MenuItem)` + 嵌入资源图标；图标点击/菜单选择经 `TrayIconEvent`/`MenuEvent` 静态 crossbeam 通道投递，由主线程消息循环 `GetMessageW` 返回后非阻塞 `try_recv` 排空并分发。启动气泡从 `NIF_INFO`+`NIM_MODIFY` 迁至 [`notify-rust`](https://crates.io/crates/notify-rust)（Windows 走 `tauri-winrt-notification` 的 WinRT TOAST）。
 - **背景**：手写托盘层要处理的东西过多（约 10 项职责：图标加载、NOTIFYICONDATAW 填充、UTF-16 截断、回调消息解码、右键菜单四项、气泡弹出、TaskbarCreated 重注册、移除、`--no-tray` 三分支、纯函数单测），且与主线程消息泵 / 注入模式 / 退出流深度耦合，改动一处要联动四处。迁移评估结论：底层换库、上层架构不破坏——保留 `TrayCommand` 纯逻辑层与 `dispatch_tray_command`，仅替换托盘实现末端。
 - **备选方案**：
   1. 迁至 `tray-item`（olback）（否决：0.10.0 在 docs.rs 构建失败、文档缺失，事件同样跨线程，Windows 图标要求 `.rc` 打包，且与 `windows 0.58` 并存两套绑定）；
   2. 继续手写仅做轻度重构（否决：仍保留全部 Win32 手写面与 unsafe，治标不治本）；
   3. `winrt-notification` 做气泡（否决：依赖旧 `windows 0.24`，类型与项目 `windows 0.58` 不互通）。
 - **理由**：
-  1. `tray-icon`（tauri）维护活跃、API 更现代，事件模型经 channel 与现有"主线程统一消息泵"契合（事件写 channel 在 `DispatchMessageW` 调起其内部 WndProc 时发生，主循环天然唤醒）；
+  1. `tray-icon`（tauri）维护活跃、API 更现代，事件模型经通道与现有"主线程统一消息泵"契合（事件写通道在 `DispatchMessageW` 调起其内部 WndProc 时发生，主循环天然唤醒）；
   2. 图标取自嵌入资源（build.rs `winresource::set_icon` 写 ID=1，`Icon::from_resource(1, None)` 读取），消除"共享类图标/IDI_WINLOGO 不销毁"的取巧语义，`exe` 资源管理器里也有正式应用图标；
   3. `TaskbarCreated`（explorer 重启）由 tray-icon 窗口过程内部接管重注册（`ChangeWindowMessageFilterEx` + 静态注册），删去本项目自实现；
   4. 净删 ~250 行 Win32 手写，unsafe 块由 ~10 处收敛到 ~2 处；`TrayCommand` 纯逻辑层与 `dispatch_tray_command` 原样复用，单测保留并新增事件解码用例。
@@ -555,41 +555,41 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
   - `Cargo.toml` 增 `tray-icon = "0.24"`、`notify-rust = "4"`（新增 ~150 传递依赖：`muda`、`windows-sys 0.61`、`crossbeam-channel`、`png` 等；与项目 `windows 0.58` 两套 Win32 绑定并存，无运行时冲突）；
   - 新增 `assets/icon.ico`（仅新资源文件，Python 脚本生成 16/32/48/256 多尺寸 PNG 压缩 ICO）；`build.rs` 用 `winresource::set_icon` 嵌入；文件缺失时降级跳过（图标缺失仅影响外观）；
   - `src/sys/tray.rs` 重写为「纯逻辑层（`TrayCommand` + `icon_event_to_command`/`menu_id_to_command`/`should_show_balloon`，零 tray-icon 依赖）+ 适配层（`create_tray`/`set_balloon_enabled`/`show_balloon`）」，删除全部 `Shell_NotifyIconW`/`fill_wide`/`show_context_menu`/`register_taskbar_created`/Win32 `load_tray_icon`；
-  - `src/main.rs`：删 `WM_APP_TRAY` 分支与 `TaskbarCreated` 分支（`registered_msg`）、删 `TASKBAR_CREATED`/`NO_TRAY` 静态与 `no_tray_active`/`remove_tray`，改在主循环 `poll_tray_events(hwnd)` 轮询两 channel 后 `dispatch_tray_command`；`request_exit` 不再显式移除托盘（`TrayIcon` drop 承担）；启动气泡定时器保留，`show_balloon` 改 notify-rust；
+  - `src/main.rs`：删 `WM_APP_TRAY` 分支与 `TaskbarCreated` 分支（`registered_msg`）、删 `TASKBAR_CREATED`/`NO_TRAY` 静态与 `no_tray_active`/`remove_tray`，改在主循环 `poll_tray_events(hwnd)` 轮询两通道后 `dispatch_tray_command`；`request_exit` 不再显式移除托盘（`TrayIcon` drop 承担）；启动气泡定时器保留，`show_balloon` 改 notify-rust；
   - `src/common/mod.rs`：删 `WM_APP_TRAY` 常量（`WM_APP+8` 空出），`WM_APP_EXIT`（`WM_APP+9`）保留；
   - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（新增 4 个托盘单测用例）。
 
 ---
 
-## D27：四个 GUI 窗口迁至 iced（tiny-skia 渲染器 + 独立线程 channel 通信，2026-09-01）
+## D27：四个图形界面窗口迁至 iced（tiny-skia 渲染器 + 独立线程通道通信，2026-09-01）
 
-- **决策**：把 `ui/panel`（概览面板）、`ui/popup`（标签编辑弹窗）、`ui/settings`（设置页）、`ui/confirm`（退出确认）四个**自绘 Win32 窗口**迁至 [iced](https://github.com/iced-rs/iced)（`tiny-skia` 软件渲染器），用其声明式 widget + 主题 + 高 DPI 取代手写的 `WNDCLASSW`/`CreateWindowExW`/`WM_CTLCOLOR*`/`WM_DRAWITEM`/`BS_OWNERDRAW` 自绘/子类化/控件布局。**其余层面保持纯 Win32 不变**：
+- **决策**：把 `ui/panel`（概览面板）、`ui/popup`（标签编辑弹窗）、`ui/settings`（设置页）、`ui/confirm`（退出确认）四个**自绘 Win32 窗口**迁至 [iced](https://github.com/iced-rs/iced)（`tiny-skia` 软件渲染器），用其声明式控件 + 主题 + 高 DPI 取代手写的 `WNDCLASSW`/`CreateWindowExW`/`WM_CTLCOLOR*`/`WM_DRAWITEM`/`BS_OWNERDRAW` 自绘/子类化/控件布局。**其余层面保持纯 Win32 不变**：
   - `sys/overlay`（透明覆盖层/角标/标题条/tooltip）、`sys/tray`（托盘）、`sys/win_event`、`sys/window`、`hotkey`、`main.rs` Win32 消息泵——**均不迁移**；
-  - 架构改为 **iced 跑在独立线程、主线程保留 `GetMessageW` 消息泵，二者经 crossbeam channel 双向通信**（镜像 D26 `tray-icon` 的 channel 轮询模式）；
+  - 架构改为 **iced 跑在独立线程、主线程保留 `GetMessageW` 消息泵，二者经 crossbeam 通道双向通信**（镜像 D26 `tray-icon` 的通道轮询模式）；
   - `ui/button.rs`、`ui/layout.rs` 整体删除；`ui/theme.rs` 拆分为「纯调色板常量（留供覆盖层注入 + iced 主题映射）+ DWM `apply_dark_mode`/`apply_corner_preference`（保留给原生覆盖层/隐藏窗口）」；
-  - **机制收敛（总线最小化）**：为约束「跨线程/跨层接口不随迁入 iced 而膨胀」，D27 同时落地四条约束——① 7 个 `set_*` 注入 setter（`set_tag_store`/`set_message_target`/`set_tooltip_theme`/`set_show_title`/`set_badge_always_top`/`set_balloon_enabled`/`set_global_settings`）收敛为**一个 `NativePrefs` 纯值结构**（`show_title`/`badge_always_top`/`tooltip_theme`/`balloon_enabled`）+ **一个 `NativeBridge`**（封装覆盖层「上报 edit_tag / 激活窗口」的回传能力），主线程一次性注入，消除「改一条 UI 偏好要同步改 N 个 setter」的牵连；② 主循环散落的 `try_recv`（tray×2 + iced×1）收进**单一 `pump_background_events(hwnd)` 阶段**，循环体读起来是「来源 → action」一张表；③ **托盘不绕 iced**：托盘是原生层、只与主线程对话，iced 只管理四个面板，二者不直连、iced 不拥有 overlay/tray/hotkey；④ iced 侧**不镜像 `WM_APP_*` 的 UI 消息**——原生消息只负责「进主循环」，出主循环一律走 iced channel，同一条消息只有一个出口、不双写。
-- **背景**：WinTag 的 GUI 由四套手写 Win32 窗口构成，合计约 4000 行（panel 1511 / popup 1111 / settings 965 / confirm 469）+ `button.rs` 401 + `theme.rs` 624。每一套都重复实现窗口类注册、`WM_CREATE` 建子控件、`WM_CTLCOLOR*` 配色、`WM_ERASEBKGND` 背景、`WM_GETMINMAXINFO` 固定尺寸、`WM_DRAWITEM` 自绘（按钮/颜色块/下拉框）、Tab/Esc/回车键盘语义、DPI 缩放（`ui::layout::dp`）。这种「一窗一个 WndProc 全手写」的模式，在 D11-D25 期间**每一轮都要跨四窗重复修相同的问题**（D18 配色 `wParam`/`lParam` 误用、D25 客户区高度漏扣、dark-mode 控件变体 `apply_control_theme` 四处调用）。iced 恰好把这类样板收敛为声明式 widget，并补上目前四窗缺少的现代能力（文本自适应、平滑滚动、可移植主题）。
+  - **机制收敛（总线最小化）**：为约束「跨线程/跨层接口不随迁入 iced 而膨胀」，D27 同时落地四条约束——① 7 个 `set_*` 注入设置器（`set_tag_store`/`set_message_target`/`set_tooltip_theme`/`set_show_title`/`set_badge_always_top`/`set_balloon_enabled`/`set_global_settings`）收敛为**一个 `NativePrefs` 纯值结构**（`show_title`/`badge_always_top`/`tooltip_theme`/`balloon_enabled`）+ **一个 `NativeBridge`**（封装覆盖层「上报 edit_tag / 激活窗口」的回传能力），主线程一次性注入，消除「改一条 UI 偏好要同步改 N 个设置器」的牵连；② 主循环散落的 `try_recv`（tray×2 + iced×1）收进**单一 `pump_background_events(hwnd)` 阶段**，循环体读起来是「来源 → 动作」一张表；③ **托盘不绕 iced**：托盘是原生层、只与主线程对话，iced 只管理四个面板，二者不直连、iced 不拥有 overlay/tray/hotkey；④ iced 侧**不镜像 `WM_APP_*` 的 UI 消息**——原生消息只负责「进主循环」，出主循环一律走 iced 通道，同一条消息只有一个出口、不双写。
+- **背景**：WinTag 的图形界面由四套手写 Win32 窗口构成，合计约 4000 行（panel 1511 / popup 1111 / settings 965 / confirm 469）+ `button.rs` 401 + `theme.rs` 624。每一套都重复实现窗口类注册、`WM_CREATE` 建子控件、`WM_CTLCOLOR*` 配色、`WM_ERASEBKGND` 背景、`WM_GETMINMAXINFO` 固定尺寸、`WM_DRAWITEM` 自绘（按钮/颜色块/下拉框）、Tab/Esc/回车键盘语义、DPI 缩放（`ui::layout::dp`）。这种「一窗一个 WndProc 全手写」的模式，在 D11-D25 期间**每一轮都要跨四窗重复修相同的问题**（D18 配色 `wParam`/`lParam` 误用、D25 客户区高度漏扣、dark-mode 控件变体 `apply_control_theme` 四处调用）。iced 恰好把这类样板收敛为声明式控件，并补上目前四窗缺少的现代能力（文本自适应、平滑滚动、可移植主题）。
 - **备选方案**：
   1. **egui/eframe**（否决）：D1 已明确移除 egui；egui 即时模式对「树形面板/搜索框/下拉框」的控件语义不如 elm-architecture 的 iced 清晰，且即时模式与 Win32 原生窗口共存时易重绘漂移；
   2. **tauri + WebView**（否决）：引入完整前端链，对 4 个面板过重，与 WinTag「轻量常驻 + 零浏览器进程」定位冲突；`--no-tray` 纯命令行模式也不应背着 WebView；
-  3. **winit + softbuffer**（否决）：只换窗口壳，仍要手写全部 widget/样式/布局，不解决重复劳动根因；
+  3. **winit + softbuffer**（否决）：只换窗口壳，仍要手写全部控件/样式/布局，不解决重复劳动根因；
   4. **继续手写（纯重构收口）**（否决）：即便把 theme/layout/button 收口成共享工具，四个窗口仍是 4000+ 行手写 WndProc，D18/D25 那类跨窗同病仍会复发；
   5. **iced 全量替换**（否决）：覆盖层/托盘/热键/事件监听无法用 iced 表达（iced/winit 整窗模型无法在外部窗口上做逐像素透明层——正是 D1 否决 winit 的理由）；`Application::run` 自带消息泵会与现有 `GetMessageW` 主循环冲突；
-  6. **iced 跑独立线程 + channel（采纳）**：只移植四窗，复用 D26 已验证的跨线程 channel 分发模式。
+  6. **iced 跑独立线程 + 通道（采纳）**：只移植四窗，复用 D26 已验证的跨线程通道分发模式。
 - **理由**：
   1. **边界干净**：覆盖层/托盘/热键/事件监听是「在外部窗口上打标」的产品核心，必须留在 Win32；四窗是纯「模态/常驻窗口」，与 iced 控件语义一一对应。边界正好落在「是否需要贴目标窗口」；
   2. **命中重复痛点**：D11-D25 每次修复都在四窗重复铺开，iced 一次消灭这类样板代码；后续 D23 的「分组下拉/快捷键录制/图表」可直接用 iced 控件实现；
-  3. **线程冲突可控**：`Application::run` 阻塞一个线程，主线程消息泵不受影响；`TagStore`/`Settings` 已是 `Arc<Mutex>`（Send），跨线程安全；channel 协议与 D26 `TrayCommand` 纯逻辑层同构；
+  3. **线程冲突可控**：`Application::run` 阻塞一个线程，主线程消息泵不受影响；`TagStore`/`Settings` 已是 `Arc<Mutex>`（Send），跨线程安全；通道协议与 D26 `TrayCommand` 纯逻辑层同构；
   4. **性能匹配**：四窗为低频交互窗口，`tiny-skia` 无 GPU 初始化、二进制小、无 wgpu 设备枚举，适合常驻托盘工具；
   5. **保留 D1 的有效部分**：D1 否决 winit 的三条理由针对覆盖层与消息泵；迁四窗并不违背其精神，overlay/tray/win_event/hotkey/main 消息泵仍是纯 Win32。
 - **影响与后续跟进**：
-  - `Cargo.toml` 增 `iced`（`tiny-skia` renderer，版本按 MSRV 与稳定版校验后定稿）与 `crossbeam-channel`（已随 tray-icon 传递，补显式声明；与项目 `windows 0.58`、tray-icon 的 `windows-sys 0.61` 两套 Win32 绑定并存，无运行时冲突）；
+  - `Cargo.toml` 增 `iced`（`tiny-skia` 渲染器，版本按 MSRV 与稳定版校验后定稿）与 `crossbeam-channel`（已随 tray-icon 传递，补显式声明；与项目 `windows 0.58`、tray-icon 的 `windows-sys 0.61` 两套 Win32 绑定并存，无运行时冲突）；
   - 新增 `src/ui/iced_proto.rs`：纯协议层（无 iced/Win32 依赖），`IcedCommand`（主→iced：`ShowPanel`/`HidePanel`/`OpenSettings`/`EditTag`/`RefreshTags`/`ApplyTheme`/`ShowConfirm`/`CloseConfirm`）与 `GuiEvent`（iced→主：`TagSaved`/`SettingsChanged`/`EditTagRequested`/`ActivateWindow`/`RemoveTag`/`ExpandAll`/`CollapseAll`/`ConfirmExit`/`CancelExit`/`PanelVisibilityChanged`）；`Tag`/`Settings`/`TagColor` 均 `Clone+Send` 可跨线程；
   - 新增 `src/ui/iced_app.rs`：`iced::Application` 实现 + 多窗口（panel/settings/popup/confirm），`subscription` 经 `from_main_rx.unfold()` 消费 `IcedCommand`，`update` 产出 `GuiEvent` 经发送器回主线程；
-  - `main.rs`：删 `PANEL_HWND`/`settings_hwnd`/`ensure_settings_window`/`toggle_settings` 的窗口句柄路径，改由「面板/设置可见状态 + 发送 IcedCommand」；`handle_quick_tag`/`WM_APP_EDIT_TAG`/托盘 `QuickTag` 的 `create_popup` 改为发 `EditTag`（`clamp_to_work` 光标定位保留在主线程计算）；`WM_APP_TAGS_CHANGED` 改发 `RefreshTags`；`poll_tray_events`/`dispatch_tray_command`/`handle_winevent` 的 UI 出口改 `tx_iced.send(...)`；`reapply_theme` 在原生覆盖层重注入外补发 `ApplyTheme`；新增 `pump_background_events(hwnd)`（收拢 tray×2 + iced×1 的 `try_recv`，替代原 `poll_tray_events`；后续 D23 若加图表/快捷键窗口，均复用同一对 `IcedCommand`/`GuiEvent`，**不新增 channel**）；
+  - `main.rs`：删 `PANEL_HWND`/`settings_hwnd`/`ensure_settings_window`/`toggle_settings` 的窗口句柄路径，改由「面板/设置可见状态 + 发送 IcedCommand」；`handle_quick_tag`/`WM_APP_EDIT_TAG`/托盘 `QuickTag` 的 `create_popup` 改为发 `EditTag`（`clamp_to_work` 光标定位保留在主线程计算）；`WM_APP_TAGS_CHANGED` 改发 `RefreshTags`；`poll_tray_events`/`dispatch_tray_command`/`handle_winevent` 的 UI 出口改 `tx_iced.send(...)`；`reapply_theme` 在原生覆盖层重注入外补发 `ApplyTheme`；新增 `pump_background_events(hwnd)`（收拢 tray×2 + iced×1 的 `try_recv`，替代原 `poll_tray_events`；后续 D23 若加图表/快捷键窗口，均复用同一对 `IcedCommand`/`GuiEvent`，**不新增通道**）；
   - `request_exit` 的 `create_confirm` → `ShowConfirm{count}`；`ConfirmExit` 回主线程走既有 `WM_APP_EXIT(wParam=1)` 退出流（复用 `should_confirm_exit`）；
   - 删除 `src/ui/button.rs`、`src/ui/layout.rs`；`ui/theme.rs` 拆分（纯调色板 `light_colors`/`dark_colors`/`blend` 留作覆盖层 `set_tooltip_theme` 注入 + iced 主题映射；DWM `apply_*` 保留）；sys 层注入点收敛为 `NativePrefs`/`NativeBridge` 各一次；
-  - **回归面**：Tab 循环、Esc 取消、回车保存/确认、颜色块选择、树形列表展开、右键 置前/编辑/移除——迁到 iced 后是**行为重写**而非逐行搬运，需在 `tests/smoke.rs` 与手动验收单逐项覆盖；
+  - **回归面**：Tab 循环、Esc 取消、回车保存/确认、颜色块选择、树形列表展开、右键置前/编辑/移除——迁到 iced 后是**行为重写**而非逐行搬运，需在 `tests/smoke.rs` 与手动验收单逐项覆盖；
   - `doc/architecture.md` 按「一层 UI 由 iced 承担 + 覆盖层/托盘仍由 sys 层 Win32 承担」更新分层图与模块职责；`doc/iced-migration.md` 新增**分阶段执行方案**（里程碑、逐阶段任务、文件级改动、验证门禁、可维护性约定）；`AGENTS.md` 同步；
   - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（本决策仅登记设计；分阶段实施见 `doc/iced-migration.md`）。
 
