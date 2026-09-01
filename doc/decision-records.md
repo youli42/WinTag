@@ -521,3 +521,18 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 - **影响与后续跟进**：新增 `src/sys/tray.rs`（D22 落地：`add_tray`/`remove_tray`/`show_balloon`/`show_context_menu`/`register_taskbar_created` + `TrayCommand` 枚举 + 纯函数层）、`src/ui/confirm.rs`；`common/mod.rs` 补 `WM_APP_TRAY=WM_APP+8`、`WM_APP_EXIT=WM_APP+9`（原 D21 规划 `WM_APP+9=WM_APP_HOTKEYS_CHANGED` 顺延至 D23 落地时占用）；`Settings` 增 `show_balloon`（新增单测：默认 true、旧配置缺字段回退、false 往返持久化）；托盘菜单"打开概览面板"同时是 `--no-tray` 之外的主入口。遗留：真实 `.ico` 图标升级、explorer 重启恢复失败的已知限制（D22 登记）；F3（托盘图标）遗留项随本决策关闭。
 
 ---
+
+## D25：底部控件客户区高度折算（layout::TITLEBAR_H / client_height，2026-09-01）
+
+- **决策**：把「`WS_OVERLAPPEDWINDOW` 窗口外高 → 客户区高度」的折算统一收口到 `ui::layout`——新增常量 `TITLEBAR_H = 30`（设计像素，Win11 默认标题栏 + 边框的近似高度）与函数 `client_height(hwnd, window_h_design) = dp(window_h_design) - dp(TITLEBAR_H)`，并令三个顶层浮窗（`confirm`/`popup`/`settings`）的底部按钮行统一以此客户区高度定位。
+- **背景**：`WS_OVERLAPPEDWINDOW` 的外高 = 客户区高 + 标题栏 + 边框，底部控件必须以**客户区高**为基准。此前三个窗口各自内联「-30」且不一致：`popup` 写 `dp(hwnd, WIN_H) - dp(hwnd, 30)`，`settings` 写 `WIN_H - dp(hwnd, 30)`（混用「未缩放外高 + 缩放标题栏」，是高 DPI 下的潜在隐患）；而新建的 `confirm.rs` 直接以窗口外高当客户区高度、未做任何抵扣——退出确认窗的「退出/取消」按钮因此被排到客户区底部之下，渲染时被裁切（实测截图：橙色按钮贴着窗口下缘且被剪掉一半）。三处重复且漂移的魔法数是同一类布局 bug 的温床。
+- **备选方案**：
+  1. 各窗继续内联 `-30`（否决：魔法数三处漂移，`confirm` 已漏扣造成可见裁切，`settings` 未缩放外高混用是潜在高 DPI 隐患）；
+  2. `WM_NCCALCSIZE` 去边框 + 自定义标题栏 / 全量无边框（否决：会打破 `confirm` 与 `popup`/`panel`/`settings` 既有的「原生标题栏 + DWM 沉浸式暗色」统一外观，需自处理拖拽/缩放/标题绘制，改动面远超本次修复范围）。
+- **理由**：
+  1. 收口到单点后，「客户区高度」只有唯一权威来源，新窗口不会再漏扣或写错基准；
+  2. `client_height` 为基于 `dp` 的纯函数，可直接单测、无窗口句柄之外的副作用；
+  3. 对固定尺寸浮窗，从外高抵扣标题栏是最低成本且正确的做法——`confirm`/`popup`/`settings` 均固定尺寸（`WM_GETMINMAXINFO` 锁定）且以 `WIN_H` 为外高基准，语义一致。
+- **影响与后续跟进**：`src/ui/layout.rs` 增 `TITLEBAR_H`/`client_height`（保留既有 `dp`，新增 1 个 `ignore` doctest）；`confirm.rs` 改 `client_h = client_height(hwnd, WIN_H)` 定位按钮行与消息区，修复退出确认窗按钮溢出裁切；`popup.rs`/`settings.rs` 改用同一函数（`popup` 行为完全一致，`settings` 一并修正高 DPI 外高未缩放的隐患）。`cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿。
+
+---
