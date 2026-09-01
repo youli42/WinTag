@@ -394,7 +394,7 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | F1 | **窗口激活闪烁反馈** | requirements.md §2"窗口激活反馈：切换到已标记窗口时，标记短暂闪烁或高亮提醒" | 未实现。`EVENT_SYSTEM_FOREGROUND` 已接入但仅映射 `BringToTop`（同步位置+置顶），无闪烁/高亮动画 | 中 | 覆盖层 WM_PAINT 增加短暂高亮状态（如扩大圆点/提亮 500ms），FOREGROUND 事件触发后经 `SetTimer` 恢复 |
 | F2 | **全屏应用降级处理** | technical-specs.md 边缘情况表"全屏应用：检测全屏状态，隐藏覆盖层，仅托盘通知" | 未实现。无全屏检测（如前台窗口与工作区同尺寸判定），无托盘通知 | 低 | 检测前台全屏窗口时隐藏全部覆盖层；托盘依赖 F3 |
-| F3 | **托盘图标** | development-plan.md 阶段一未勾选项"托盘图标，程序常驻后台" | 未实现。程序无系统托盘入口，退出需结束进程 | 低 | `Shell_NotifyIcon` 托盘图标 + 右键菜单（开关覆盖层/退出）；依赖需评估 tray-icon crate（曾因不引第三方否决，可复核） |
+| F3 | **托盘图标** | development-plan.md 阶段一未勾选项"托盘图标，程序常驻后台" | ✅ 已实现（D22/D24）：`Shell_NotifyIconW` 托盘常驻、右键四项菜单、左键/气泡打开面板、`--no-tray` 禁用、退出确认、explorer 重启恢复，见 [D24](#d24托盘常驻化-单实例保护-退出确认-气泡开关2026-09-01d21-p2-short-落地) | 低 | 已完成，本条关闭 |
 | F4 | **管理员权限窗口兼容** | technical-specs.md 边缘情况表 | 部分受限。程序默认非提权运行，UIPI 会拦截来自提权窗口的 WinEvent，覆盖层无法跟随管理员窗口；`AGENTS.md` 已注明"可能需要管理员权限" | 低 | 文档化限制 + 可选以管理员身份重启（无自动提权） |
 | F5 | **热键冲突处理** | 健壮性 | ✅ 已修复（提交 `37419ed` fix(hotkey)）：改为逐个注册并记录失败项，冲突时降级（仅注册成功的热键）并打印提示，不再整体退出；同时新增设置页热键 `OpenSettings`（`Ctrl+Shift+S`） | 中 | 已完成，本条关闭 |
 | F6 | **用户配置（热键自定义/默认颜色）** | development-plan.md 阶段三未勾选项 | ✅ 已实现（`170ce92` 起）：配置数据模型与 TOML 持久化（`%APPDATA%\WinTag\config.toml`），设置页支持主题/圆角选择并保存（见 [D10](#d10暗色主题与圆角采用-win32-原生方案配置持久化到-toml)）；热键编辑 UI 与默认颜色自定义待后续（见 issues-and-requirements.md R1） | 低 | 已完成（部分）：配置持久化落地，热键编辑 UI 待 R1 |
@@ -402,6 +402,8 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 **登记说明**：F1 为需求文档明确功能（重构前已存在缺口，非本次回归）；F2/F3/F4 为技术规格声明的边缘处理；F5 为本次审计新发现；F6 为开发计划未勾选项。均在本次重构范围之外，重构目标（位置同步/DPI/跳转/预填/清理/健壮性）不受影响。
 
 **更新（2026-08-21）**：F5（热键冲突处理）与 F6（用户配置）已随 T9 收尾落地，表中状态已更新；遗留项收敛为 F1（窗口激活闪烁反馈）、F2（全屏应用降级）、F3（托盘图标）、F4（管理员权限窗口兼容）。
+
+**更新（2026-09-01）**：F3（托盘图标）已随 D24 托盘常驻化落地（`Shell_NotifyIconW` + 右键菜单 + 气泡 + `--no-tray`），表中状态已更新；遗留项收敛为 F1（窗口激活闪烁反馈）、F2（全屏应用降级）、F4（管理员权限窗口兼容）。
 
 ## D19：角标置顶可选化——新增 `badge_always_top` 设置（2026-08-30）
 
@@ -490,5 +492,32 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 - **备选方案**：分组元数据持久化（否决：D9 纯会话原则，仅 UI 偏好持久化；工作区记忆另立例外）；图表时间线（默认不选，需加字段）。
 - **理由**：三项均复用既有渲染/树/注入/广播模式，无新架构；分组纯会话契合 D9；`#[serde(default)]` 保证旧配置兼容。
 - **影响与后续跟进**：新增 `src/core/hotkey_config.rs`、`src/ui/charts.rs`；`common/mod.rs` 加 `WM_APP+9/+10`；`doc/issues-and-requirements.md` R19/R20 对应。图表形态待用户确认后定稿。
+
+---
+
+## D24：托盘常驻化 + 单实例保护 + 退出确认 + 气泡开关（2026-09-01，D21 P2 Short 落地）
+
+- **决策**：将 D21 P2 Short 规划的"托盘+可配置"配置项由只读规划转为落地。五项改动全部沿用既有纯 Win32（D1）与注入/广播模式，不引入新 crate：
+  1. **Windows 子系统 + 默认托盘常驻、零窗口启动**：`main.rs` 首行 `#![windows_subsystem = "windows"]`（无控制台，删除 D13 之后的 Ctrl+C 优雅退出 handler——无控制台即无 `SetConsoleCtrlHandler` 可挂）。程序启动不再显示任何窗口，仅创建隐藏窗口（热键/事件中转）+ 托盘图标；
+  2. **每次启动弹托盘气泡**（设置项 `show_balloon` 可关）：纯函数 `should_show_balloon(no_tray, show_balloon)`（`sys/tray.rs`）判定；为 `true` 时经一次性定时器 `TIMER_BALLOON=0x1235` 延迟 1500ms（等消息循环就绪，避免图标注册初期 `NIM_MODIFY` 气泡被 shell 丢弃），`WM_TIMER` 分支 `KillTimer` 后调 `sys::tray::show_balloon`（`NIF_INFO` + `NIM_MODIFY`）；
+  3. **`--no-tray` 命令行参数**：`parse_cli_no_tray`（逐项 `OsString == "--no-tray"` 相等比较，不做前缀匹配）禁用托盘图标与气泡；此模式下退出走概览面板底部"退出"按钮（`IDC_EXIT`，`WM_APP_EXIT` 请求）；启动时 `NO_TRAY` 全局注入，`TaskbarCreated` 重注册分支与 `request_exit` 的 `remove_tray` 均按其判断；
+  4. **有标签退出弹定制主题确认窗**：`request_exit` 经纯函数 `should_confirm_exit(has_tags, confirmed)` 判定——有标签且未确认时调 `ui::confirm::create_confirm`（新 `src/ui/confirm.rs`，`WinTagConfirm` 窗口类 + `ConfirmData`，自绘暗色/圆角/自绘按钮 + 回车确认/Esc 取消/Tab 循环，仿 popup 模板）；确认窗"退出"按钮回投 `WM_APP_EXIT(wParam=1)` 完成确认；确认或无标签时 `remove_tray`（--no-tray 时跳过）+ `PostMessageW(WM_QUIT)` 走正常收尾。退出入口三处：托盘右键菜单"退出"、面板"退出"按钮（wParam=0）、确认窗"确定"（wParam=1）；
+  5. **单实例保护**：用 `RegisterClassW("WinTag_SingleInstance")` 注册守护窗口类，失败且 `GetLastError() == ERROR_CLASS_ALREADY_EXISTS` 即判定另一实例在运行，直接 `return Ok(())`（退 0，不创建窗口/托盘）。**为何不用 `CreateMutexW`**：windows-rs 0.58 该 API 被 `Win32_Security` feature 门控（本项目未启用且本任务不得改动 Cargo.toml），守护类注册同为原子操作，且进程退出时窗口类自动注销，无需显式清理；
+  6. **托盘图标 v1 用系统图标**：`load_tray_icon` 优先取传入窗口（隐藏窗）类小图标 `GCLP_HICONSM`，回退系统共享图标 `LoadIconW(None, IDI_WINLOGO)`（零新增 feature/资源，共享图标不 `DestroyIcon`）；
+  7. **回调消息与消息路由**：`uCallbackMessage = WM_APP_TRAY = WM_APP+8`（`common/mod.rs`），托盘回调直达 `hidden_wndproc`；左键单击（`WM_LBUTTONUP=0x0202`）与气泡点击（`NIN_BALLOONUSERCLICK`）经纯函数 `tray_command_from_lparam` 解码为 `TrayCommand::OpenPanel`（打开概览面板）；右键（`WM_RBUTTONUP=0x0205`）在 `WM_RBUTTONUP` 分支 `show_context_menu`（`TrackPopupMenu` + `TPM_RETURNCMD`，四项：打开概览面板/打开设置页/快速标记/退出，取消失败回退 OpenPanel 绝不低于退）；`dispatch_tray_command` 由 main 接 ui（镜像热键分发语义）；
+  8. **explorer 重启恢复**：`RegisterWindowMessageW("TaskbarCreated")` 注册动态消息，`hidden_wndproc` 匹配该消息且 `--no-tray` 关闭时重新 `add_tray`（失败登记已知限制）；
+  9. **`show_balloon` 持久化**：`Settings` 增 `show_balloon: bool`（`#[serde(default = "default_true")]` 默认 `true`，旧配置缺字段回退 true），持久化于 config.toml；设置页新增"气泡提示"复选框（`IDC_BALLOON_CHECK`，保存/回显与主题/角标开关同路径）；`sys::tray::set_balloon_enabled` 经 `reapply_theme`（`WM_APP_THEME_CHANGED`）热注入，镜像 `set_show_title`/`set_badge_always_top` 模式。
+- **背景**：D21 规划 P2 Short 托盘+可配置、D22 登记托盘设计（Shell_NotifyIconW 方案、TaskbarCreated、图标 v1 用系统图标），但 D22 落地时仅实现配置路径解析链，托盘本体尚未落地。用户需求 4 明确要求"创建托盘替代纯命令行常驻"；同时需要单实例保护（防多实例热键/托盘冲突）与有标签退出确认（防误丢会话内标签）。
+- **备选方案**：
+  1. 托盘图标改用真实 `.ico`（`build.rs` winresource `.icon` + `LoadIconW`）（备选：D22 已给出升级路径，v1 先系统图标，后续升级）；
+  2. 单实例用 `CreateMutexW`（否决：windows-rs 0.58 该 API 被 `Win32_Security` feature 门控，项目未启用且本任务不改 Cargo.toml）；
+  3. 退出确认用 `MessageBoxW`（否决：与整体定制主题 UI 割裂；`ui::confirm` 仿 popup 模板成本低且主题一致）；
+  4. 气泡不延迟直接弹（否决：实测图标注册初期 `NIM_MODIFY` 气泡被 shell 丢弃，1500ms 定时器等循环就绪更稳）。
+- **理由**：
+  1. 零窗口启动 + 托盘常驻是"程序常驻后台"（F3）的核心体验，`--no-tray` 保留纯命令行/开发模式；
+  2. 单实例保护避免多实例同时注册热键（后者会静默失败）与托盘图标互相覆盖，守护类方案零额外依赖且进程退出自动清理；
+  3. 有标签退出确认把"退出即清空会话数据"的不可逆操作前置一次确认，`should_confirm_exit` 纯函数可单测；
+  4. 气泡开关走既有 `#[serde(default)]` + `reapply_theme` 注入链路，设置页交互与角标开关同构，改动面最小。
+- **影响与后续跟进**：新增 `src/sys/tray.rs`（D22 落地：`add_tray`/`remove_tray`/`show_balloon`/`show_context_menu`/`register_taskbar_created` + `TrayCommand` 枚举 + 纯函数层）、`src/ui/confirm.rs`；`common/mod.rs` 补 `WM_APP_TRAY=WM_APP+8`、`WM_APP_EXIT=WM_APP+9`（原 D21 规划 `WM_APP+9=WM_APP_HOTKEYS_CHANGED` 顺延至 D23 落地时占用）；`Settings` 增 `show_balloon`（新增单测：默认 true、旧配置缺字段回退、false 往返持久化）；托盘菜单"打开概览面板"同时是 `--no-tray` 之外的主入口。遗留：真实 `.ico` 图标升级、explorer 重启恢复失败的已知限制（D22 登记）；F3（托盘图标）遗留项随本决策关闭。
 
 ---

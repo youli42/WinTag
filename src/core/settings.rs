@@ -72,6 +72,9 @@ pub struct Settings {
     /// 关闭后角标跟随目标窗口 z 序：被其他窗口盖住时随之隐藏。
     #[serde(default = "default_true")]
     pub badge_always_top: bool,
+    /// 托盘启动时是否显示气泡提示（缺省 true，旧配置文件缺字段时按显示回退）。
+    #[serde(default = "default_true")]
+    pub show_balloon: bool,
 }
 
 impl Default for Settings {
@@ -82,6 +85,7 @@ impl Default for Settings {
             corner: CornerPreference::Default,
             show_badge_title: true,
             badge_always_top: true,
+            show_balloon: true,
         }
     }
 }
@@ -202,21 +206,15 @@ fn parse_str(s: &str) -> Result<Settings, toml::de::Error> {
     toml::from_str(s)
 }
 
-/// 解析配置内容，失败回退默认并告警（`load` 的公共尾段，避免复制粘贴）
+/// 解析配置内容，失败回退默认（`load` 的公共尾段，避免复制粘贴）
 fn parse_or_default(content: &str) -> Settings {
-    match parse_str(content) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[配置] 读取配置失败，使用默认配置: {e}");
-            Settings::default()
-        }
-    }
+    parse_str(content).unwrap_or_default()
 }
 
 /// 从配置文件加载设置
 ///
 /// 任何错误（文件不存在 / IO 失败 / TOML 解析失败）都回退到默认配置，
-/// 仅打印一条中文警告，绝不 panic、绝不中断程序。
+/// 绝不 panic、绝不中断程序。
 ///
 /// D9 读穿透：`config_path()` 不存在时，best-effort 读旧
 /// `%APPDATA%\WinTag\config.toml`（仅当二者不是同一路径，且不复制）。
@@ -224,17 +222,15 @@ pub fn load() -> Settings {
     let path = config_path();
     match std::fs::read_to_string(&path) {
         Ok(content) => parse_or_default(&content),
-        Err(e) => {
+        Err(_) => {
             // 新位置无文件时读穿透旧 %APPDATA% 配置（D9：只读，不复制）
             if let Some(legacy) = legacy_appdata_path() {
                 if should_read_through(&path, &legacy) {
                     if let Ok(content) = std::fs::read_to_string(&legacy) {
-                        println!("[配置] 已从旧位置 %APPDATA% 读取（D9 不复制）");
                         return parse_or_default(&content);
                     }
                 }
             }
-            eprintln!("[配置] 读取配置失败，使用默认配置: {e}");
             Settings::default()
         }
     }
@@ -275,6 +271,7 @@ mod tests {
                 corner: CornerPreference::Default,
                 show_badge_title: true,
                 badge_always_top: true,
+                show_balloon: true,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -290,6 +287,7 @@ mod tests {
                 corner,
                 show_badge_title: false,
                 badge_always_top: false,
+                show_balloon: false,
             };
             let s = toml::to_string(&cfg).unwrap();
             let back: Settings = toml::from_str(&s).unwrap();
@@ -301,6 +299,7 @@ mod tests {
             corner: CornerPreference::Round,
             show_badge_title: false,
             badge_always_top: false,
+            show_balloon: false,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: Settings = toml::from_str(&s).unwrap();
@@ -347,6 +346,42 @@ mod tests {
         assert!(parsed.badge_always_top, "缺省字段应回退为始终置顶");
     }
 
+    /// 测试 (c4)：Default 的 show_balloon 应默认为 true（托盘启动气泡提示默认开启）
+    #[test]
+    fn test_default_show_balloon() {
+        assert!(
+            Settings::default().show_balloon,
+            "默认 show_balloon 应回退为 true"
+        );
+    }
+
+    /// 测试 (c5)：旧版配置缺 show_balloon 字段可解析，回退 true（托盘气泡默认开启）
+    #[test]
+    fn test_parse_legacy_missing_show_balloon() {
+        let legacy = "theme = \"Dark\"\ncorner = \"Round\"\n";
+        let parsed: Settings = parse_str(legacy).unwrap();
+        assert_eq!(parsed.theme, ThemeMode::Dark);
+        assert_eq!(parsed.corner, CornerPreference::Round);
+        assert!(parsed.show_balloon, "缺省字段应回退为显示托盘气泡提示");
+    }
+
+    /// 测试 (c6)：含 show_balloon = false 的 TOML serde 往返（关闭气泡保持持久化）
+    #[test]
+    fn test_serde_roundtrip_show_balloon() {
+        let cfg = Settings {
+            theme: ThemeMode::System,
+            corner: CornerPreference::Default,
+            show_badge_title: true,
+            badge_always_top: true,
+            show_balloon: false,
+        };
+        let s = toml::to_string(&cfg).unwrap();
+        assert!(s.contains("show_balloon = false"), "序列化内容: {s}");
+        let back: Settings = toml::from_str(&s).unwrap();
+        assert_eq!(back, cfg);
+        assert!(!back.show_balloon);
+    }
+
     /// 测试 (d)：save→load 往返 —— 写入临时路径，验证文件内容含枚举关键值并可读回
     #[test]
     fn test_save_load_roundtrip() {
@@ -358,6 +393,7 @@ mod tests {
             corner: CornerPreference::SmallRound,
             show_badge_title: true,
             badge_always_top: false,
+            show_balloon: true,
         };
         cfg.save_to(&path).unwrap();
 

@@ -21,6 +21,17 @@ pub fn scale_px(px: i32, dpi: u32) -> i32 {
     scaled.clamp(1, i32::MAX as i64) as i32
 }
 
+/// 标准窗口标题栏（含上下边框）在设计像素下的近似高度
+///
+/// `WS_OVERLAPPEDWINDOW`（含标题栏 + 边框）窗口的外高 = 客户区高 + 标题栏 + 边框。
+/// 布局**底部控件**（按钮行等）必须以**客户区高度**为基准定位，因此须从窗口
+/// 外高 `dp(WIN_H)` 中抵扣本值。若漏扣，按钮行会落到客户区底部之下被裁切
+///（历史 bug：退出确认窗"退出/取消"按钮溢出客户区被剪切）。
+///
+/// 取值 30 为 Win11 默认标题栏 + 边框的近似高度（96 DPI 基准），与本项目
+/// popup/settings 既有约定一致；高 DPI 下经 [`dp`] 线性缩放。
+pub const TITLEBAR_H: i32 = 30;
+
 /// 取窗口当前 DPI 并缩放设计像素
 ///
 /// `GetDpiForWindow` 失败（句柄无效等）时按 96 DPI（不缩放）处理；
@@ -29,6 +40,27 @@ pub fn dp(hwnd: HWND, px: i32) -> i32 {
     // SAFETY: GetDpiForWindow 为只读查询，句柄无效时返回 0，无副作用。
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     scale_px(px, if dpi == 0 { BASE_DPI } else { dpi })
+}
+
+/// 由窗口外高（设计像素）推算客户区高度：抵扣标题栏与边框后剩余的可用高度
+///
+/// 用于 `WS_OVERLAPPEDWINDOW` 窗口的子控件 Y 坐标定位——底部按钮行必须以
+/// 客户区高度为基准，而非窗口外高。调用方传 `WIN_H`（设计像素窗口外高），
+/// 返回本窗口当前 DPI 下的客户区物理像素高度。
+///
+/// # 参数
+///
+/// - `hwnd`：目标窗口句柄（须已创建，用于取回 DPI）
+/// - `window_h_design`：窗口设计像素外高（如各窗口模块的 `WIN_H` 常量）
+///
+/// # 示例
+///
+/// ```ignore
+/// let client_h = client_height(hwnd, WIN_H);
+/// let btn_row_y = client_h - m - btn_h;
+/// ```
+pub fn client_height(hwnd: HWND, window_h_design: i32) -> i32 {
+    dp(hwnd, window_h_design) - dp(hwnd, TITLEBAR_H)
 }
 
 #[cfg(test)]

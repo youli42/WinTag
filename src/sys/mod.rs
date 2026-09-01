@@ -1,5 +1,6 @@
 pub mod badge;
 pub mod overlay;
+pub mod tray;
 pub mod win_event;
 pub mod window;
 

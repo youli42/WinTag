@@ -52,6 +52,21 @@ pub const WM_APP_TAGS_CHANGED: u32 = WM_APP + 6;
 /// 标题/备注/颜色）。
 pub const WM_APP_EDIT_TAG: u32 = WM_APP + 7;
 
+/// 自定义消息：托盘图标回调（wParam = 图标 ID, lParam = 事件码）
+///
+/// 由 `Shell_NotifyIconW` 的 `NOTIFYICONDATAW.uCallbackMessage` 在用户点击
+/// 托盘图标/托盘气泡时投递给隐藏窗口（单线程消息泵直达 hidden_wndproc）。
+/// lParam 承载事件码（如 WM_LBUTTONUP、NIN_BALLOONUSERCLICK），由
+/// `sys::tray::tray_command_from_lparam` 解码为 TrayCommand 供主线程分发。
+pub const WM_APP_TRAY: u32 = WM_APP + 8;
+
+/// 自定义消息：请求退出程序（wParam = 是否已确认退出；1 = 确认，0 = 仅请求）
+///
+/// 由概览面板"退出"按钮 / 退出确认弹窗点击"确定"后发送到隐藏窗口，
+/// 主线程收到后走规范退出流：有标签/便签且未确认时先弹确认弹窗，
+/// 确认后 `NIM_DELETE` 托盘图标 + `PostMessageW(WM_QUIT)` 使消息循环退出。
+pub const WM_APP_EXIT: u32 = WM_APP + 9;
+
 /// 将字符串编码为以 NUL（`\0`）结尾的 UTF-16 宽字符串
 ///
 /// 用于向 Win32 API 传入窗口类名、窗口标题等宽字符串参数，

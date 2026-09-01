@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use wintag::core;
 use wintag::hotkey;
 use wintag::sys;
@@ -7,22 +9,31 @@ use core::settings::{Settings, ThemeMode};
 use core::tag::TagStore;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, TRUE, WPARAM};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
-use windows::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT,
+    WIN32_ERROR, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    RedrawWindow, HRGN, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, RegisterClassW, SetTimer, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    IsWindowVisible, KillTimer, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER,
+    WNDCLASSW, WS_OVERLAPPED,
 };
 
 use wintag::common::{self, widestring};
 
 /// 兜底轮询定时器 ID（500ms 周期，捕获事件丢失/最小化窗口可见性误判）
 const TIMER_POLL_OVERLAYS: usize = 0x1234;
+/// 托盘启动气泡一次性定时器 ID（1500ms 延迟到消息循环就绪后弹出，
+/// 避免托盘图标注册初期 NIM_MODIFY 气泡被 shell 丢弃）
+const TIMER_BALLOON: usize = 0x1235;
 
 type OverlayMap = HashMap<isize, sys::overlay::Overlay>;
 
@@ -32,69 +43,76 @@ static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
 static PANEL_HWND: OnceLock<isize> = OnceLock::new();
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
-/// 隐藏窗口句柄（供 Ctrl+C 处理线程定向投递 WM_QUIT，触发主消息循环优雅退出）
-static CTRL_C_WND: OnceLock<isize> = OnceLock::new();
+/// `--no-tray` 开关注入（main 解析后写入，WndProc 的 TaskbarCreated 分支与
+/// request_exit 退出流读取；未注入视为 false，即默认启用托盘）
+static NO_TRAY: OnceLock<AtomicBool> = OnceLock::new();
+/// TaskbarCreated 注册消息号（main 启动时注册后写入；0 表示注册失败，
+/// WndProc 不匹配该动态消息，托盘不再自动恢复）
+static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
-/// 判断 Ctrl+C 处理函数是否应接管本次控制台事件（仅 CTRL_C_EVENT 且窗口已就绪时接管）
+/// 判定单实例冲突：`CreateMutexW` 返回的句柄因同名命名互斥量已存在
+/// （`GetLastError == ERROR_ALREADY_EXISTS`）时，说明另一 WinTag 实例正在运行。
 ///
-/// 纯函数、无副作用，便于单元测试。其余事件（CTRL_BREAK/CTRL_CLOSE/CTRL_LOGOFF/CTRL_SHUTDOWN）
-/// 一律交回默认处理器，避免在系统关闭/注销等阶段做重活导致进程响应失败。
-fn ctrl_c_handled(ctrl_type: u32, window_ready: bool) -> bool {
-    ctrl_type == CTRL_C_EVENT && window_ready
+/// 纯函数、无副作用，便于单元测试。
+fn single_instance_conflict(err: WIN32_ERROR) -> bool {
+    err == ERROR_ALREADY_EXISTS
 }
 
-/// Ctrl+C（CTRL_C_EVENT）控制台处理器
+/// 判定退出前是否需要弹确认窗：有标签数据且尚未确认时返回 true。
 ///
-/// 目标：把 Ctrl+C 从"CRT 默认以 0xC000013A 强制终止"改为"走主消息循环优雅退出"。
-/// 该回调由 CRT 在**独立线程**上调用，因此不能用 `PostQuitMessage`（它只投递到当前线程队列）；
-/// 必须定向 `PostMessageW(hwnd, WM_QUIT)` 到主线程拥有的隐藏窗口，令 `GetMessageW` 返回 0，
-/// `main` 正常返回 `Ok(())`，`winevent_hooks` Drop 注销 WinEvent hook，退出码为 0。
+/// 纯函数、无副作用，便于单元测试。
+fn should_confirm_exit(has_tags: bool, confirmed: bool) -> bool {
+    has_tags && !confirmed
+}
+
+/// 读取注入的 `--no-tray` 开关（未注入时视为 false，即默认启用托盘）
+fn no_tray_active() -> bool {
+    NO_TRAY.get().is_some_and(|b| b.load(Ordering::Relaxed))
+}
+
+/// 解析命令行是否含 `--no-tray`（托盘常驻化禁用开关）
 ///
-/// 返回 `TRUE` 表示已处理（阻止默认终止）；返回 `FALSE` 表示未接管（交回默认处理器）。
-///
-/// # Safety
-///
-/// - 本函数作为 `HANDLER_ROUTINE` 注册，运行在 CRT 为控制台事件创建的独立线程上；
-/// - 仅调用线程安全的 `PostMessageW`，并把 `CTRL_C_WND`（`OnceLock`，启动时 set 后不再变）
-///   读入局部变量，不访问任何可变共享状态；
-/// - `CTRL_C_WND` 在调用 `SetConsoleCtrlHandler` 之前 set，故回调触发时窗口必已登记。
-unsafe extern "system" fn ctrl_c_handler(ctrl_type: u32) -> BOOL {
-    if ctrl_c_handled(ctrl_type, CTRL_C_WND.get().is_some()) {
-        if let Some(&h) = CTRL_C_WND.get() {
-            let _ = PostMessageW(
-                HWND(h as *mut std::ffi::c_void),
-                WM_QUIT,
-                WPARAM(0),
-                LPARAM(0),
-            );
-            return TRUE;
-        }
-    }
-    FALSE
+/// 遍历全部 `args`（含 argv[0]），任一项 `== "--no-tray"` 即返回 `true`。
+/// 使用 `OsString` 逐项比较（非 UTF-8 argv 不 panic，仅做相等判定），
+/// 不做前缀匹配以免误判 `--no-tray-extra` 之类的未知参数。
+fn parse_cli_no_tray(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|arg| arg == "--no-tray")
 }
 
 fn main() -> anyhow::Result<()> {
-    println!("WinTag 启动中...");
-
     // 命令行参数处理（D22/R1）：`--config-dir` 由 core::settings::config_root()
-    // 解析链消费（内部读取 args_os 并 memoize，见 settings.rs），此处仅扫描
-    // 未知参数告警后忽略，绝不中断程序。必须在 core::settings::load() 之前完成。
+    // 解析链消费（内部读取 args_os 并 memoize，见 settings.rs）；`--no-tray`
+    // 请求禁用托盘图标/气泡，退出改走概览面板内"退出"按钮。
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let mut arg_idx = 1; // 跳过 argv[0]（程序名）
-    while arg_idx < raw_args.len() {
-        let arg = &raw_args[arg_idx];
-        if arg == "--config-dir" {
-            arg_idx += 2; // 连同其值一并跳过
-            continue;
+    let no_tray = parse_cli_no_tray(&raw_args);
+
+    // 单实例保护（D22）：创建命名互斥量 `WinTag_SingleInstance`（跨进程唯一）。
+    // Windows 窗类注册是进程私有的，不能用于跨进程单实例（跨进程同名窗类不冲突，
+    // 会产生多个实例）；命名互斥量才是标准、可靠的跨进程单实例机制。
+    // 需要通过 `Win32_Security` feature（已加入 Cargo.toml）才能调用 CreateMutexW。
+    let instance_name = widestring("WinTag_SingleInstance");
+    // SAFETY: CreateMutexW 创建/打开命名互斥量；SECURITY_ATTRIBUTES 传 None（默认安全描述符），
+    // 无长度参数问题。返回的 HANDLE 由本函数持有至 main 结束（进程退出时系统自动回收）。
+    let instance_handle =
+        unsafe { CreateMutexW(None, BOOL::from(false), PCWSTR(instance_name.as_ptr())) };
+    if let Ok(handle) = instance_handle {
+        // SAFETY: GetLastError 必须在 CreateMutexW 调用之后立即读取（线程本地最后错误）；
+        // 此处紧随调用返回，中间无其他系统调用，可正确读取 ERROR_ALREADY_EXISTS。
+        if single_instance_conflict(unsafe { GetLastError() }) {
+            // 已存在另一实例：关闭本实例持有的互斥量句柄并退出（退 0）。
+            // SAFETY: handle 为 CreateMutexW 返回的有效句柄，CloseHandle 释放它。
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Ok(());
         }
-        let display = arg.to_string_lossy();
-        if display.starts_with("--config-dir=") {
-            arg_idx += 1;
-            continue;
-        }
-        eprintln!("[参数] 未知参数已忽略: {display}");
-        arg_idx += 1;
+        // 首次创建（持互斥量直至进程退出，保证单实例）；句柄经 `_handle` 绑定，
+        // 防止编译期未使用告警（进程退出时系统已自动回收，无需显式关闭）。
+        let _hold = handle;
     }
+    // --no-tray 开关注入全局：WndProc（TaskbarCreated 重注册托盘）与 request_exit
+    // （是否 remove_tray）需要读取。main 单写、消息泵内只读，无竞态。
+    let _ = NO_TRAY.set(AtomicBool::new(no_tray));
 
     // 声明 Per-Monitor V2 DPI 感知（必须在创建任何窗口之前调用）
     // SAFETY: SetProcessDpiAwarenessContext 为进程级设置，无参数生命周期问题；
@@ -118,14 +136,6 @@ fn main() -> anyhow::Result<()> {
 
     // 创建隐藏窗口（热键 + 覆盖层管理 + WinEvent 消息中转）
     let hwnd = create_hidden_window()?;
-
-    // 注册 Ctrl+C 处理器（问题 3）：先登记窗口句柄（handler 触发时须已就绪），再注册。
-    // 失败不致命：回退到 CRT 默认终止（仍能退出，只是非零码且不执行 drop 清理）。
-    let _ = CTRL_C_WND.set(hwnd.0 as isize);
-    // SAFETY: CTRL_C_WND 已 set；handler 只做 PostMessageW/WM_QUIT 线程安全投递。
-    if unsafe { SetConsoleCtrlHandler(Some(ctrl_c_handler), TRUE) }.is_err() {
-        eprintln!("[退出] Ctrl+C 处理器注册失败，回退默认终止行为");
-    }
 
     // 初始化覆盖层存储（OnceLock 仅首次设置生效，重复调用忽略）
     if OVERLAY_STORE.get().is_none() {
@@ -167,8 +177,10 @@ fn main() -> anyhow::Result<()> {
     sys::overlay::set_show_title(cfg.show_badge_title);
     sys::overlay::set_badge_always_top(cfg.badge_always_top);
 
-    // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）
-    let settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
+    // 创建设置窗口（初始隐藏，由热键 / WM_APP_OPEN_SETTINGS 切换显隐）。
+    // 创建失败时句柄为 NULL 且 ui::settings::settings_hwnd() 全局记录缺失，
+    // 热键/托盘打开设置时经 ensure_settings_window 懒创建重试，故仅保活不读取。
+    let _settings_hwnd = ui::settings::create_settings(ui::settings::SettingsData {
         settings: Arc::clone(&settings),
         hidden_hwnd: hwnd.0 as isize,
         visible: false,
@@ -178,34 +190,44 @@ fn main() -> anyhow::Result<()> {
         corner_edit: HWND::default(),
         title_check: HWND::default(),
         top_check: HWND::default(),
+        balloon_check: HWND::default(),
     });
-    if settings_hwnd == HWND::default() {
-        eprintln!("[设置] 设置窗口创建失败，热键仍可用（打开时自动重试创建）");
-    }
 
     // 安装 WinEvent 事件监听：绑定隐藏窗口为转发目标，事件经 WM_APP_WINEVENT 分发。
-    // winevent_hooks 作为 main 局部变量存活至退出，Drop 时自动注销 hook。
-    // （用普通命名而非下划线前缀：它被 is_degraded() 实际使用）
+    // _winevent_hooks 作为 main 局部变量存活至退出，Drop 时自动注销 hook
+    // （下划线前缀：值不再被读取，仅借 Drop 生命周期保活）。
     sys::win_event::bind_hidden(hwnd);
-    let winevent_hooks = sys::win_event::install()?;
-    if winevent_hooks.is_degraded() {
-        eprintln!("[WinEvent] 监听降级为轮询模式（500ms 兜底同步）");
-    } else {
-        println!("[WinEvent] 事件监听已安装（系统段 + 对象段）");
-    }
+    let _winevent_hooks = sys::win_event::install()?;
 
     // 注册全局热键
     hotkey::register_all(hwnd)?;
-    println!("热键已注册：");
-    println!("  Ctrl+Shift+N — 快速标记当前窗口");
-    println!("  Ctrl+Shift+M — 打开概览面板");
-    println!("  Ctrl+Shift+S — 打开设置页面");
+
+    // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式
+    // （概览面板/热键/设置均不受影响）。托盘事件经 WM_APP_TRAY 回调直达 WndProc。
+    if !no_tray {
+        let _ = sys::tray::add_tray(hwnd, None);
+    }
+    // 注册 TaskbarCreated 消息号（explorer 重启后托盘被重建，WndProc 收到该动态
+    // 消息时重新 add_tray 恢复图标）；注册失败降级为 0（WndProc 不匹配，不再恢复）。
+    let taskbar_msg = sys::tray::register_taskbar_created().unwrap_or(0);
+    let _ = TASKBAR_CREATED.set(taskbar_msg);
 
     // 兜底轮询定时器：捕获 WinEvent 事件丢失 / 最小化窗口可见性误判
     // SAFETY: SetTimer 在消息循环前调用，hwnd 为存活窗口；失败仅返回 0，忽略即可
     // （事件驱动同步仍是主路径）。
     unsafe {
         let _ = SetTimer(hwnd, TIMER_POLL_OVERLAYS, 500, None);
+    }
+
+    // 启动气泡：托盘创建成功后经一次性定时器（1500ms）推迟到消息循环就绪后弹出。
+    // 直接 NIM_MODIFY 常被 shell 在图标注册初期丢弃；延迟到循环内再弹更稳，
+    // WM_TIMER 收到 TIMER_BALLOON 时 KillTimer 转为一次性。开关判定复用
+    // sys::tray 纯函数（--no-tray 或配置关闭气泡时跳过）。
+    if sys::tray::should_show_balloon(no_tray, cfg.show_balloon) {
+        // SAFETY: hwnd 为存活隐藏窗口；SetTimer 失败返回 0，忽略（气泡丢失非致命）。
+        unsafe {
+            let _ = SetTimer(hwnd, TIMER_BALLOON, 1500, None);
+        }
     }
 
     // 运行 Windows 消息循环
@@ -229,18 +251,15 @@ fn main() -> anyhow::Result<()> {
             if let Some(hk) = hotkey {
                 match hk {
                     hotkey::Hotkey::QuickTag => {
-                        println!("[热键] Ctrl+Shift+N 触发");
                         handle_quick_tag(Arc::clone(&store_clone), hwnd.0 as isize);
                     }
                     hotkey::Hotkey::TogglePanel => {
-                        println!("[热键] Ctrl+Shift+M 触发");
                         if let Some(ph) = PANEL_HWND.get() {
                             ui::panel::toggle_panel(HWND(*ph as *mut std::ffi::c_void));
                         }
                     }
                     hotkey::Hotkey::OpenSettings => {
-                        println!("[热键] Ctrl+Shift+S 触发");
-                        // 设置窗口未创建时先懒创建（失败打印告警后静默）
+                        // 设置窗口未创建时先懒创建（失败静默）
                         let shwnd = ensure_settings_window(hwnd.0 as isize);
                         if shwnd != HWND::default() {
                             ui::settings::toggle_settings(
@@ -313,53 +332,42 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         common::WM_CREATE_OVERLAY => {
             let target_hwnd = wparam.0 as isize;
-            println!("[覆盖层] 创建请求: HWND={}", target_hwnd);
             if let Some(store) = OVERLAY_STORE.get() {
-                match store.lock() {
-                    Ok(mut overlays) => {
-                        // 防御：伪造消息可能携带无效/任意句柄，先校验窗口真实存在
-                        // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
-                        let valid = unsafe {
-                            IsWindow(HWND(target_hwnd as *mut std::ffi::c_void)).as_bool()
-                        };
-                        if !valid {
-                            eprintln!("[覆盖层] 拒绝无效窗口句柄: HWND={}", target_hwnd);
-                            return LRESULT(0);
-                        }
-                        // 防御：覆盖层数量上限，防止伪造消息耗尽 USER/GDI 资源
-                        if overlays.len() >= MAX_OVERLAYS {
-                            eprintln!("[覆盖层] 数量已达上限 {}，拒绝创建", MAX_OVERLAYS);
-                            return LRESULT(0);
-                        }
-                        match overlays.entry(target_hwnd) {
-                            Entry::Vacant(v) => match sys::overlay::Overlay::create(target_hwnd) {
-                                Ok(overlay) => {
-                                    // 创建后立即强制一次重绘（与设置保存后 reapply_theme
-                                    // 的 refresh() 恢复路径一致）：确保首次 UpdateLayeredWindow
-                                    // 内容生效，角标立即可见。
-                                    overlay.refresh();
-                                    // 立即建立 z 序：覆盖层带 WS_EX_TOPMOST 但未调用
-                                    // sync_position 时，若目标窗口同属 topmost 带且被激活，
-                                    // 会压住覆盖层导致角标被遮挡。此处重申 HWND_TOPMOST（或
-                                    // insert-after 目标窗口）消除创建后到首次事件/轮询间
-                                    // 的 z 序空窗期。
-                                    let _ = overlay.sync_position();
-                                    v.insert(overlay);
-                                    println!("[覆盖层] 创建成功: HWND={}", target_hwnd);
-                                }
-                                Err(e) => {
-                                    eprintln!("[覆盖层] 创建失败: {}", e);
-                                }
-                            },
-                            Entry::Occupied(o) => {
-                                // 该窗口已有覆盖层：强制重绘刷新标签内容/配色
-                                // （重新标注同一窗口时标题条与颜色即时更新）
-                                o.get().refresh();
+                // 锁中毒时静默跳过本次创建请求
+                if let Ok(mut overlays) = store.lock() {
+                    // 防御：伪造消息可能携带无效/任意句柄，先校验窗口真实存在
+                    // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
+                    let valid =
+                        unsafe { IsWindow(HWND(target_hwnd as *mut std::ffi::c_void)).as_bool() };
+                    if !valid {
+                        return LRESULT(0);
+                    }
+                    // 防御：覆盖层数量上限，防止伪造消息耗尽 USER/GDI 资源
+                    if overlays.len() >= MAX_OVERLAYS {
+                        return LRESULT(0);
+                    }
+                    match overlays.entry(target_hwnd) {
+                        Entry::Vacant(v) => {
+                            // 创建失败静默：下次事件/轮询仍会重试创建
+                            if let Ok(overlay) = sys::overlay::Overlay::create(target_hwnd) {
+                                // 创建后立即强制一次重绘（与设置保存后 reapply_theme
+                                // 的 refresh() 恢复路径一致）：确保首次 UpdateLayeredWindow
+                                // 内容生效，角标立即可见。
+                                overlay.refresh();
+                                // 立即建立 z 序：覆盖层带 WS_EX_TOPMOST 但未调用
+                                // sync_position 时，若目标窗口同属 topmost 带且被激活，
+                                // 会压住覆盖层导致角标被遮挡。此处重申 HWND_TOPMOST（或
+                                // insert-after 目标窗口）消除创建后到首次事件/轮询间
+                                // 的 z 序空窗期。
+                                let _ = overlay.sync_position();
+                                v.insert(overlay);
                             }
                         }
-                    }
-                    Err(_) => {
-                        eprintln!("[覆盖层] 存储锁中毒，跳过创建");
+                        Entry::Occupied(o) => {
+                            // 该窗口已有覆盖层：强制重绘刷新标签内容/配色
+                            // （重新标注同一窗口时标题条与颜色即时更新）
+                            o.get().refresh();
+                        }
                     }
                 }
             }
@@ -367,15 +375,10 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         common::WM_DESTROY_OVERLAY => {
             let target_hwnd = wparam.0 as isize;
-            println!("[覆盖层] 销毁请求: HWND={}", target_hwnd);
             if let Some(store) = OVERLAY_STORE.get() {
-                match store.lock() {
-                    Ok(mut overlays) => {
-                        overlays.remove(&target_hwnd);
-                    }
-                    Err(_) => {
-                        eprintln!("[覆盖层] 存储锁中毒，跳过销毁");
-                    }
+                // 锁中毒时静默跳过本次销毁请求
+                if let Ok(mut overlays) = store.lock() {
+                    overlays.remove(&target_hwnd);
                 }
             }
             LRESULT(0)
@@ -407,7 +410,6 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
             let valid = unsafe { IsWindow(HWND(target_hwnd as *mut std::ffi::c_void)).as_bool() };
             if !valid {
-                eprintln!("[编辑] 拒绝无效窗口句柄: HWND={}", target_hwnd);
                 return LRESULT(0);
             }
             let Some(store) = GLOBAL_TAG_STORE.get() else {
@@ -417,7 +419,6 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             };
             let Some(tag) = tags.get(&target_hwnd) else {
-                eprintln!("[编辑] 目标窗口无标签: HWND={}", target_hwnd);
                 return LRESULT(0);
             };
             let window_title = tag.window_title.clone();
@@ -461,6 +462,24 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        common::WM_APP_TRAY => {
+            // 托盘图标回调：lParam 承载事件码。左键单击/气泡点击经纯函数解码为
+            // OpenPanel；右键（WM_RBUTTONUP）不在纯函数职责内，弹右键菜单后
+            // 按用户选择分发。
+            if let Some(cmd) = sys::tray::tray_message(lparam.0 as usize) {
+                dispatch_tray_command(hwnd, cmd);
+            } else if lparam.0 as u32 == sys::tray::WM_RBUTTONUP {
+                let cmd = sys::tray::show_context_menu(hwnd);
+                dispatch_tray_command(hwnd, cmd);
+            }
+            LRESULT(0)
+        }
+        common::WM_APP_EXIT => {
+            // 退出请求：面板"退出"按钮 wParam=0 仅请求；确认弹窗"确定" wParam=1
+            // 已确认。request_exit 内部做"有标签且未确认 → 弹确认窗"判定。
+            request_exit(hwnd, wparam.0 != 0);
+            LRESULT(0)
+        }
         WM_SETTINGCHANGE => {
             // 系统设置变更（如系统主题切换）：仅"跟随系统"模式需要重新检测，
             // 其余模式由 WM_APP_THEME_CHANGED 覆盖，避免无谓的注册表读取。
@@ -472,9 +491,33 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        registered_msg
+            if TASKBAR_CREATED
+                .get()
+                .is_some_and(|&m| m != 0 && msg == registered_msg) =>
+        {
+            // explorer 重启后托盘被重建：--no-tray 关闭时重新创建图标恢复常驻
+            // （add_tray 失败静默，图标缺失不致命，面板/热键仍可用）。
+            if !no_tray_active() {
+                let _ = sys::tray::add_tray(hwnd, None);
+            }
+            LRESULT(0)
+        }
         WM_TIMER => {
             if wparam.0 == TIMER_POLL_OVERLAYS {
                 poll_overlays();
+            } else if wparam.0 == TIMER_BALLOON {
+                // 一次性启动气泡：先 KillTimer 防重入，再经 NIM_MODIFY 弹出
+                // （show_balloon 内部还会校验 balloon_enabled 注入开关）。
+                // SAFETY: hwnd 存活；KillTimer 失败仅返回 Err，忽略（防重入非关键）。
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_BALLOON);
+                }
+                sys::tray::show_balloon(
+                    hwnd,
+                    "WinTag",
+                    "WinTag 已启动。点击查看已标注窗口，或按 Ctrl+Shift+M 打开概览",
+                );
             }
             LRESULT(0)
         }
@@ -489,9 +532,7 @@ fn handle_winevent(hidden_hwnd: HWND, target_hwnd: isize, event: u32) {
         // 位置变化与前台切换都走同步：sync_position 内部使用 HWND_TOPMOST 天然置顶
         WinEventAction::Sync | WinEventAction::BringToTop => {
             with_overlay(target_hwnd, |overlay| {
-                if let Err(e) = overlay.sync_position() {
-                    eprintln!("[WinEvent] 同步覆盖层失败: {}", e);
-                }
+                let _ = overlay.sync_position();
             });
         }
         WinEventAction::Hide => {
@@ -500,9 +541,7 @@ fn handle_winevent(hidden_hwnd: HWND, target_hwnd: isize, event: u32) {
         WinEventAction::Show => {
             with_overlay(target_hwnd, |overlay| {
                 overlay.show();
-                if let Err(e) = overlay.sync_position() {
-                    eprintln!("[WinEvent] 同步覆盖层失败: {}", e);
-                }
+                let _ = overlay.sync_position();
             });
         }
         WinEventAction::Forget => {
@@ -525,9 +564,7 @@ fn handle_winevent(hidden_hwnd: HWND, target_hwnd: isize, event: u32) {
         WinEventAction::MoveEnd => {
             // 移动/缩放结束：强制最终同步（GetWindowRect 规避 DWM 陈旧值）+ 恢复轮询周期。
             with_overlay(target_hwnd, |overlay| {
-                if let Err(e) = overlay.sync_position_force() {
-                    eprintln!("[WinEvent] 移动结束同步覆盖层失败: {}", e);
-                }
+                let _ = overlay.sync_position_force();
             });
             set_poll_interval(hidden_hwnd, 500);
         }
@@ -593,9 +630,7 @@ fn poll_overlays() {
         if target_visible && !overlay.is_visible() {
             overlay.show();
         }
-        if let Err(e) = overlay.sync_position() {
-            eprintln!("[轮询] 同步覆盖层失败: {}", e);
-        }
+        let _ = overlay.sync_position();
     }
 
     // 延迟到遍历结束后统一移除（避免迭代期间修改 HashMap）
@@ -610,13 +645,11 @@ fn poll_overlays() {
 ///
 /// 注意：调用场景多为窗口销毁事件，此时不应查询窗口属性。
 fn forget_target(target_hwnd: isize) {
-    let removed = OVERLAY_STORE
-        .get()
-        .and_then(|store| store.lock().ok())
-        .map(|mut overlays| overlays.remove(&target_hwnd).is_some())
-        .unwrap_or(false);
-    if removed {
-        println!("[清理] 目标窗口已销毁，移除覆盖层: HWND={}", target_hwnd);
+    // 移除即触发 Overlay::drop，自动销毁覆盖层窗口（不存在或锁中毒时静默）
+    if let Some(store) = OVERLAY_STORE.get() {
+        if let Ok(mut overlays) = store.lock() {
+            overlays.remove(&target_hwnd);
+        }
     }
     remove_tag(target_hwnd);
 }
@@ -633,34 +666,16 @@ fn remove_tag(target_hwnd: isize) {
 
 /// 处理快速标记热键
 fn handle_quick_tag(store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
-    match sys::window::get_foreground_window_info() {
-        Ok(info) => {
-            println!(
-                "[标记] 前台窗口: {} ({}), HWND={}",
-                info.title, info.process_name, info.hwnd
-            );
-
-            let existing = store.lock().ok().and_then(|s| s.get(&info.hwnd).cloned());
-
-            if let Some(tag) = existing {
-                println!(
-                    "窗口已有标签：{} ({}), 备注：{}",
-                    tag.title, info.process_name, tag.note
-                );
-            }
-
-            // 创建 Win32 弹窗（覆盖层创建已移到弹窗确认分支）
-            ui::popup::create_popup(
-                store,
-                info.hwnd,
-                &info.title,
-                &info.process_name,
-                hidden_hwnd,
-            );
-        }
-        Err(e) => {
-            eprintln!("获取窗口信息失败: {}", e);
-        }
+    // 前台窗口信息获取失败时静默（无窗口可标记）
+    if let Ok(info) = sys::window::get_foreground_window_info() {
+        // 创建 Win32 弹窗（覆盖层创建已移到弹窗确认分支）
+        ui::popup::create_popup(
+            store,
+            info.hwnd,
+            &info.title,
+            &info.process_name,
+            hidden_hwnd,
+        );
     }
 }
 
@@ -686,7 +701,67 @@ fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
         corner_edit: HWND::default(),
         title_check: HWND::default(),
         top_check: HWND::default(),
+        balloon_check: HWND::default(),
     })
+}
+
+/// 分发托盘命令（WM_APP_TRAY 解码结果与右键菜单选择共用，D22）
+///
+/// 镜像热键分发的动作语义：OpenPanel 切换概览面板、OpenSettings 确保创建后
+/// 切换设置页、QuickTag 对前台窗口弹标记窗、Exit 走规范退出流。
+fn dispatch_tray_command(hwnd: HWND, cmd: sys::tray::TrayCommand) {
+    match cmd {
+        sys::tray::TrayCommand::OpenPanel => {
+            if let Some(ph) = PANEL_HWND.get() {
+                ui::panel::toggle_panel(HWND(*ph as *mut std::ffi::c_void));
+            }
+        }
+        sys::tray::TrayCommand::OpenSettings => {
+            let shwnd = ensure_settings_window(hwnd.0 as isize);
+            if shwnd != HWND::default() {
+                // 取全局设置实例（未注入时回退默认实例，保证 toggle 不 panic）
+                let settings = core::settings::global_settings()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(Settings::default())));
+                ui::settings::toggle_settings(shwnd, hwnd.0 as isize, settings);
+            }
+        }
+        sys::tray::TrayCommand::QuickTag => {
+            if let Some(store) = GLOBAL_TAG_STORE.get() {
+                handle_quick_tag(Arc::clone(store), hwnd.0 as isize);
+            }
+        }
+        sys::tray::TrayCommand::Exit => request_exit(hwnd, false),
+    }
+}
+
+/// 规范退出流（D22/D24）：有标签数据且未确认 → 弹确认窗；确认或无需确认 →
+/// 移除托盘图标并投递 WM_QUIT，令 GetMessageW 返回 0、main 正常返回退出码 0。
+///
+/// 入口有三：托盘右键菜单"退出"（未确认）、概览面板"退出"按钮（未确认，
+/// wParam=0）、确认弹窗"确定"（已确认，wParam=1，经 WM_APP_EXIT 回投）。
+fn request_exit(hwnd: HWND, confirmed: bool) {
+    let tag_count = GLOBAL_TAG_STORE
+        .get()
+        .and_then(|s| s.lock().ok())
+        .map(|tags| tags.len())
+        .unwrap_or(0);
+    if should_confirm_exit(tag_count > 0, confirmed) {
+        // 弹确认窗：确认后该窗投递 WM_APP_EXIT(wParam=1) 回来，本轮直接返回。
+        // 创建失败（返回 NULL）时不阻塞退出路径之外的任何功能，用户可再次请求。
+        let msg = format!("确定退出？将丢弃 {tag_count} 个标签/便签");
+        let _ = ui::confirm::create_confirm(&msg, hwnd.0 as isize);
+        return;
+    }
+    // 有托盘才移除（--no-tray 时未创建图标，跳过以保持语义清晰）
+    if !no_tray_active() {
+        sys::tray::remove_tray(hwnd);
+    }
+    // SAFETY: PostMessageW 为线程安全投递 API；WM_QUIT 投递给本线程隐藏窗口，
+    // 令主消息循环 GetMessageW 返回 0 优雅退出（_winevent_hooks 等随 main
+    // 返回经 Drop 清理）。
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_QUIT, WPARAM(0), LPARAM(0));
+    }
 }
 
 /// 从全局设置重新解析主题并应用到所有已知窗口（主题/设置变更统一入口）
@@ -724,9 +799,17 @@ fn reapply_theme(hidden_hwnd: HWND) {
         ui::panel::reapply_tree_theme(panel_hwnd, dark);
         // 子控件主题变体热更新（D17）
         ui::theme::apply_control_theme(panel_hwnd, dark);
-        // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
+        // SAFETY: RedrawWindow 带 RDW_ERASE 触发 WM_ERASEBKGND（父窗口背景按新调色板重绘，
+        // 此前 InvalidateRect(...,FALSE) 因 bErase=FALSE 不擦背景，导致第一次切浅色时
+        // 面板非子控件区域保留旧主题像素）；RDW_ALLCHILDREN 连子控件（含 owner-draw 按钮）
+        // 一起带擦除失效重绘。
         unsafe {
-            let _ = InvalidateRect(panel_hwnd, None, FALSE);
+            let _ = RedrawWindow(
+                panel_hwnd,
+                None,
+                HRGN::default(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
         }
     }
 
@@ -738,15 +821,23 @@ fn reapply_theme(hidden_hwnd: HWND) {
         let _ = ui::theme::apply_corner_preference(settings_hwnd, cfg.corner);
         // 子控件主题变体热更新（D17）：下拉框/复选框随主题切换
         ui::theme::apply_control_theme(settings_hwnd, dark);
-        // SAFETY: InvalidateRect 仅标记重绘区域，由消息循环触发 WM_PAINT 重绘。
+        // SAFETY: 同面板——RDW_ERASE 触发 WM_ERASEBKGND 让设置窗口背景按新调色板重绘，
+        // RDW_ALLCHILDREN 连 owner-draw 下拉框/按钮子控件一并带擦除重绘。
         unsafe {
-            let _ = InvalidateRect(settings_hwnd, None, FALSE);
+            let _ = RedrawWindow(
+                settings_hwnd,
+                None,
+                HRGN::default(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
         }
     }
 
     // 重新注入 tooltip 配色（Mutex 可热更新，主题切换后新 tooltip 即时采用新配色，
     // 修复原先 OnceLock 一次性注入导致主题切换后 tooltip 沿用启动配色的遗留问题）
     sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
+    // 注入托盘气泡开关（sys 层镜像，设置保存广播后热更新；未注入时默认显示）
+    sys::tray::set_balloon_enabled(cfg.show_balloon);
     // 重新注入标题条显示开关（R6），并强制所有已存在的覆盖层重绘：
     // 主题切换后角标描边色 / 标题条配色即时更新，开关切换即时生效。
     sys::overlay::set_show_title(cfg.show_badge_title);
@@ -767,27 +858,71 @@ fn reapply_theme(hidden_hwnd: HWND) {
 mod tests {
     use super::*;
 
-    /// CTRL_C_EVENT 且隐藏窗口已就绪 → 应接管（返回 TRUE）
+    /// ERROR_ALREADY_EXISTS → 判定为单实例冲突（命名互斥量已存在）
     #[test]
-    fn ctrl_c_handled_takes_event_when_c_and_ready() {
-        assert!(ctrl_c_handled(CTRL_C_EVENT, true));
+    fn single_instance_conflict_detects_duplicate() {
+        assert!(single_instance_conflict(ERROR_ALREADY_EXISTS));
     }
 
-    /// CTRL_C_EVENT 但窗口未就绪 → 不应接管（返回 FALSE）
+    /// 其它错误码（0 / 任意值）→ 非冲突，继续启动
     #[test]
-    fn ctrl_c_handled_ignores_c_when_window_not_ready() {
-        assert!(!ctrl_c_handled(CTRL_C_EVENT, false));
+    fn single_instance_conflict_ignores_other_errors() {
+        assert!(!single_instance_conflict(WIN32_ERROR(0)));
+        assert!(!single_instance_conflict(WIN32_ERROR(5)));
     }
 
-    /// 其它控制台事件（如 CTRL_CLOSE_EVENT=2）即使窗口就绪也不接管
+    /// 有标签且未确认 → 需要确认弹窗；其余组合（无标签/已确认）不需要
     #[test]
-    fn ctrl_c_handled_ignores_non_c_event() {
-        assert!(!ctrl_c_handled(2, true));
+    fn should_confirm_exit_only_when_tags_and_unconfirmed() {
+        assert!(should_confirm_exit(true, false));
+        assert!(!should_confirm_exit(false, false));
+        assert!(!should_confirm_exit(true, true));
+        assert!(!should_confirm_exit(false, true));
     }
 
-    /// 未知事件编号不接管
+    // ---------- parse_cli_no_tray ----------
+
+    /// 命令行含 `--no-tray`（任意位置，含 argv[0] 之后）→ true
     #[test]
-    fn ctrl_c_handled_ignores_unknown_event() {
-        assert!(!ctrl_c_handled(999, true));
+    fn parse_no_tray_true_when_flag_present() {
+        use std::ffi::OsString;
+        let args = [
+            OsString::from("wintag"),
+            OsString::from("--no-tray"),
+            OsString::from("--config-dir"),
+            OsString::from("C:\\cfg"),
+        ];
+        assert!(parse_cli_no_tray(&args));
+    }
+
+    /// 命令行不含 `--no-tray`（仅 --config-dir / 无参数）→ false
+    #[test]
+    fn parse_no_tray_false_when_flag_absent() {
+        use std::ffi::OsString;
+        let args = [
+            OsString::from("wintag"),
+            OsString::from("--config-dir"),
+            OsString::from("C:\\cfg"),
+        ];
+        assert!(!parse_cli_no_tray(&args));
+        assert!(!parse_cli_no_tray(&[OsString::from("wintag")]));
+    }
+
+    /// 非 UTF-8 参数不 panic，且不误判为 --no-tray
+    #[test]
+    fn parse_no_tray_handles_non_utf8() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let weird = OsString::from_wide(&[0xD800]);
+        let args = [OsString::from("wintag"), weird];
+        assert!(!parse_cli_no_tray(&args));
+    }
+
+    /// --no-tray 前若无其它参数干扰，靠 == 逐项比较而非前缀匹配
+    #[test]
+    fn parse_no_tray_does_not_match_prefix() {
+        use std::ffi::OsString;
+        let args = [OsString::from("wintag"), OsString::from("--no-tray-extra")];
+        assert!(!parse_cli_no_tray(&args));
     }
 }

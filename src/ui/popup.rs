@@ -28,7 +28,7 @@ use crate::common::{self, get_userdata, set_userdata, widestring};
 use crate::core::matcher;
 use crate::core::tag::{Tag, TagColor, TagStore};
 use crate::ui::button::{self, ButtonStyle};
-use crate::ui::layout::dp;
+use crate::ui::layout::{client_height, dp};
 use crate::ui::theme::apply_font_to_children;
 
 const IDC_TITLE_EDIT: i32 = 101;
@@ -319,13 +319,12 @@ pub fn create_popup(
                 }
             }
         }
-        Err(e) => {
+        Err(_) => {
             // SAFETY: CreateWindowExW 失败时窗口未接管 data_ptr，所有权仍在本函数；
             // 重建 Box 释放内存，防止泄漏。
             unsafe {
                 drop(Box::from_raw(data_ptr));
             }
-            eprintln!("创建弹窗失败: {e}");
         }
     }
 }
@@ -436,7 +435,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             let chip_gap = dp(hwnd, CHIP_GAP);
             let edit_x = m + label_w;
             let edit_w = win_w - m - edit_x;
-            let client_h = dp(hwnd, WIN_H) - dp(hwnd, 30); // 减去标题栏近似高度
+            let client_h = client_height(hwnd, WIN_H); // 客户区高 = 外高抵扣标题栏
             let btn_row_y = client_h - m - btn_h;
             // 备注编辑框顶 = 备注标签行下方（标签行高 + 4px 间距），底 = 按钮行
             // 上方（留 btn_gap 间距）。原实现漏减标签行高，编辑框下探遮挡按钮行。
@@ -693,7 +692,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
 
             match id {
                 IDC_OK_BUTTON => save_and_close(hwnd),
-                IDC_CANCEL_BUTTON => cancel_and_close(hwnd, data),
+                IDC_CANCEL_BUTTON => cancel_and_close(hwnd),
                 // 颜色色块点击（R16）：更新选中色并整窗重绘色块行
                 id if (IDC_COLOR_BASE..IDC_COLOR_BASE + COLOR_CHOICES.len() as i32)
                     .contains(&id) =>
@@ -728,7 +727,7 @@ extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     // SAFETY: get_userdata 由 common 封装，hwnd 为本窗口且仅在消息循环内调用。
                     let data = unsafe { get_userdata::<PopupData>(hwnd) };
                     if !data.is_null() {
-                        cancel_and_close(hwnd, data);
+                        cancel_and_close(hwnd);
                     }
                 }
                 // Tab / Shift+Tab：在标题/备注/确认/取消间循环切换键盘焦点（R7）。
@@ -881,9 +880,6 @@ fn save_and_close(hwnd: HWND) {
                     LPARAM(0),
                 );
             }
-            println!("已标记窗口：{}", unsafe { &(*data).window_title });
-        } else {
-            eprintln!("标签存储锁中毒，标记未保存");
         }
     }
     // SAFETY: hwnd 为本窗口有效句柄，DestroyWindow 触发 WM_DESTROY 释放数据。
@@ -894,16 +890,12 @@ fn save_and_close(hwnd: HWND) {
 
 /// 执行“取消”关闭弹窗（取消按钮与 ESC 键共用，问题 5.2）
 ///
-/// 打印取消日志后走 `WM_CLOSE` 单一路径关闭弹窗（覆盖层无需销毁，见 WM_CLOSE）。
+/// 走 `WM_CLOSE` 单一路径关闭弹窗（覆盖层无需销毁，见 WM_CLOSE）。
 ///
 /// # 参数
 ///
 /// - `hwnd`：弹窗窗口句柄
-/// - `data`：弹窗用户数据指针（由调用方保证非空且在窗口生命周期内有效）
-fn cancel_and_close(hwnd: HWND, data: *mut PopupData) {
-    // SAFETY: data 由调用方保证非空且在窗口生命周期内有效（WM_DESTROY 前），
-    // 此处仅读取 window_title 字段。
-    println!("取消标记窗口：{}", unsafe { &(*data).window_title });
+fn cancel_and_close(hwnd: HWND) {
     // SAFETY: 取消统一走 WM_CLOSE 单一路径关闭弹窗（覆盖层无需销毁，见 WM_CLOSE）。
     unsafe {
         let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));

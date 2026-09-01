@@ -974,7 +974,8 @@ fn update_layered_badge(hwnd: HWND) {
     // SAFETY: hwnd 为覆盖层窗口存活句柄；UpdateLayeredWindow 提交内存 DC 内容
     // 为窗口的分层像素，ULW_ALPHA 启用逐像素 alpha 混合。mem_dc 为
     // CreateCompatibleDC 返回的 HDC。
-    if let Err(e) = unsafe {
+    // 失败不再静默记录（Windows 子系统无控制台）：丢弃错误，下次 WM_PAINT 会重试。
+    let _ = unsafe {
         UpdateLayeredWindow(
             hwnd,
             None,
@@ -986,11 +987,7 @@ fn update_layered_badge(hwnd: HWND) {
             Some(&blend),
             ULW_ALPHA,
         )
-    } {
-        // 失败不再静默：记录错误，便于定位“角标不显示”类问题
-        //（失败时下次 WM_PAINT 会重试）。
-        eprintln!("[覆盖层] UpdateLayeredWindow 失败: {e}，角标内容未提交");
-    }
+    };
 
     // 清理：恢复原对象 → 删 bitmap → 删内存 DC
     // SAFETY: 成对清理，无跨消息生命周期。

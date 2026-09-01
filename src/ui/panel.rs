@@ -28,7 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use crate::common::{get_userdata, set_userdata, widestring, WM_APP_EDIT_TAG, WM_APP_TAGS_CHANGED};
+use crate::common::{
+    get_userdata, set_userdata, widestring, WM_APP_EDIT_TAG, WM_APP_EXIT, WM_APP_TAGS_CHANGED,
+};
 use crate::core::tag::TagStore;
 use crate::ui::button::{self, ButtonStyle};
 use crate::ui::layout::dp;
@@ -39,13 +41,16 @@ const IDC_LIST_VIEW: i32 = 202;
 /// 一键全部展开 / 全部收起按钮（问题 20）
 const IDC_EXPAND_ALL: i32 = 203;
 const IDC_COLLAPSE_ALL: i32 = 204;
+/// 底部"退出"按钮（D24，--no-tray 模式退出入口），单击经 WM_APP_EXIT 请求退出
+const IDC_EXIT: i32 = 205;
 
-/// 键盘焦点循环顺序（问题 22）：搜索框 → 树形列表 → 全部展开 → 全部收起
-const FOCUS_ORDER: [i32; 4] = [
+/// 键盘焦点循环顺序（问题 22/D24）：搜索框 → 树形列表 → 全部展开 → 全部收起 → 退出
+const FOCUS_ORDER: [i32; 5] = [
     IDC_SEARCH_EDIT,
     IDC_LIST_VIEW,
     IDC_EXPAND_ALL,
     IDC_COLLAPSE_ALL,
+    IDC_EXIT,
 ];
 
 /// 右键菜单命令 ID（R17，配合 `TPM_RETURNCMD` 直接取回选择）
@@ -150,8 +155,7 @@ pub fn create_panel(data: Arc<Mutex<TagStore>>, hidden_hwnd: isize) -> HWND {
 
     match panel {
         Ok(panel) => panel,
-        Err(e) => {
-            eprintln!("创建面板窗口失败: {e}");
+        Err(_) => {
             // SAFETY: data_ptr 由 Box::into_raw 产生且窗口创建失败，所有权未转移
             // 给任何 WndProc（WM_CREATE 未执行），在此回收防止内存泄漏。
             unsafe {
@@ -260,13 +264,7 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                     None,
                 )
             };
-            let list_view = match list_view {
-                Ok(tv) => tv,
-                Err(e) => {
-                    eprintln!("创建树形列表失败: {e}");
-                    HWND::default()
-                }
-            };
+            let list_view = list_view.unwrap_or_default();
             // 子类化树控件（问题 22）：回车 / Tab 转发父面板统一处理键盘操作
             //（树自身默认消费回车切换展开，必须拦截才能回车激活选中项）
             if list_view != HWND::default() {
@@ -307,6 +305,19 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 "全部收起",
                 btn_x + btn_w + btn_gap,
                 btn_y,
+                btn_w,
+                btn_h,
+                ButtonStyle::Secondary,
+            );
+            // "退出"按钮（D24，--no-tray 模式退出入口）：置于面板底部，实际坐标随
+            // WM_SIZE/layout_children 校正（此处按初始窗口高估算落点占位）。
+            let exit_y = dp(hwnd, WIN_H) - m - btn_h;
+            let _ = button::create_button(
+                hwnd,
+                IDC_EXIT,
+                "退出",
+                btn_x,
+                exit_y,
                 btn_w,
                 btn_h,
                 ButtonStyle::Secondary,
@@ -356,13 +367,32 @@ extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
             if id == IDC_SEARCH_EDIT && code == EN_CHANGE {
                 refresh_tree(hwnd);
             } else if code == BN_CLICKED {
-                // 按钮点击（问题 20）：一键全部展开 / 全部收起
-                // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
-                if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
-                    match id {
-                        IDC_EXPAND_ALL => expand_all_roots(list_view),
-                        IDC_COLLAPSE_ALL => collapse_all_roots(list_view),
-                        _ => {}
+                if id == IDC_EXIT {
+                    // "退出"按钮（D24）：经隐藏窗口请求退出（--no-tray 模式退出入口），
+                    // wParam=0 表示"请求退出"，由主线程规范退出流判定是否需确认。
+                    // SAFETY: 面板窗口由 create_panel 创建，窗口存活期间 PanelData 有效。
+                    let data = unsafe { get_userdata::<PanelData>(hwnd) };
+                    if !data.is_null() {
+                        // SAFETY: data 已校验非空；hidden_hwnd 为启动时注入的存活隐藏
+                        // 窗口句柄；PostMessageW 为线程安全标准 API，异步投递。
+                        unsafe {
+                            let _ = PostMessageW(
+                                HWND((*data).hidden_hwnd as *mut std::ffi::c_void),
+                                WM_APP_EXIT,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                } else {
+                    // 按钮点击（问题 20）：一键全部展开 / 全部收起
+                    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+                    if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
+                        match id {
+                            IDC_EXPAND_ALL => expand_all_roots(list_view),
+                            IDC_COLLAPSE_ALL => collapse_all_roots(list_view),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -608,7 +638,7 @@ fn focus_next_control(hwnd: HWND, forward: bool) {
 ///
 /// 修正原 WM_SIZE 的 bug（SetWindowPos 缺 SWP_NOMOVE，控件被吸到 (0,0)），
 /// 恢复四边 MARGIN 内边距：搜索框顶部对齐、按钮（问题 20）与搜索框同排
-/// 右对齐、列表占剩余空间。
+/// 右对齐、列表占底部按钮行（D24）上方剩余空间。
 fn layout_children(hwnd: HWND, width: i32, height: i32) {
     let m = dp(hwnd, MARGIN);
     let search_h = dp(hwnd, SEARCH_H);
@@ -671,10 +701,29 @@ fn layout_children(hwnd: HWND, width: i32, height: i32) {
             );
         }
     }
-    // 列表：占按钮行下方到客户区底边
+    // 底部按钮行（D24）："退出"按钮右对齐贴客户区底边，列表可用高度下移避让
+    let exit_y = (height - m - btn_h).max(m);
+    let exit_x = (width - m - btn_w).max(m);
+    // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
+    if let Ok(exit_btn) = unsafe { GetDlgItem(hwnd, IDC_EXIT) } {
+        // SAFETY: SetWindowPos 移动退出按钮到底部右对齐并调整尺寸；SWP_NOZORDER 保留 Z 序。
+        use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+        unsafe {
+            let _ = SetWindowPos(
+                exit_btn,
+                HWND_TOP,
+                exit_x,
+                exit_y,
+                btn_w,
+                btn_h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+    }
+    // 列表：占按钮行下方到退出按钮行上方（底部按钮行下移，列表高度同步收窄）
     // SAFETY: GetDlgItem 按子控件 ID 查询，失败时返回 Err 被忽略。
     if let Ok(list_view) = unsafe { GetDlgItem(hwnd, IDC_LIST_VIEW) } {
-        let list_h = (height - list_y - m).max(1);
+        let list_h = (height - list_y - m - (btn_h + btn_gap)).max(1);
         let content_w = (width - 2 * m).max(1);
         // SAFETY: SWP_NOMOVE 保留原位置（m, list_y），仅改尺寸。
         use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;

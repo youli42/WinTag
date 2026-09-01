@@ -34,28 +34,31 @@ cargo fmt
 ```
 src/
 ├── lib.rs           # 库入口，公开模块
-├── main.rs          # 入口，消息循环、热键分发、覆盖层管理
+├── main.rs          # 入口，Windows 子系统 + 单实例保护 + 托盘常驻，消息循环、热键分发、覆盖层管理
 ├── build.rs         # 构建脚本：嵌入 comctl32 v6 视觉样式 manifest（D11）
+├── common/          # 系统级共享工具层（叶子模块，D7）：宽字符串转换、窗口用户数据读写、自定义消息常量
+│   └── mod.rs       # 自定义消息：WM_APP+1..7 已占（OVERLAY/DESTROY/WINEVENT/OPEN_SETTINGS/THEME_CHANGED/TAGS_CHANGED/EDIT_TAG）；D24 增 WM_APP_TRAY=WM_APP+8、WM_APP_EXIT=WM_APP+9
 ├── sys/             # 底层系统服务层 — Win32 API 调用
 │   ├── mod.rs
 │   ├── window.rs    # 窗口检测、句柄捕获、事件监听
 │   ├── badge.rs     # 角标/标题条软件光栅渲染纯函数（SDF 圆边三角形 + 圆角矩形 + 标题截断，D11/D12）
 │   ├── overlay.rs   # 透明覆盖层绘制与同步（UpdateLayeredWindow 逐像素 alpha，BGRA 字节序，D17；D12 起含可选圆角标题条，开关经 set_show_title 注入；D14 首绘异步化 + 每次同步重申置顶；D16 单击经 WM_APP_EDIT_TAG 请求编辑；D18 tooltip 分字体 DT_CALCRECT 量测、DrawTextW 返回值推进备注行；D19 置顶可选化——badge_always_top 关闭时 insert-after 目标窗口跟随其 z 序；D20 修正——SetWindowPos 的 hWndInsertAfter 会把窗口排到其背后，须插到目标前邻 GW_HWNDPREV + 对齐 z 带，tooltip 同逻辑）
-│   └── tray.rs      # （规划中，D22）系统托盘图标 Shell_NotifyIcon + NOTIFYICONDATAW + TrayCommand；main 接 ui，保持 ui→core→sys
+│   └── tray.rs      # 系统托盘（D22/D24 落地）：Shell_NotifyIconW + NOTIFYICONDATAW + TrayCommand 枚举（纯函数层 + Win32 实现层）；左键单击/气泡点击=打开概览面板、右键四项菜单、should_show_balloon/show_balloon（NIF_INFO + NIM_MODIFY）、TaskbarCreated 重注册；main 接 ui，保持 ui→core→sys
 ├── core/            # 核心数据管理层
 │   ├── mod.rs
 │   ├── tag.rs       # 标签数据结构定义（内存中，无持久化；规划中加 group 字段，D23）
 │   ├── matcher.rs   # 窗口句柄匹配逻辑
-│   ├── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml；含 show_badge_title，R6；badge_always_top，R19/D19；规划中加 hotkeys/panel_dock，D22/D23）
+│   ├── settings.rs  # 配置数据模型与 TOML 持久化（%APPDATA%\WinTag\config.toml；含 show_badge_title，R6；badge_always_top，R19/D19；show_balloon，D24；规划中加 hotkeys/panel_dock，D22/D23）
 │   └── hotkey_config.rs  # （规划中，D23）自定义快捷键数据模型（纯 serde，HotkeyMap）
 ├── ui/              # 用户界面层
 │   ├── mod.rs
-│   ├── panel.rs     # 全局概览面板（DarkMode_Explorer；D12 改 SysTreeView32 可展开树形列表 + 单击置前目标窗口；D13 标签变更自动刷新 WM_APP_TAGS_CHANGED + MIN_W 300；D14 默认纵向 400×640）；D15 根项「标题 | 窗口名称」同行、展开显示完整多行备注
+│   ├── panel.rs     # 全局概览面板（DarkMode_Explorer；D12 改 SysTreeView32 可展开树形列表 + 单击置前目标窗口；D13 标签变更自动刷新 WM_APP_TAGS_CHANGED + MIN_W 300；D14 默认纵向 400×640）；D15 根项「标题 | 窗口名称」同行、展开显示完整多行备注；D24 底部"退出"按钮（--no-tray 退出入口，经 WM_APP_EXIT）
 │   ├── popup.rs     # 悬浮便签浮窗（布局重排 + 自绘按钮，D11；Tab 循环/回车保存/Shift+回车换行子类化转发，D14；颜色色块行 + 动态长度读取，D16；单例复用 + 光标附近定位，D17）
 │   ├── button.rs    # 自绘圆角按钮模块（BS_OWNERDRAW + WM_DRAWITEM，D11）
 │   ├── layout.rs    # DPI 缩放辅助（dp()，D11）
 │   ├── theme.rs     # 暗色主题与圆角 + 全局字体 + 扩展调色板（DWM + WM_CTLCOLOR + lfMessageFont，D11；统一主题管理器 sync_window_theme/apply_control_theme + 下拉框 DarkMode_Explorer 变体，D17）
-│   ├── settings.rs  # 设置页面窗口（主题/圆角选择、角标显示标题开关、保存、WM_APP_THEME_CHANGED 广播；下拉框 CBS_OWNERDRAWFIXED 自绘 + WM_CTLCOLOR* 以 wParam 为 HDC，D18；角标始终置顶开关，D19）
+│   ├── settings.rs  # 设置页面窗口（主题/圆角选择、角标显示标题开关、气泡提示开关 show_balloon、保存、WM_APP_THEME_CHANGED 广播；下拉框 CBS_OWNERDRAWFIXED 自绘 + WM_CTLCOLOR* 以 wParam 为 HDC，D18；角标始终置顶开关，D19；气泡提示开关，D24）
+│   ├── confirm.rs   # 退出确认弹窗（D24）：定制主题自绘（仿 popup），Accent"退出" + Secondary"取消"，回车确认/Esc 取消/Tab 循环，确认后经 WM_APP_EXIT(wParam=1) 请求退出
 │   ├── charts.rs    # （规划中，D23）统计图表窗口（GDI 柱状图，bar_layout 纯函数）
 │   └── (规划中) settings.rs 增"教程/快捷键"分页，D22/D23
 └── hotkey.rs        # 全局热键注册（规划中支持自定义快捷键，D23）
@@ -108,6 +111,6 @@ tests/
 
 ## 当前阶段
 
-项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；2026-08-29 完成 UI 全面现代化（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + 自绘圆角按钮 + ListView DarkMode_Explorer + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow 圆边三角形角标 + tooltip 圆角分层重绘）；2026-08-30 完成覆盖层标题条（R6/R11：角标旁圆角胶囊显示标签标题、5 字省略号截断、悬停看完整标题与备注、设置页开关）、概览面板树形化（R12：SysTreeView32 可展开列表）与面板单击置前（R13），见 [decision-records.md D12](./doc/decision-records.md)；同日完成面板标签变更自动刷新（D13：`WM_APP_TAGS_CHANGED` 广播经主线程转发、刷新保留展开状态）与面板最小宽度放宽（520 → 300 设计像素），见 [decision-records.md D13](./doc/decision-records.md)；同日完成弹窗键盘语义补全与三项修复（D14：Tab 在标题/备注/按钮间循环切换、备注框回车保存 Shift+回车换行、备注框遮挡按钮行的布局修复与 DPI 基准统一、面板默认纵向 400×640、覆盖层首绘异步化 + 创建后强制重绘 + 每次同步重申 HWND_TOPMOST 以修复新标注角标不显示），见 [decision-records.md D14](./doc/decision-records.md)；同日完成标注流程闭环（D16：角标/标题条单击打开预填编辑弹窗 R5、弹窗 5 色颜色选择行 R16、面板右键菜单置前/编辑/移除与 Esc 关闭 R17、标题/备注动态长度读取修复静默截断），见 [decision-records.md D16](./doc/decision-records.md)；同日完成三项实测缺陷修复（D18：设置页 WM_CTLCOLOR* 误用 lParam 为 HDC、下拉框改 CBS_OWNERDRAWFIXED 自绘推翻 D17-3 子类化方案——Win11 上显示区不走任何配色消息、tooltip 备注裁切根因修复——DrawTextW 不回写矩形 bottom + 默认字体量测行高偏小），见 [decision-records.md D18](./doc/decision-records.md)；边缘情况（全屏降级、托盘图标、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。
+项目处于 **MVP 开发中**，核心功能已实现，覆盖层位置同步、暗色主题、设置页与配置持久化均已完成；2026-08-29 完成 UI 全面现代化（D11：comctl32 v6 manifest + 全局字体 + 扩展调色板 + 自绘圆角按钮 + ListView DarkMode_Explorer + 三窗口布局重排 + 覆盖层 UpdateLayeredWindow 圆边三角形角标 + tooltip 圆角分层重绘）；2026-08-30 完成覆盖层标题条（R6/R11：角标旁圆角胶囊显示标签标题、5 字省略号截断、悬停看完整标题与备注、设置页开关）、概览面板树形化（R12：SysTreeView32 可展开列表）与面板单击置前（R13），见 [decision-records.md D12](./doc/decision-records.md)；同日完成面板标签变更自动刷新（D13：`WM_APP_TAGS_CHANGED` 广播经主线程转发、刷新保留展开状态）与面板最小宽度放宽（520 → 300 设计像素），见 [decision-records.md D13](./doc/decision-records.md)；同日完成弹窗键盘语义补全与三项修复（D14：Tab 在标题/备注/按钮间循环切换、备注框回车保存 Shift+回车换行、备注框遮挡按钮行的布局修复与 DPI 基准统一、面板默认纵向 400×640、覆盖层首绘异步化 + 创建后强制重绘 + 每次同步重申 HWND_TOPMOST 以修复新标注角标不显示），见 [decision-records.md D14](./doc/decision-records.md)；同日完成标注流程闭环（D16：角标/标题条单击打开预填编辑弹窗 R5、弹窗 5 色颜色选择行 R16、面板右键菜单置前/编辑/移除与 Esc 关闭 R17、标题/备注动态长度读取修复静默截断），见 [decision-records.md D16](./doc/decision-records.md)；同日完成三项实测缺陷修复（D18：设置页 WM_CTLCOLOR* 误用 lParam 为 HDC、下拉框改 CBS_OWNERDRAWFIXED 自绘推翻 D17-3 子类化方案——Win11 上显示区不走任何配色消息、tooltip 备注裁切根因修复——DrawTextW 不回写矩形 bottom + 默认字体量测行高偏小），见 [decision-records.md D18](./doc/decision-records.md)；2026-09-01 完成托盘常驻化（D24：Windows 子系统 + 单实例保护 + 默认托盘常驻零窗口启动 + 启动气泡可开关 + `--no-tray` 禁用 + 有标签退出弹定制主题确认窗 + 托盘右键四项菜单/左键与气泡打开面板 + 面板底部"退出"按钮 + 设置页"气泡提示"开关），见 [decision-records.md D24](./doc/decision-records.md)；边缘情况（全屏降级、窗口激活闪烁反馈）登记于 [doc/decision-records.md](./doc/decision-records.md) 遗留项。
 
-**扩展规划（2026-08-31，只读调研，未实施）**：功能增强与使用性问题修复已调研并归档——① 系统托盘（D22，v1 系统图标可接受）；② 标签分组/工作区（D23，**纯会话不持久化**，分组控件置于新建标签弹窗标题下方，可输入或选择已有分组）；③ 统计图表（D23，形态待确认，默认按分组计数柱状图）；④ 自定义快捷键（D23，设置页"快捷键"分页录制）；⑤ 面板增强（默认展开、一键展开收起、贴边隐藏、纯键盘操作，D21）；⑥ 标签跟随移动修复（D21，MOVESIZESEND 最终同步 + 轮询加速）。详见 [doc/issues-and-requirements.md 四、扩展规划](./doc/issues-and-requirements.md) 与 [doc/decision-records.md D21-D23](./doc/decision-records.md)。详细设计文档见 `doc/` 目录。
+**扩展规划（2026-08-31，只读调研，未实施）**：功能增强与使用性问题修复已调研并归档——① ~~系统托盘（D22，v1 系统图标可接受）~~（✅ 已随 D24 落地）；② 标签分组/工作区（D23，**纯会话不持久化**，分组控件置于新建标签弹窗标题下方，可输入或选择已有分组）；③ 统计图表（D23，形态待确认，默认按分组计数柱状图）；④ 自定义快捷键（D23，设置页"快捷键"分页录制）；⑤ 面板增强（默认展开、一键展开收起、贴边隐藏、纯键盘操作，D21）；⑥ 标签跟随移动修复（D21，MOVESIZESEND 最终同步 + 轮询加速）。详见 [doc/issues-and-requirements.md 四、扩展规划](./doc/issues-and-requirements.md) 与 [doc/decision-records.md D21-D23](./doc/decision-records.md)。详细设计文档见 `doc/` 目录。

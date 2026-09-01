@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::common::{get_userdata, set_userdata, widestring, WM_APP_THEME_CHANGED};
 use crate::core::settings::{global_settings, CornerPreference, Settings, ThemeMode};
 use crate::ui::button::{self, ButtonStyle};
-use crate::ui::layout::dp;
+use crate::ui::layout::{client_height, dp};
 use crate::ui::theme::{
     apply_control_theme, apply_corner_preference, apply_dark_mode, apply_font_to_children,
     get_brush, light_colors, sync_window_theme, theme_colors,
@@ -50,6 +50,7 @@ const IDC_TITLE_CHECK: i32 = 203;
 const IDC_TOP_CHECK: i32 = 204;
 const IDC_SAVE_BUTTON: i32 = 205;
 const IDC_CANCEL_BUTTON: i32 = 206;
+const IDC_BALLOON_CHECK: i32 = 207;
 
 /// 设计像素常量（96 DPI 基准）
 const MARGIN: i32 = 20;
@@ -62,7 +63,7 @@ const BTN_W: i32 = 88;
 const BTN_H: i32 = 30;
 const BTN_GAP: i32 = 8;
 const WIN_W: i32 = 460;
-const WIN_H: i32 = 330;
+const WIN_H: i32 = 390;
 
 /// 设置窗口的用户数据：设置存储引用、隐藏窗口句柄与可见状态
 ///
@@ -88,6 +89,8 @@ pub struct SettingsData {
     pub title_check: HWND,
     /// "角标始终置顶"复选框句柄（`WM_CREATE` 后有效，R19）
     pub top_check: HWND,
+    /// "气泡提示"复选框句柄（`WM_CREATE` 后有效，D22：托盘启动气泡开关）
+    pub balloon_check: HWND,
 }
 
 /// 创建设置窗口（初始隐藏）
@@ -155,8 +158,7 @@ pub fn create_settings(data: SettingsData) -> HWND {
             let _ = SETTINGS_HWND.set(hwnd.0 as isize);
             hwnd
         }
-        Err(e) => {
-            eprintln!("创建设置窗口失败: {e}");
+        Err(_) => {
             // SAFETY: data_ptr 由 Box::into_raw 产生且窗口创建失败，所有权未转移
             // 给任何 WndProc（WM_CREATE 未执行），在此回收防止内存泄漏。
             unsafe {
@@ -249,9 +251,10 @@ extern "system" fn settings_wndproc(
             let row2_y = row1_y + ctrl_h + dp(hwnd, ROW_GAP);
             let row3_y = row2_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
             let row4_y = row3_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
+            let row5_y = row4_y + ctrl_h + dp(hwnd, ROW_GAP_SMALL);
             let combo_x = m + label_w;
             let combo_w = WIN_W - m - combo_x;
-            let client_h = WIN_H - dp(hwnd, 30);
+            let client_h = client_height(hwnd, WIN_H); // 客户区高 = 外高抵扣标题栏
             let btn_w = dp(hwnd, BTN_W);
             let btn_h = dp(hwnd, BTN_H);
             let btn_gap = dp(hwnd, BTN_GAP);
@@ -315,10 +318,7 @@ extern "system" fn settings_wndproc(
                     subclass_combo_for_theme(c);
                     c
                 }
-                Err(e) => {
-                    eprintln!("创建主题下拉框失败: {e}");
-                    HWND::default()
-                }
+                Err(_) => HWND::default(),
             };
             // 填充主题下拉项（顺序与 ThemeMode 枚举变体索引一致：System/Light/Dark）
             for mode in [ThemeMode::System, ThemeMode::Light, ThemeMode::Dark] {
@@ -378,10 +378,7 @@ extern "system" fn settings_wndproc(
                     subclass_combo_for_theme(c);
                     c
                 }
-                Err(e) => {
-                    eprintln!("创建圆角下拉框失败: {e}");
-                    HWND::default()
-                }
+                Err(_) => HWND::default(),
             };
             // 填充圆角下拉项（顺序与 CornerPreference 枚举变体索引一致：
             // Default/Round/SmallRound）
@@ -408,7 +405,7 @@ extern "system" fn settings_wndproc(
                 WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32);
             // SAFETY: 创建 AUTOCHECKBOX 子控件（ID = IDC_TITLE_CHECK）；
             // 失败时返回默认句柄并打印告警，保存时按未勾选处理。
-            let title_check = match unsafe {
+            let title_check = (unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     windows::core::w!("BUTTON"),
@@ -423,18 +420,13 @@ extern "system" fn settings_wndproc(
                     instance,
                     None,
                 )
-            } {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("创建标题显示复选框失败: {e}");
-                    HWND::default()
-                }
-            };
+            })
+            .unwrap_or_default();
 
             // —— 角标始终置顶复选框（R19：关闭后角标跟随目标窗口 z 序）——
             // SAFETY: 创建 AUTOCHECKBOX 子控件（ID = IDC_TOP_CHECK）；
             // 失败时返回默认句柄并打印告警，保存时按未勾选处理。
-            let top_check = match unsafe {
+            let top_check = (unsafe {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     windows::core::w!("BUTTON"),
@@ -449,13 +441,29 @@ extern "system" fn settings_wndproc(
                     instance,
                     None,
                 )
-            } {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("创建置顶复选框失败: {e}");
-                    HWND::default()
-                }
-            };
+            })
+            .unwrap_or_default();
+
+            // —— 气泡提示复选框（D22：托盘启动时是否显示气泡提示）——
+            // SAFETY: 创建 AUTOCHECKBOX 子控件（ID = IDC_BALLOON_CHECK）；
+            // 失败时返回默认句柄并打印告警，保存时按未勾选处理。
+            let balloon_check = (unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    windows::core::w!("BUTTON"),
+                    windows::core::w!("气泡提示"),
+                    check_style,
+                    combo_x,
+                    row5_y,
+                    combo_w,
+                    ctrl_h,
+                    hwnd,
+                    HMENU(IDC_BALLOON_CHECK as *mut c_void),
+                    instance,
+                    None,
+                )
+            })
+            .unwrap_or_default();
 
             // —— 按钮行：右下 保存（accent）/取消（次要），自绘（9.4/9.8）——
             // SAFETY: create_button 内部注册状态并子类化；失败返回 Err，忽略。
@@ -488,6 +496,7 @@ extern "system" fn settings_wndproc(
                 (*data).corner_combo = corner_combo;
                 (*data).title_check = title_check;
                 (*data).top_check = top_check;
+                (*data).balloon_check = balloon_check;
             }
 
             // 全局消息字体注入所有子控件（STATIC/COMBOBOX；按钮自绘时选用 message_font）
@@ -881,6 +890,16 @@ fn refresh_selections(hwnd: HWND) {
             }),
             LPARAM(0),
         );
+        let _ = SendMessageW(
+            (*data).balloon_check,
+            BM_SETCHECK,
+            WPARAM(if current.show_balloon {
+                BST_CHECKED.0 as usize
+            } else {
+                BST_UNCHECKED.0 as usize
+            }),
+            LPARAM(0),
+        );
     }
 }
 
@@ -911,19 +930,22 @@ fn save_and_hide(hwnd: HWND) {
         == BST_CHECKED.0 as isize;
     let badge_top = unsafe { SendMessageW(pd.top_check, BM_GETCHECK, WPARAM(0), LPARAM(0)) }.0
         == BST_CHECKED.0 as isize;
+    let show_balloon = unsafe { SendMessageW(pd.balloon_check, BM_GETCHECK, WPARAM(0), LPARAM(0)) }
+        .0
+        == BST_CHECKED.0 as isize;
     let new_settings = Settings {
         theme: theme_from_index(theme_idx as i32),
         corner: corner_from_index(corner_idx as i32),
         show_badge_title: show_title,
         badge_always_top: badge_top,
+        show_balloon,
     };
 
-    // 更新内存中的设置并写盘（锁中毒时跳过，避免 panic 传播）
+    // 更新内存中的设置并写盘（锁中毒或写盘失败时跳过，避免 panic 传播）
     if let Ok(mut settings) = pd.settings.lock() {
         *settings = new_settings;
-        if let Err(e) = settings.save() {
-            eprintln!("保存设置失败: {e}");
-        }
+        // 保存失败不再打印（Windows 子系统无控制台）；忽略错误，内存态已生效。
+        let _ = settings.save();
     }
 
     // 广播主题变更消息到主线程隐藏窗口（由主线程重新应用主题到各窗口）

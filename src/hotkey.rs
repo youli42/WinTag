@@ -72,9 +72,8 @@ pub fn register_all(hwnd: HWND) -> Result<()> {
                 hotkey.vk(),
             )
         };
-        if let Err(e) = result {
-            eprintln!("[热键] 注册失败 (id={}): {}", hotkey.id(), e);
-        }
+        // 注册失败（如与其他程序冲突）best-effort 丢弃，继续注册剩余热键（不中断程序）。
+        let _ = result;
     }
     Ok(())
 }
