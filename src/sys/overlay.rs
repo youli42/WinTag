@@ -54,37 +54,20 @@ const FALLBACK_DOT_RGBA: [u8; 4] = [255, 183, 77, 255];
 /// WM_MOUSELEAVE：TrackMouseEvent(TME_LEAVE) 触发的鼠标离开消息
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-/// 角标标题条显示开关（R6 设置项 `show_badge_title` 的 sys 层注入镜像）
+/// 返回角标是否始终置顶（供 tooltip 创建与同步逻辑共用，R19）
 ///
-/// 依赖方向约束（ui → core → sys）不允许 sys 层读取 `core::settings`，
-/// 因此由主线程经 [`set_show_title`] 注入（启动时 + 设置保存广播后），
-/// 镜像 [`set_tooltip_theme`] 的注入模式。未注入时默认显示。
-static SHOW_TITLE: AtomicBool = AtomicBool::new(true);
-
-/// 注入标题条显示开关（R6：设置页"角标显示标题"）
-pub fn set_show_title(enabled: bool) {
-    SHOW_TITLE.store(enabled, Ordering::Relaxed);
-}
-
-/// 角标始终置顶开关（R19 设置项 `badge_always_top` 的 sys 层注入镜像）
-///
-/// 开启（默认）：覆盖层带 `WS_EX_TOPMOST` 且每次同步重申 `HWND_TOPMOST`，
-/// 浮在所有窗口之上（含被其他窗口盖住的目标窗口）。
-/// 关闭：覆盖层跟随目标窗口 z 序——`sync_position` 改用
-/// "插到目标窗口正上方一格"（insert-after）的方式重排，被其他窗口盖住时
-/// 随目标一起被遮挡，不再悬浮在最上层。
-/// 由主线程经 [`set_badge_always_top`] 注入（启动时 + 设置保存广播后），
-/// 与 [`SHOW_TITLE`] 相同的依赖方向约束（ui → core → sys）。
-static BADGE_ALWAYS_TOP: AtomicBool = AtomicBool::new(true);
-
-/// 注入角标始终置顶开关（R19：设置页"角标始终置顶"）
-pub fn set_badge_always_top(enabled: bool) {
-    BADGE_ALWAYS_TOP.store(enabled, Ordering::Relaxed);
-}
-
-/// 返回角标是否始终置顶（供 tooltip 创建与同步逻辑共用）
+/// D27 G1 起由 [`crate::sys::native_prefs::native_prefs`] 提供（主线程
+/// `set_native_prefs` 一次性注入），替代原 `set_show_title` / `set_badge_always_top`
+/// 两个单值 setter，维持 ui → core → sys 依赖方向。
 fn badge_always_top() -> bool {
-    BADGE_ALWAYS_TOP.load(Ordering::Relaxed)
+    crate::sys::native_prefs::native_prefs().badge_always_top
+}
+
+/// 返回角标标题条是否显示（R6，供 [`update_layered_badge`] 判断是否绘标题条）
+///
+/// 同 [badge_always_top]，D27 G1 起读 [`crate::sys::native_prefs::native_prefs`]。
+fn show_title() -> bool {
+    crate::sys::native_prefs::native_prefs().show_title
 }
 
 /// 注入的隐藏窗口句柄（消息中转目标）
@@ -148,25 +131,6 @@ static TAG_STORE_INNER: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
 /// 未调用本函数时悬停静默：不显示 tooltip，也不产生任何错误。
 pub fn set_tag_store(store: Arc<Mutex<TagStore>>) {
     let _ = TAG_STORE_INNER.set(store);
-}
-
-/// 注入的 tooltip 主题配色（元组：(背景色, 前景色)，`COLORREF` 为 `0x00BBGGRR` 布局）
-///
-/// 通过 [`set_tooltip_theme`] 注入；未注入时 tooltip 回退默认白底黑字，
-/// 与注入前的行为完全一致。采用 `Mutex` 承载以支持主题切换后热更新
-/// （决策记录 D11：修复主题切换后 tooltip 沿用启动配色的遗留问题），
-/// 读取用 `lock().ok()` 取当前值。
-static TOOLTIP_THEME: OnceLock<Mutex<(COLORREF, COLORREF)>> = OnceLock::new();
-
-/// 注入 tooltip 主题配色
-///
-/// 首次调用初始化 Mutex 存储；此后每次调用覆盖为最新配色，使主题切换后
-/// 新建的 tooltip 即时采用新配色。未调用本函数时 tooltip 保持默认白底黑字。
-pub fn set_tooltip_theme(bg: COLORREF, fg: COLORREF) {
-    let state = TOOLTIP_THEME.get_or_init(|| Mutex::new((bg, fg)));
-    if let Ok(mut guard) = state.lock() {
-        *guard = (bg, fg);
-    }
 }
 
 /// 透明覆盖层窗口
@@ -620,11 +584,11 @@ fn colorref_to_rgb(c: COLORREF) -> [u8; 3] {
 
 /// 读取标题条显示文本（R6：角标旁显示标题，超长截断为省略号）
 ///
-/// - 开关关闭（[`set_show_title`]）或未注入标签存储 → `None`（只画角标）；
+/// - 开关关闭（`show_title()` 返回 false）或未注入标签存储 → `None`（只画角标）；
 /// - 标签标题为空时回退窗口原始标题（`tag.window_title`）；
 /// - 均为空 → `None`。
 fn title_text(target_hwnd: isize) -> Option<String> {
-    if !SHOW_TITLE.load(Ordering::Relaxed) {
+    if !show_title() {
         return None;
     }
     let store = TAG_STORE_INNER.get()?;
@@ -866,17 +830,14 @@ fn update_layered_badge(hwnd: HWND) {
         None
     };
     let (pill_fill, pill_stroke, text_fg) = {
-        let theme = TOOLTIP_THEME
-            .get()
-            .and_then(|m| m.lock().ok().map(|g| *g))
-            .unwrap_or((COLORREF(0x00FFFFFF), COLORREF(0x00000000)));
+        let prefs = crate::sys::native_prefs::native_prefs();
         let border = crate::ui::theme::theme_colors()
             .map(|c| c.border)
             .unwrap_or(COLORREF(0x00808080));
         (
-            colorref_to_rgb(theme.0),
+            colorref_to_rgb(prefs.tooltip_bg),
             colorref_to_rgb(border),
-            colorref_to_rgb(theme.1),
+            colorref_to_rgb(prefs.tooltip_fg),
         )
     };
 
@@ -1379,12 +1340,10 @@ extern "system" fn tooltip_wndproc(
                 let mut ps = Default::default();
                 let hdc = BeginPaint(hwnd, &mut ps);
 
-                // 取注入的 tooltip 配色（Mutex 可热更新）：已注入用注入色，
+                // 取注入的 tooltip 配色（可热更新）：已注入用注入色，
                 // 未注入/锁中毒回退默认白底黑字
-                let (bg, fg) = TOOLTIP_THEME
-                    .get()
-                    .and_then(|m| m.lock().ok().map(|g| *g))
-                    .unwrap_or((COLORREF(0x00FFFFFF), COLORREF(0x00000000)));
+                let prefs = crate::sys::native_prefs::native_prefs();
+                let (bg, fg) = (prefs.tooltip_bg, prefs.tooltip_fg);
                 // 描边色取主题 border（未注入时用中灰）
                 let border = crate::ui::theme::theme_colors()
                     .map(|c| c.border)

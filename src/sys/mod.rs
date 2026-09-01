@@ -1,4 +1,5 @@
 pub mod badge;
+pub mod native_prefs;
 pub mod overlay;
 pub mod tray;
 pub mod win_event;

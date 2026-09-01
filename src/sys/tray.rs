@@ -13,8 +13,6 @@
 //! 依赖方向约束（`ui → core → sys`）：本层不源码级依赖 `core`/`ui`，仅
 //! 产生 [`TrayCommand`]，由主线程经 [`crate`] 分发到现有窗口动作。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use tray_icon::{
     menu::{Menu, MenuId, MenuItem},
     Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -31,14 +29,6 @@ const MENU_ID_EXIT: &str = "exit";
 
 /// 嵌入资源中的应用图标 ordinal（build.rs `set_icon` 写入 ID=1）
 const APP_ICON_RESOURCE_ID: u16 = 1;
-
-/// 托盘气泡显示开关（设置项 `show_balloon` 的 sys 层注入镜像）
-///
-/// 依赖方向约束不允许 sys 层读取 `core::settings`，因此由主线程经
-/// [`set_balloon_enabled`] 注入（启动时 + 设置保存广播后）。
-/// 未注入时默认显示；[`show_balloon`] 实际弹出前读取本开关。
-/// 注入模式镜像 `sys::overlay::set_show_title`。
-static BALLOON_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // =====================================================================
 // 纯逻辑层：TrayCommand + 事件/待命解码（零 tray-icon 依赖，可单测）
@@ -119,14 +109,9 @@ pub fn should_show_balloon(no_tray: bool, show_balloon: bool) -> bool {
 // 适配层：托盘图标创建/销毁、气泡通知（依赖 tray-icon / notify-rust）
 // =====================================================================
 
-/// 注入托盘气泡显示开关（[`show_balloon`] 实际弹出前读取本开关）
-pub fn set_balloon_enabled(enabled: bool) {
-    BALLOON_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-/// 读取托盘气泡显示开关（未注入时默认 `true`）
+/// 读取托盘气泡显示开关（D27 G1 起读 [`crate::sys::native_prefs`]，未注入默认 `true`）
 pub fn balloon_enabled() -> bool {
-    BALLOON_ENABLED.load(Ordering::Relaxed)
+    crate::sys::native_prefs::native_prefs().balloon_enabled
 }
 
 /// 构建四项托盘右键菜单（打开概览面板/打开设置页/快速标记/退出）。

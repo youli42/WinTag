@@ -74,6 +74,23 @@ fn parse_cli_no_tray(args: &[std::ffi::OsString]) -> bool {
     args.iter().any(|arg| arg == "--no-tray")
 }
 
+/// 由全局设置与系统深浅色解析原生层偏好（D27 G1 纯函数，可单测）
+///
+/// 把 [`Settings`]（core 层）与系统深浅色映射为 [`sys::native_prefs::NativePrefs`]
+/// （sys 层），供主线程一次性注入。tooltip 配色取自 `ui::theme::resolve_colors`
+/// 解析出的调色板，保持与其余窗口的主题一致；sys 层内部不感知 core/ui，
+/// 映射收敛在此处维持 `ui → core → sys` 依赖方向。
+fn apply_native_prefs(cfg: Settings, system_dark: bool) -> sys::native_prefs::NativePrefs {
+    let colors = ui::theme::resolve_colors(cfg.theme, system_dark);
+    sys::native_prefs::NativePrefs {
+        show_title: cfg.show_badge_title,
+        badge_always_top: cfg.badge_always_top,
+        tooltip_bg: colors.tooltip_bg,
+        tooltip_fg: colors.tooltip_fg,
+        balloon_enabled: cfg.show_balloon,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // 命令行参数处理（D22/R1）：`--config-dir` 由 core::settings::config_root()
     // 解析链消费（内部读取 args_os 并 memoize，见 settings.rs）；`--no-tray`
@@ -165,9 +182,9 @@ fn main() -> anyhow::Result<()> {
 
     // 注入 tooltip 配色与标题条显示开关（Mutex/AtomicBool 可热更新：
     // reapply_theme 在设置保存广播后重新注入，新内容即时采用新配色/开关）
-    sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
-    sys::overlay::set_show_title(cfg.show_badge_title);
-    sys::overlay::set_badge_always_top(cfg.badge_always_top);
+    // D27 G1：原生层偏好一次性注入（覆盖层/tooltip/托盘气泡共用一份 NativePrefs，
+    // 替代散落的 set_show_title/set_badge_always_top/set_tooltip_theme/set_balloon_enabled）
+    sys::native_prefs::set_native_prefs(apply_native_prefs(cfg, system_dark));
 
     // D27：启动 iced 线程（四个 GUI 窗口的宿主，阶段 G0 仅退出确认窗）。
     // 主线程与 iced 线程经一对 crossbeam 通道双向通信：主线程发 IcedCommand、
@@ -870,17 +887,10 @@ fn reapply_theme(hidden_hwnd: HWND) {
         }
     }
 
-    // 重新注入 tooltip 配色（Mutex 可热更新，主题切换后新 tooltip 即时采用新配色，
-    // 修复原先 OnceLock 一次性注入导致主题切换后 tooltip 沿用启动配色的遗留问题）
-    sys::overlay::set_tooltip_theme(colors.tooltip_bg, colors.tooltip_fg);
-    // 注入托盘气泡开关（sys 层镜像，设置保存广播后热更新；未注入时默认显示）
-    sys::tray::set_balloon_enabled(cfg.show_balloon);
-    // 重新注入标题条显示开关（R6），并强制所有已存在的覆盖层重绘：
-    // 主题切换后角标描边色 / 标题条配色即时更新，开关切换即时生效。
-    sys::overlay::set_show_title(cfg.show_badge_title);
-    // R19：角标置顶开关注入，并对已存在的覆盖层立刻重排 z 序（新覆盖层
-    // 创建时读取开关，旧覆盖层依赖事件/500ms 轮询也会自行收敛，此处即时生效）
-    sys::overlay::set_badge_always_top(cfg.badge_always_top);
+    // D27 G1：原生层偏好一次性重注入（设置保存广播后热更新；覆盖层/tooltip/托盘共用）
+    sys::native_prefs::set_native_prefs(apply_native_prefs(cfg, system_dark));
+    // 强制所有已存在的覆盖层重绘并重申 z 序：主题切换后角标描边色 / 标题条配色 /
+    // 置顶开关即时生效。
     if let Some(store) = OVERLAY_STORE.get() {
         if let Ok(overlays) = store.lock() {
             for overlay in overlays.values() {
@@ -961,5 +971,40 @@ mod tests {
         use std::ffi::OsString;
         let args = [OsString::from("wintag"), OsString::from("--no-tray-extra")];
         assert!(!parse_cli_no_tray(&args));
+    }
+
+    // ---------- apply_native_prefs（D27 G1）----------
+
+    /// 显式深色偏好：tooltip 配色取暗色调色板（深底近白字），其余开关透传
+    #[test]
+    fn apply_native_prefs_maps_dark_theme() {
+        use crate::core::settings::CornerPreference;
+        let cfg = Settings {
+            theme: ThemeMode::Dark,
+            corner: CornerPreference::Round,
+            show_badge_title: false,
+            badge_always_top: false,
+            show_balloon: false,
+        };
+        let prefs = apply_native_prefs(cfg, false);
+        assert!(!prefs.show_title);
+        assert!(!prefs.badge_always_top);
+        assert!(!prefs.balloon_enabled);
+        // 暗色 tooltip：#2F2F2F 底、近白字（与 ui::theme::dark_colors 一致）
+        assert_eq!(prefs.tooltip_bg, ui::theme::dark_colors().tooltip_bg);
+        assert_eq!(prefs.tooltip_fg, ui::theme::dark_colors().tooltip_fg);
+    }
+
+    /// System 模式跟随 system_dark：深色系统取暗色调色板
+    #[test]
+    fn apply_native_prefs_system_follows_dark() {
+        let cfg = Settings {
+            theme: ThemeMode::System,
+            ..Settings::default()
+        };
+        let dark = apply_native_prefs(cfg, true);
+        let light = apply_native_prefs(cfg, false);
+        assert_eq!(dark.tooltip_bg, ui::theme::dark_colors().tooltip_bg);
+        assert_eq!(light.tooltip_bg, ui::theme::light_colors().tooltip_bg);
     }
 }
