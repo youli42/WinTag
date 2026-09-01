@@ -16,10 +16,13 @@
 //! 桥接通道仅在本模块内部存在，不属于对外信道，符合「总线最小化」铁律。
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use iced::futures::StreamExt;
 use iced::keyboard::key::{Key, Named};
-use iced::widget::{button, checkbox, column, combo_box, container, row, text, text_input};
+use iced::widget::{
+    button, checkbox, column, combo_box, container, row, scrollable, text, text_input,
+};
 use iced::window;
 use iced::{Element, Length, Size, Subscription, Task, Theme};
 
@@ -27,7 +30,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::core::settings::{CornerPreference, Settings, ThemeMode};
 use crate::core::tag::{Tag, TagColor};
-use crate::ui::iced_proto::{plan_popup_action, GuiEvent, IcedCommand, PopupPlan};
+use crate::ui::iced_proto::{plan_popup_action, GuiEvent, IcedCommand, PopupPlan, TagRow};
 
 /// 退出确认窗口的目标尺寸（逻辑像素，iced 自管 DPI）
 const CONFIRM_W: f32 = 380.0;
@@ -38,6 +41,9 @@ const SETTINGS_H: f32 = 480.0;
 /// 标签弹窗目标尺寸（与 Win32 版 `popup` 的 420×320 一致）
 const POPUP_W: f32 = 420.0;
 const POPUP_H: f32 = 320.0;
+/// 概览面板目标尺寸（与 Win32 版 R14 的 400×640 一致）
+const PANEL_W: f32 = 400.0;
+const PANEL_H: f32 = 640.0;
 
 /// 五色选项（顺序与 Win32 版一致）
 const TAG_COLORS: [(TagColor, &str); 5] = [
@@ -88,6 +94,18 @@ struct PopupWindow {
     title_id: text_input::Id,
 }
 
+/// 概览面板的状态
+struct PanelState {
+    /// 窗口 id
+    id: window::Id,
+    /// 标签行列表（主线程经 `RefreshTags` 下发）
+    rows: Vec<TagRow>,
+    /// 搜索过滤关键字（空串 = 不过滤）
+    search: String,
+    /// 已展开（显示备注）的目标窗口句柄集合
+    expanded: HashSet<isize>,
+}
+
 /// iced 应用状态（运行在 iced 线程，单线程访问，无需 `Send`）
 ///
 /// 仅 [`Message`] 需要 `Send`（iced 事件循环要求），状态本体可含 `RefCell`。
@@ -103,6 +121,8 @@ pub struct WinTagApp {
     settings: Option<SettingsWindow>,
     /// 当前显示的标签弹窗（`None` = 未显示）
     popup: Option<PopupWindow>,
+    /// 当前显示的概览面板（`None` = 未显示）
+    panel: Option<PanelState>,
     /// 是否暗色主题（启动时解析；经 `ApplyTheme` 热更新）
     dark: bool,
 }
@@ -146,6 +166,23 @@ pub enum Message {
     PopupSavePressed,
     /// 取消（点击"取消" / Esc / 关闭窗口）
     PopupCancelPressed,
+    // ---- 概览面板交互 ----
+    /// 搜索框内容变更
+    PanelSearchChanged(String),
+    /// 展开/收起某行的备注
+    PanelToggleExpand(isize),
+    /// 全部展开
+    PanelExpandAll,
+    /// 全部收起
+    PanelCollapseAll,
+    /// 行点击（激活/置前目标窗口）
+    PanelRowActivated(isize),
+    /// 行"编辑"按钮
+    PanelRowEdit(isize),
+    /// 行"移除"按钮
+    PanelRowRemove(isize),
+    /// 面板底部"退出"
+    PanelExitPressed,
 }
 
 impl WinTagApp {
@@ -176,6 +213,7 @@ impl WinTagApp {
                 confirm: None,
                 settings: None,
                 popup: None,
+                panel: None,
                 dark,
             },
             Task::none(),
@@ -190,6 +228,8 @@ impl WinTagApp {
             "设置".to_string()
         } else if self.popup.as_ref().is_some_and(|c| c.id == window) {
             "标记窗口".to_string()
+        } else if self.panel.as_ref().is_some_and(|c| c.id == window) {
+            "WinTag 概览".to_string()
         } else {
             "WinTag".to_string()
         }
@@ -209,6 +249,10 @@ impl WinTagApp {
                 }
                 if self.popup.as_ref().is_some_and(|c| c.id == id) {
                     self.popup = None;
+                }
+                if self.panel.as_ref().is_some_and(|c| c.id == id) {
+                    self.panel = None;
+                    let _ = self.gui_tx.send(GuiEvent::PanelVisibilityChanged(false));
                 }
                 Task::none()
             }
@@ -308,6 +352,49 @@ impl WinTagApp {
                     Task::none()
                 }
             }
+            // ---- 概览面板 ----
+            Message::PanelSearchChanged(s) => {
+                if let Some(p) = &mut self.panel {
+                    p.search = s;
+                }
+                Task::none()
+            }
+            Message::PanelToggleExpand(target) => {
+                if let Some(p) = &mut self.panel {
+                    if !p.expanded.remove(&target) {
+                        p.expanded.insert(target);
+                    }
+                }
+                Task::none()
+            }
+            Message::PanelExpandAll => {
+                if let Some(p) = &mut self.panel {
+                    p.expanded = p.rows.iter().map(|r| r.target).collect();
+                }
+                Task::none()
+            }
+            Message::PanelCollapseAll => {
+                if let Some(p) = &mut self.panel {
+                    p.expanded.clear();
+                }
+                Task::none()
+            }
+            Message::PanelRowActivated(target) => {
+                let _ = self.gui_tx.send(GuiEvent::ActivateWindow { target });
+                Task::none()
+            }
+            Message::PanelRowEdit(target) => {
+                let _ = self.gui_tx.send(GuiEvent::EditTagRequested { target });
+                Task::none()
+            }
+            Message::PanelRowRemove(target) => {
+                let _ = self.gui_tx.send(GuiEvent::RemoveTag { target });
+                Task::none()
+            }
+            Message::PanelExitPressed => {
+                let _ = self.gui_tx.send(GuiEvent::PanelExit);
+                Task::none()
+            }
         }
     }
 
@@ -326,7 +413,49 @@ impl WinTagApp {
                 position,
                 tag,
             } => self.open_popup(target, position, tag),
+            IcedCommand::ShowPanel => self.show_panel(),
+            IcedCommand::HidePanel => self.hide_panel(),
+            IcedCommand::RefreshTags { rows } => self.refresh_panel(rows),
         }
+    }
+
+    /// 显示概览面板；已显示则置前聚焦
+    fn show_panel(&mut self) -> Task<Message> {
+        if let Some(p) = &self.panel {
+            return window::gain_focus(p.id);
+        }
+        let (id, open) = window::open(window::Settings {
+            position: window::Position::Centered,
+            size: Size::new(PANEL_W, PANEL_H),
+            min_size: Some(Size::new(300.0, 360.0)),
+            ..window::Settings::default()
+        });
+        self.panel = Some(PanelState {
+            id,
+            rows: Vec::new(),
+            search: String::new(),
+            expanded: HashSet::new(),
+        });
+        open.map(|_| Message::Noop)
+    }
+
+    /// 隐藏概览面板（关闭窗口；其后 WindowClosed 会上报 PanelVisibilityChanged(false)）
+    fn hide_panel(&mut self) -> Task<Message> {
+        if let Some(p) = self.panel.take() {
+            window::close(p.id)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// 刷新面板列表：替换标签快照，并只保留仍存在的目标在展开集合中
+    fn refresh_panel(&mut self, rows: Vec<TagRow>) -> Task<Message> {
+        if let Some(p) = &mut self.panel {
+            p.rows = rows;
+            let live: HashSet<isize> = p.rows.iter().map(|r| r.target).collect();
+            p.expanded.retain(|t| live.contains(t));
+        }
+        Task::none()
     }
 
     /// 打开退出确认窗（居中 + 定尺寸；返回驱动窗口创建的 Task）
@@ -477,6 +606,11 @@ impl WinTagApp {
                 return popup_view(p);
             }
         }
+        if let Some(panel) = &self.panel {
+            if panel.id == window_id {
+                return panel_view(panel);
+            }
+        }
         // 尚未创建的实际窗口：渲染空容器（iced 要求每窗口都有 view）
         container(text("")).into()
     }
@@ -604,4 +738,129 @@ fn color_swatch(
 ) -> iced::widget::Button<'static, Message> {
     let marker = if color == selected { "●" } else { "○" };
     button(text(format!("{marker} {label}"))).on_press(Message::PopupColorSelected(color))
+}
+
+/// 概览面板视图：搜索框 + 标签列表（可展开备注）+ 全部展开/收起 + 底部"退出"
+fn panel_view(panel: &PanelState) -> Element<'_, Message> {
+    let search = text_input("搜索标题/备注/窗口/进程", &panel.search)
+        .on_input(Message::PanelSearchChanged)
+        .width(Length::Fill);
+
+    let rows = filter_rows(&panel.rows, &panel.search);
+    let list = if rows.is_empty() {
+        column![text("无匹配标签").size(14)].padding(8)
+    } else {
+        column(
+            rows.into_iter()
+                .map(|row| panel_row(panel, &row))
+                .collect::<Vec<_>>(),
+        )
+        .spacing(4)
+    };
+
+    let content = column![
+        search,
+        row![
+            button(text("全部展开")).on_press(Message::PanelExpandAll),
+            button(text("全部收起")).on_press(Message::PanelCollapseAll),
+        ]
+        .spacing(8),
+        scrollable(list).width(Length::Fill).height(Length::Fill),
+        row![button(text("退出")).on_press(Message::PanelExitPressed)],
+    ]
+    .spacing(12)
+    .padding(16)
+    .width(Length::Fill)
+    .height(Length::Fill);
+
+    content.into()
+}
+
+/// 单个标签行：标题|窗口名 点击置前；展开时显示备注 + 置前/编辑/移除按钮
+///
+/// 全部文案克隆为自持 `'static` 字符串（行数据由调用方持有），按钮消息携带
+/// `target` 副本，故返回 `Element<'static, Message>`。
+fn panel_row(panel: &PanelState, row: &TagRow) -> Element<'static, Message> {
+    let expanded = panel.expanded.contains(&row.target);
+    let header = row![
+        button(text(if expanded { "▾" } else { "▸" }))
+            .on_press(Message::PanelToggleExpand(row.target)),
+        button(text(format!(
+            "{} | {}",
+            row.tag.title, row.tag.window_title
+        )))
+        .on_press(Message::PanelRowActivated(row.target)),
+    ]
+    .spacing(4)
+    .width(Length::Fill);
+
+    if expanded {
+        let actions = row![
+            button(text("置前")).on_press(Message::PanelRowActivated(row.target)),
+            button(text("编辑")).on_press(Message::PanelRowEdit(row.target)),
+            button(text("移除")).on_press(Message::PanelRowRemove(row.target)),
+        ]
+        .spacing(8);
+        let note = if row.tag.note.is_empty() {
+            text("（无）").size(12)
+        } else {
+            text(row.tag.note.clone()).size(12)
+        };
+        column![header, note, actions]
+            .spacing(4)
+            .padding(4)
+            .width(Length::Fill)
+            .into()
+    } else {
+        header.into()
+    }
+}
+
+/// 搜索过滤（纯函数，可单测）：匹配标题/备注/窗口名/进程名（大小写不敏感）
+fn filter_rows(rows: &[TagRow], query: &str) -> Vec<TagRow> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter()
+        .filter(|r| {
+            r.tag.title.to_lowercase().contains(&q)
+                || r.tag.note.to_lowercase().contains(&q)
+                || r.tag.window_title.to_lowercase().contains(&q)
+                || r.tag.process_name.to_lowercase().contains(&q)
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(title: &str, note: &str, target: isize) -> TagRow {
+        TagRow {
+            target,
+            tag: Tag {
+                title: title.to_string(),
+                note: note.to_string(),
+                color: TagColor::Orange,
+                window_title: format!("win-{title}"),
+                process_name: format!("proc-{title}"),
+            },
+        }
+    }
+
+    /// 空查询返回全部；非空按标题/备注/窗口/进程任一字段匹配（大小写不敏感）
+    #[test]
+    fn filter_rows_matches_any_field_case_insensitive() {
+        let rows = vec![row("记事本", "工作便签", 1), row("浏览器", "阅读", 2)];
+        assert_eq!(filter_rows(&rows, "").len(), 2);
+        assert_eq!(filter_rows(&rows, "记事").len(), 1);
+        assert_eq!(filter_rows(&rows, "阅读").len(), 1);
+        assert_eq!(filter_rows(&rows, "WIN-浏览器").len(), 1);
+        assert_eq!(filter_rows(&rows, "proc-浏览器").len(), 1);
+        assert_eq!(filter_rows(&rows, "不存在").len(), 0);
+        // 大小写不敏感
+        assert_eq!(filter_rows(&rows, "WIN-记事本").len(), 1);
+    }
 }

@@ -15,12 +15,22 @@
 use crate::core::settings::Settings;
 use crate::core::tag::Tag;
 
+/// 概览面板单个标签行（G4：`RefreshTags` 携带；跨线程 `Clone + Send`）
+#[derive(Debug, Clone)]
+pub struct TagRow {
+    /// 目标窗口句柄（isize；面板点击置前/编辑/移除以此定位）
+    pub target: isize,
+    /// 标签数据（展示标题/备注/颜色/窗口/进程）
+    pub tag: Tag,
+}
+
 /// 主线程 → iced 线程：请求 iced 执行某个界面动作。
 ///
 /// 由 `main.rs` 经 crossbeam 通道发送到 iced 线程，`ui::iced_app` 在
 /// `subscription` 中消费后驱动的 `update`。
 ///
-/// 阶段 G0 落地退出确认流，G2 扩展设置页指令，G3 扩展标签编辑弹窗指令。
+/// 阶段 G0 落地退出确认流，G2 扩展设置页指令，G3 扩展标签编辑弹窗指令，
+/// G4 扩展概览面板指令。
 #[derive(Debug, Clone)]
 pub enum IcedCommand {
     /// 打开"退出确认"窗口（`count` = 待丢弃的标签/便签数量）。
@@ -33,9 +43,6 @@ pub enum IcedCommand {
     /// 供主线程请求强制收起确认窗（如再次请求退出被取消时的收尾）。
     CloseConfirm,
     /// 打开设置窗口（G2）。
-    ///
-    /// iced 线程收到后读取全局设置的当前快照（`core::settings::global_settings`）
-    /// 预填表单，并创建设置窗口。
     OpenSettings,
     /// 应用主题（G2：`dark` = 是否暗色）。
     ///
@@ -45,13 +52,20 @@ pub enum IcedCommand {
     /// 打开标签编辑弹窗（G3）。
     ///
     /// `target` = 目标窗口句柄（isize）；`position` = 主线程算好的弹窗左上角
-    /// 物理像素坐标（光标右下偏移 + 钳制到工作区）；`tag` = 预填的标签数据
-    /// （新建时 title 预填窗口标题、note 空、color 默认橙；编辑时保留原值）。
+    /// 物理像素坐标（光标右下偏移 + 钳制到工作区）；`tag` = 预填的标签数据。
     EditTag {
         target: isize,
         position: (i32, i32),
         tag: Tag,
     },
+    /// 显示概览面板（G4）。
+    ///
+    /// 若无面板窗口则创建；已显示则置前（`window::gain_focus`）。
+    ShowPanel,
+    /// 隐藏概览面板（G4，关闭面板窗口）。
+    HidePanel,
+    /// 刷新概览面板列表（G4，主线程在标签变更且面板可见时发送标签快照）。
+    RefreshTags { rows: Vec<TagRow> },
 }
 
 /// iced 线程 → 主线程：iced 产出的界面事件，由主线程 `pump_background_events`
@@ -61,21 +75,23 @@ pub enum IcedCommand {
 #[derive(Debug, Clone)]
 pub enum GuiEvent {
     /// 用户在"退出确认"窗点击"退出"（或回车）。
-    ///
-    /// 主线程收到后走既有 `WM_APP_EXIT(wParam=1)` 退出流（复用
-    /// `should_confirm_exit`，见 `main.rs`）。
     ConfirmExit,
     /// 用户取消退出（点击"取消" / Esc / 关闭窗口）。
     CancelExit,
     /// 用户在设置页点击"保存"（`Settings` = 保存后的完整设置，G2）。
-    ///
-    /// 主线程写入全局设置 + 持久化 + 触发 `reapply_theme`。
     SettingsChanged(Settings),
     /// 用户在标签弹窗点击"保存"（G3）。
-    ///
-    /// `target` = 目标窗口句柄；`tag` = 编辑后的标签（`window_title`/`process_name`
-    /// 已在 [`IcedCommand::EditTag`] 时由主线程带入，此处保留）。
     TagSaved { target: isize, tag: Tag },
+    /// 概览面板可见性变化（G4：`true`=显示，`false`=隐藏/关闭）。
+    PanelVisibilityChanged(bool),
+    /// 面板行点击（G4：激活/置前目标窗口）。
+    ActivateWindow { target: isize },
+    /// 面板行"编辑"（G4：请求主线程打开预填编辑弹窗）。
+    EditTagRequested { target: isize },
+    /// 面板行"移除"（G4：删除标签并销毁覆盖层）。
+    RemoveTag { target: isize },
+    /// 面板底部"退出"（G4：走规范退出流，含有标签时确认）。
+    PanelExit,
 }
 
 // ---------------------------------------------------------------------

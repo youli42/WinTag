@@ -9,20 +9,19 @@ use core::settings::{Settings, ThemeMode};
 use core::tag::TagStore;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT,
     WIN32_ERROR, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{
-    RedrawWindow, HRGN, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
-};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, IsIconic, IsWindow,
-    IsWindowVisible, KillTimer, PostMessageW, RegisterClassW, SetTimer, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, MSG, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER,
+    IsWindowVisible, KillTimer, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
+    SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HWND_TOP, MSG,
+    SWP_NOACTIVATE, SW_RESTORE, WINDOW_EX_STYLE, WM_HOTKEY, WM_QUIT, WM_SETTINGCHANGE, WM_TIMER,
     WNDCLASSW, WS_OVERLAPPED,
 };
 
@@ -38,8 +37,8 @@ type OverlayMap = HashMap<isize, sys::overlay::Overlay>;
 
 /// 覆盖层存储：目标窗口句柄 → 覆盖层（仅主线程消息泵访问）
 static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
-/// 概览面板窗口句柄
-static PANEL_HWND: OnceLock<isize> = OnceLock::new();
+/// 概览面板可见性（D27 G4：面板迁至 iced 线程，主线程只记布尔 + 发命令）
+static PANEL_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
 /// 主线程 → iced 线程的命令发送端（D27）
@@ -160,12 +159,6 @@ fn main() -> anyhow::Result<()> {
     // 注入覆盖层的消息中转目标（R5：角标/标题条单击 → WM_APP_EDIT_TAG 请求编辑）
     sys::overlay::set_message_target(hwnd.0 as isize);
 
-    // 创建概览面板（隐藏）
-    let panel_hwnd = ui::panel::create_panel(Arc::clone(&tag_store), hwnd.0 as isize);
-    if PANEL_HWND.get().is_none() {
-        let _ = PANEL_HWND.set(panel_hwnd.0 as isize);
-    }
-
     // 解析并注入主题：按配置主题 + 系统深浅色解析调色板并应用到隐藏窗口。
     // 面板/设置窗口在各自 WM_CREATE 中读取同一全局调色板（theme_colors），
     // 此处先 set_theme 保证创建期 WM_CTLCOLOR* 取到正确配色。
@@ -278,9 +271,8 @@ fn main() -> anyhow::Result<()> {
                         handle_quick_tag(Arc::clone(&store_clone), hwnd.0 as isize);
                     }
                     hotkey::Hotkey::TogglePanel => {
-                        if let Some(ph) = PANEL_HWND.get() {
-                            ui::panel::toggle_panel(HWND(*ph as *mut std::ffi::c_void));
-                        }
+                        // D27 G4：面板迁至 iced 线程，主线程只切换可见布尔 + 发命令
+                        toggle_panel_hidden();
                     }
                     hotkey::Hotkey::OpenSettings => {
                         // D27 G2：设置窗迁至 iced 线程，主线程只发命令
@@ -419,27 +411,9 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let target_hwnd = wparam.0 as isize;
             // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE，无副作用。
             let valid = unsafe { IsWindow(HWND(target_hwnd as *mut std::ffi::c_void)).as_bool() };
-            if !valid {
-                return LRESULT(0);
+            if valid {
+                open_edit_tag(hwnd, target_hwnd);
             }
-            let Some(store) = GLOBAL_TAG_STORE.get() else {
-                return LRESULT(0);
-            };
-            let Ok(tags) = store.lock() else {
-                return LRESULT(0);
-            };
-            let Some(tag) = tags.get(&target_hwnd) else {
-                return LRESULT(0);
-            };
-            let tag = tag.clone();
-            drop(tags);
-            // D27 G3：弹窗迁至 iced，主线程算好位置后发 EditTag
-            let position = popup_position(hwnd);
-            send_iced(crate::ui::iced_proto::IcedCommand::EditTag {
-                target: target_hwnd,
-                position,
-                tag,
-            });
             LRESULT(0)
         }
         common::WM_APP_THEME_CHANGED => {
@@ -448,27 +422,9 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         common::WM_APP_TAGS_CHANGED => {
-            // 便签弹窗保存标签后广播：转发给概览面板刷新树形列表
-            // （镜像 WM_APP_THEME_CHANGED 的注入/广播模式，ui 层不直接依赖面板句柄）
-            if let Some(&panel) = PANEL_HWND.get() {
-                if panel != 0 {
-                    let panel_hwnd = HWND(panel as *mut std::ffi::c_void);
-                    // SAFETY: IsWindowVisible 为只读查询，面板句柄由 main 启动时
-                    // 写入且窗口随进程存活，无生命周期风险。
-                    if unsafe { IsWindowVisible(panel_hwnd) }.as_bool() {
-                        // SAFETY: PostMessageW 为线程安全投递 API，wParam/lparam
-                        // 原样透传（wParam = 目标窗口句柄），面板自行取用。
-                        unsafe {
-                            let _ = PostMessageW(
-                                panel_hwnd,
-                                common::WM_APP_TAGS_CHANGED,
-                                wparam,
-                                lparam,
-                            );
-                        }
-                    }
-                }
-            }
+            // 便签弹窗保存标签后广播：D27 G4 面板迁至 iced，主线程改为持标签快照
+            // 下发 RefreshTags（仅面板可见时发送，隐藏时下次打开会全量刷新）。
+            refresh_panel_now();
             LRESULT(0)
         }
         common::WM_APP_EXIT => {
@@ -673,7 +629,7 @@ fn handle_quick_tag(_store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
 /// 计算 iced 标签弹窗的左上角物理像素坐标（光标右下偏移 + 钳制到工作区，R19）
 ///
 /// 沿用 Win32 版弹窗的定位语义：`GetCursorPos` + (16,16) 偏移，再用
-/// `ui::popup::clamp_to_work`（含 DPI 缩放后的窗口尺寸）钳制到所在显示器工作区。
+/// `ui::geo::clamp_to_work`（含 DPI 缩放后的窗口尺寸）钳制到所在显示器工作区。
 /// 位置在主线程算好传给 iced 线程（`window::Position::Specific`）。
 fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
     let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
@@ -681,9 +637,9 @@ fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin);
     }
-    let w = ui::layout::dp(hidden_hwnd, ui::popup::POPUP_LOGICAL_W);
-    let h = ui::layout::dp(hidden_hwnd, ui::popup::POPUP_LOGICAL_H);
-    ui::popup::clamp_to_work(origin.x + 16, origin.y + 16, w, h)
+    let w = ui::geo::dp(hidden_hwnd, ui::geo::POPUP_LOGICAL_W);
+    let h = ui::geo::dp(hidden_hwnd, ui::geo::POPUP_LOGICAL_H);
+    ui::geo::clamp_to_work(origin.x + 16, origin.y + 16, w, h)
 }
 
 /// 向 iced 线程发送一条命令（D27；通道未就绪时静默）
@@ -693,6 +649,99 @@ fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
 fn send_iced(cmd: crate::ui::iced_proto::IcedCommand) {
     if let Some(tx) = ICED_CMD_TX.get() {
         let _ = tx.send(cmd);
+    }
+}
+
+/// 概览面板可见布尔读写（仅主线程访问，D27 G4）
+fn panel_visible() -> bool {
+    PANEL_VISIBLE.load(Ordering::Relaxed)
+}
+fn set_panel_visible(visible: bool) {
+    PANEL_VISIBLE.store(visible, Ordering::Relaxed);
+}
+
+/// 切换概览面板（D27 G4：主线程只记布尔 + 发 Show/HidePanel；显示时补发标签快照）
+fn toggle_panel_hidden() {
+    if panel_visible() {
+        send_iced(crate::ui::iced_proto::IcedCommand::HidePanel);
+        set_panel_visible(false);
+    } else {
+        send_iced(crate::ui::iced_proto::IcedCommand::ShowPanel);
+        set_panel_visible(true);
+        // 显示后立即下发当前标签快照（面板窗口异步创建，rows 同步由 iced 状态持有）
+        refresh_panel_now();
+    }
+}
+
+/// 面板刷新：持标签快照下发 RefreshTags（仅面板可见时）
+fn refresh_panel_now() {
+    if !panel_visible() {
+        return;
+    }
+    let rows = build_tag_rows();
+    send_iced(crate::ui::iced_proto::IcedCommand::RefreshTags { rows });
+}
+
+/// 从全局标签存储构建面板行快照（纯数据组装）
+fn build_tag_rows() -> Vec<crate::ui::iced_proto::TagRow> {
+    let mut rows = Vec::new();
+    if let Some(store) = GLOBAL_TAG_STORE.get() {
+        if let Ok(tags) = store.lock() {
+            for (&target, tag) in tags.iter() {
+                rows.push(crate::ui::iced_proto::TagRow {
+                    target,
+                    tag: tag.clone(),
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// 打开预填编辑弹窗（D27 G3；R5/R16：角标/标题条单击、面板右键"编辑"共用）
+///
+/// 目标窗口存活且已有标签时，把标签与光标定位传给 iced 线程打开编辑弹窗。
+fn open_edit_tag(hwnd: HWND, target_hwnd: isize) {
+    let Some(store) = GLOBAL_TAG_STORE.get() else {
+        return;
+    };
+    let Ok(tags) = store.lock() else {
+        return;
+    };
+    let Some(tag) = tags.get(&target_hwnd).cloned() else {
+        return;
+    };
+    drop(tags);
+    let position = popup_position(hwnd);
+    send_iced(crate::ui::iced_proto::IcedCommand::EditTag {
+        target: target_hwnd,
+        position,
+        tag,
+    });
+}
+
+/// 把指定窗口置前到最前（D27 G4；面板行点击 / 置前按钮）
+///
+/// 临时置前语义（与既有双击一致）：最小化先恢复，再置前台 + HWND_TOP，
+/// 切走后不驻留最上层（非 HWND_TOPMOST）。
+fn activate_target(target: isize) {
+    let hwnd = HWND(target as *mut std::ffi::c_void);
+    // SAFETY: IsIconic 为只读查询，句柄失效返回 FALSE，无副作用。
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    // SAFETY: IsWindow 为只读查询，句柄失效返回 FALSE。
+    if !unsafe { IsWindow(hwnd) }.as_bool() {
+        return;
+    }
+    if minimized {
+        // SAFETY: hwnd 为存活窗口；ShowWindow 失败仅返回布尔，忽略。
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+    }
+    // SAFETY: SetForegroundWindow/SetWindowPos 为线程安全 API；HWND_TOP 置前到最前。
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE);
     }
 }
 
@@ -727,7 +776,8 @@ fn pump_background_events(
 /// - `ConfirmExit`：以 confirmed=true 重入规范退出流；
 /// - `CancelExit`：无动作（iced 已自行关闭确认窗）；
 /// - `SettingsChanged`：写入全局设置 + 持久化 + 触发 `reapply_theme`；
-/// - `TagSaved`：写入标签存储 + 请求覆盖层创建 + 广播标签变更。
+/// - `TagSaved`：写入标签存储 + 请求覆盖层创建 + 广播标签变更；
+/// - 面板事件：置前 / 编辑 / 移除 / 可见性 / 退出。
 fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
     match event {
         ui::iced_proto::GuiEvent::ConfirmExit => request_exit(hwnd, true),
@@ -770,6 +820,29 @@ fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
                 );
             }
         }
+        ui::iced_proto::GuiEvent::PanelVisibilityChanged(visible) => {
+            set_panel_visible(visible);
+        }
+        ui::iced_proto::GuiEvent::ActivateWindow { target } => {
+            activate_target(target);
+        }
+        ui::iced_proto::GuiEvent::EditTagRequested { target } => {
+            open_edit_tag(hwnd, target);
+        }
+        ui::iced_proto::GuiEvent::RemoveTag { target } => {
+            remove_tag(target);
+            // SAFETY: hwnd 为存活隐藏窗口；PostMessageW 为线程安全标准 API。
+            unsafe {
+                let _ = PostMessageW(
+                    hwnd,
+                    common::WM_DESTROY_OVERLAY,
+                    WPARAM(target as usize),
+                    LPARAM(0),
+                );
+            }
+            refresh_panel_now();
+        }
+        ui::iced_proto::GuiEvent::PanelExit => request_exit(hwnd, false),
     }
 }
 
@@ -780,9 +853,8 @@ fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
 fn dispatch_tray_command(hwnd: HWND, cmd: sys::tray::TrayCommand) {
     match cmd {
         sys::tray::TrayCommand::OpenPanel => {
-            if let Some(ph) = PANEL_HWND.get() {
-                ui::panel::toggle_panel(HWND(*ph as *mut std::ffi::c_void));
-            }
+            // D27 G4：面板迁至 iced 线程，主线程只切换可见布尔 + 发命令
+            toggle_panel_hidden();
         }
         sys::tray::TrayCommand::OpenSettings => {
             // D27 G2：设置窗迁至 iced 线程，主线程只发命令
@@ -850,30 +922,6 @@ fn reapply_theme(hidden_hwnd: HWND) {
     // SAFETY: hidden_hwnd 由调用方保证存活；DWM 调用失败仅返回布尔值，忽略。
     let _ = ui::theme::apply_dark_mode(hidden_hwnd, dark);
     let _ = ui::theme::apply_corner_preference(hidden_hwnd, cfg.corner);
-
-    // 概览面板（经 PANEL_HWND）：DWM 属性 + ListView 主题刷新 + 强制重绘
-    if let Some(ph) = PANEL_HWND.get() {
-        let panel_hwnd = HWND(*ph as *mut std::ffi::c_void);
-        // SAFETY: panel_hwnd 由 create_panel 成功后写入 PANEL_HWND，窗口存活。
-        let _ = ui::theme::apply_dark_mode(panel_hwnd, dark);
-        let _ = ui::theme::apply_corner_preference(panel_hwnd, cfg.corner);
-        // 刷新树形列表主题（DarkMode_Explorer 热更新，问题 9.3/9.5）
-        ui::panel::reapply_tree_theme(panel_hwnd, dark);
-        // 子控件主题变体热更新（D17）
-        ui::theme::apply_control_theme(panel_hwnd, dark);
-        // SAFETY: RedrawWindow 带 RDW_ERASE 触发 WM_ERASEBKGND（父窗口背景按新调色板重绘，
-        // 此前 InvalidateRect(...,FALSE) 因 bErase=FALSE 不擦背景，导致第一次切浅色时
-        // 面板非子控件区域保留旧主题像素）；RDW_ALLCHILDREN 连子控件（含 owner-draw 按钮）
-        // 一起带擦除失效重绘。
-        unsafe {
-            let _ = RedrawWindow(
-                panel_hwnd,
-                None,
-                HRGN::default(),
-                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
-            );
-        }
-    }
 
     // D27 G1：原生层偏好一次性重注入（设置保存广播后热更新；覆盖层/tooltip/托盘共用）
     sys::native_prefs::set_native_prefs(apply_native_prefs(cfg, system_dark));
