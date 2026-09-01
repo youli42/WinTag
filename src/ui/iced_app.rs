@@ -2,7 +2,7 @@
 //!
 //! 本模块运行在**独立线程**（`main.rs` 以 `std::thread` 启动），用 [`iced::daemon`]
 //! 的多窗口模型承担 `confirm` / `settings` / `popup` / `panel` 四个窗口。阶段 G0
-//! 落地退出确认窗（最小闭环）、G2 迁移设置窗，其余窗口由后续阶段（G3-G4）迁入。
+//! 落地退出确认窗、G2 迁移设置窗、G3 迁移标签编辑弹窗，G4 收尾概览面板。
 //!
 //! 线程模型：主线程（Win32 消息泵）与本模块（iced 线程）经一对 crossbeam 通道
 //! 双向通信——主线程发 [`IcedCommand`]、本模块回 [`GuiEvent`]，契约见
@@ -18,14 +18,16 @@
 use std::cell::RefCell;
 
 use iced::futures::StreamExt;
-use iced::widget::{button, checkbox, column, combo_box, container, row, text};
+use iced::keyboard::key::{Key, Named};
+use iced::widget::{button, checkbox, column, combo_box, container, row, text, text_input};
 use iced::window;
 use iced::{Element, Length, Size, Subscription, Task, Theme};
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::core::settings::{CornerPreference, Settings, ThemeMode};
-use crate::ui::iced_proto::{GuiEvent, IcedCommand};
+use crate::core::tag::{Tag, TagColor};
+use crate::ui::iced_proto::{plan_popup_action, GuiEvent, IcedCommand, PopupPlan};
 
 /// 退出确认窗口的目标尺寸（逻辑像素，iced 自管 DPI）
 const CONFIRM_W: f32 = 380.0;
@@ -33,6 +35,18 @@ const CONFIRM_H: f32 = 160.0;
 /// 设置窗口目标尺寸
 const SETTINGS_W: f32 = 420.0;
 const SETTINGS_H: f32 = 480.0;
+/// 标签弹窗目标尺寸（与 Win32 版 `popup` 的 420×320 一致）
+const POPUP_W: f32 = 420.0;
+const POPUP_H: f32 = 320.0;
+
+/// 五色选项（顺序与 Win32 版一致）
+const TAG_COLORS: [(TagColor, &str); 5] = [
+    (TagColor::Orange, "橙"),
+    (TagColor::Blue, "蓝"),
+    (TagColor::Green, "绿"),
+    (TagColor::Red, "红"),
+    (TagColor::Purple, "紫"),
+];
 
 /// 退出确认窗的状态
 struct ConfirmState {
@@ -54,6 +68,26 @@ struct SettingsWindow {
     corner_state: combo_box::State<CornerPreference>,
 }
 
+/// 标签编辑弹窗的状态
+struct PopupWindow {
+    /// 窗口 id
+    id: window::Id,
+    /// 目标窗口句柄（isize）
+    target: isize,
+    /// 可编辑标题
+    title: String,
+    /// 可编辑备注
+    note: String,
+    /// 当前选中颜色
+    color: TagColor,
+    /// 目标窗口标题（只读展示，随保存带出）
+    window_title: String,
+    /// 目标窗口进程名（只读展示，随保存带出）
+    process_name: String,
+    /// 标题输入框 id（用于打开时聚焦）
+    title_id: text_input::Id,
+}
+
 /// iced 应用状态（运行在 iced 线程，单线程访问，无需 `Send`）
 ///
 /// 仅 [`Message`] 需要 `Send`（iced 事件循环要求），状态本体可含 `RefCell`。
@@ -67,6 +101,8 @@ pub struct WinTagApp {
     confirm: Option<ConfirmState>,
     /// 当前显示的设置窗（`None` = 未显示）
     settings: Option<SettingsWindow>,
+    /// 当前显示的标签弹窗（`None` = 未显示）
+    popup: Option<PopupWindow>,
     /// 是否暗色主题（启动时解析；经 `ApplyTheme` 热更新）
     dark: bool,
 }
@@ -99,6 +135,17 @@ pub enum Message {
     SettingsSavePressed,
     /// 点击"取消"（关闭窗口，不保存）
     SettingsCancelPressed,
+    // ---- 标签弹窗交互 ----
+    /// 标题输入框内容变更
+    PopupTitleChanged(String),
+    /// 备注输入框内容变更
+    PopupNoteChanged(String),
+    /// 颜色块选择
+    PopupColorSelected(TagColor),
+    /// 点击"保存"（发出 [`GuiEvent::TagSaved`] 并关闭窗口）
+    PopupSavePressed,
+    /// 取消（点击"取消" / Esc / 关闭窗口）
+    PopupCancelPressed,
 }
 
 impl WinTagApp {
@@ -128,6 +175,7 @@ impl WinTagApp {
                 cmd_stream: RefCell::new(Some(bridge_rx)),
                 confirm: None,
                 settings: None,
+                popup: None,
                 dark,
             },
             Task::none(),
@@ -140,6 +188,8 @@ impl WinTagApp {
             "退出确认".to_string()
         } else if self.settings.as_ref().is_some_and(|c| c.id == window) {
             "设置".to_string()
+        } else if self.popup.as_ref().is_some_and(|c| c.id == window) {
+            "标记窗口".to_string()
         } else {
             "WinTag".to_string()
         }
@@ -156,6 +206,9 @@ impl WinTagApp {
                 }
                 if self.settings.as_ref().is_some_and(|c| c.id == id) {
                     self.settings = None;
+                }
+                if self.popup.as_ref().is_some_and(|c| c.id == id) {
+                    self.popup = None;
                 }
                 Task::none()
             }
@@ -204,6 +257,57 @@ impl WinTagApp {
                 self.close_settings()
             }
             Message::SettingsCancelPressed => self.close_settings(),
+            // ---- 标签弹窗 ----
+            Message::PopupTitleChanged(s) => {
+                if let Some(p) = &mut self.popup {
+                    p.title = s;
+                }
+                Task::none()
+            }
+            Message::PopupNoteChanged(s) => {
+                if let Some(p) = &mut self.popup {
+                    p.note = s;
+                }
+                Task::none()
+            }
+            Message::PopupColorSelected(c) => {
+                if let Some(p) = &mut self.popup {
+                    p.color = c;
+                }
+                Task::none()
+            }
+            Message::PopupSavePressed => {
+                let saved_id = if let Some(p) = &self.popup {
+                    let tag = Tag {
+                        title: p.title.clone(),
+                        note: p.note.clone(),
+                        color: p.color,
+                        window_title: p.window_title.clone(),
+                        process_name: p.process_name.clone(),
+                    };
+                    let _ = self.gui_tx.send(GuiEvent::TagSaved {
+                        target: p.target,
+                        tag,
+                    });
+                    Some(p.id)
+                } else {
+                    None
+                };
+                match saved_id {
+                    Some(id) => {
+                        self.popup = None;
+                        window::close(id)
+                    }
+                    None => Task::none(),
+                }
+            }
+            Message::PopupCancelPressed => {
+                if let Some(p) = self.popup.take() {
+                    window::close(p.id)
+                } else {
+                    Task::none()
+                }
+            }
         }
     }
 
@@ -217,6 +321,11 @@ impl WinTagApp {
                 self.dark = dark;
                 Task::none()
             }
+            IcedCommand::EditTag {
+                target,
+                position,
+                tag,
+            } => self.open_popup(target, position, tag),
         }
     }
 
@@ -279,6 +388,64 @@ impl WinTagApp {
         }
     }
 
+    /// 打开/复用标签编辑弹窗（G3，单例语义由 `plan_popup_action` 决策）
+    fn open_popup(&mut self, target: isize, position: (i32, i32), tag: Tag) -> Task<Message> {
+        match plan_popup_action(
+            self.popup.as_ref().map(|p| (p.target, 0)),
+            target,
+            self.popup.is_some(),
+        ) {
+            // 同目标且旧弹窗存活：复用并聚焦标题框（不新建不销毁）
+            PopupPlan::Reuse(_) => {
+                if let Some(p) = &self.popup {
+                    text_input::focus::<Message>(p.title_id.clone())
+                } else {
+                    Task::none()
+                }
+            }
+            // 异目标且旧弹窗存活：销毁旧弹窗后新建
+            PopupPlan::Replace(_) => {
+                let old = self.popup.take();
+                let open = self.open_popup_fresh(target, position, tag);
+                if let Some(old) = old {
+                    Task::batch([window::close(old.id), open])
+                } else {
+                    open
+                }
+            }
+            // 首次 / 旧弹窗已销毁：直接新建
+            PopupPlan::Fresh => self.open_popup_fresh(target, position, tag),
+        }
+    }
+
+    /// 新建标签弹窗（按主线程算好的位置 + 定尺寸，并聚焦标题框）
+    fn open_popup_fresh(&mut self, target: isize, position: (i32, i32), tag: Tag) -> Task<Message> {
+        let title_id = text_input::Id::unique();
+        let (id, open) = window::open(window::Settings {
+            position: window::Position::Specific(iced::Point::new(
+                position.0 as f32,
+                position.1 as f32,
+            )),
+            size: Size::new(POPUP_W, POPUP_H),
+            resizable: false,
+            ..window::Settings::default()
+        });
+        self.popup = Some(PopupWindow {
+            id,
+            target,
+            title: tag.title.clone(),
+            note: tag.note.clone(),
+            color: tag.color,
+            window_title: tag.window_title.clone(),
+            process_name: tag.process_name.clone(),
+            title_id: title_id.clone(),
+        });
+        Task::batch([
+            open.map(|_| Message::Noop),
+            text_input::focus::<Message>(title_id),
+        ])
+    }
+
     /// 按窗口渲染界面
     pub fn view<'a>(&'a self, window_id: window::Id) -> Element<'a, Message> {
         if let Some(confirm) = &self.confirm {
@@ -305,6 +472,11 @@ impl WinTagApp {
                 return settings_view(sw);
             }
         }
+        if let Some(p) = &self.popup {
+            if p.id == window_id {
+                return popup_view(p);
+            }
+        }
         // 尚未创建的实际窗口：渲染空容器（iced 要求每窗口都有 view）
         container(text("")).into()
     }
@@ -318,7 +490,7 @@ impl WinTagApp {
         }
     }
 
-    /// 订阅：合并「主线程指令流」与「窗口关闭事件流」
+    /// 订阅：合并「主线程指令流」「窗口关闭事件流」与「Esc 取消弹窗」
     pub fn subscription(&self) -> Subscription<Message> {
         let mut slot = self.cmd_stream.borrow_mut();
         // 首调用取出桥接接收端，构建常驻订阅流；之后返回 None
@@ -330,7 +502,18 @@ impl WinTagApp {
                 }),
             )
         });
-        Subscription::batch([cmd_sub, window::close_events().map(Message::WindowClosed)])
+        let esc_sub = iced::keyboard::on_key_press(|key, _modifiers| {
+            if key == Key::Named(Named::Escape) {
+                Some(Message::PopupCancelPressed)
+            } else {
+                None
+            }
+        });
+        Subscription::batch([
+            cmd_sub,
+            window::close_events().map(Message::WindowClosed),
+            esc_sub,
+        ])
     }
 }
 
@@ -373,4 +556,52 @@ fn settings_view(sw: &SettingsWindow) -> Element<'_, Message> {
         .padding(16),
     )
     .into()
+}
+
+/// 标签弹窗视图（窗口/进程只读 + 标题/备注输入 + 五色块 + 保存/取消）
+fn popup_view(p: &PopupWindow) -> Element<'_, Message> {
+    let title = text_input("标题", &p.title)
+        .on_input(Message::PopupTitleChanged)
+        .on_submit(Message::PopupSavePressed)
+        .id(p.title_id.clone());
+    let note = text_input("备注", &p.note)
+        .on_input(Message::PopupNoteChanged)
+        .on_submit(Message::PopupSavePressed);
+
+    let colors = row![
+        color_swatch(TAG_COLORS[0].0, TAG_COLORS[0].1, p.color),
+        color_swatch(TAG_COLORS[1].0, TAG_COLORS[1].1, p.color),
+        color_swatch(TAG_COLORS[2].0, TAG_COLORS[2].1, p.color),
+        color_swatch(TAG_COLORS[3].0, TAG_COLORS[3].1, p.color),
+        color_swatch(TAG_COLORS[4].0, TAG_COLORS[4].1, p.color),
+    ]
+    .spacing(8);
+
+    container(
+        column![
+            text(format!("{} / {}", p.window_title, p.process_name)).size(12),
+            title,
+            note,
+            colors,
+            row![
+                button(text("取消")).on_press(Message::PopupCancelPressed),
+                button(text("保存")).on_press(Message::PopupSavePressed),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12)
+        .width(Length::Fill)
+        .padding(16),
+    )
+    .into()
+}
+
+/// 单个颜色块按钮（选中项以实心圆点标记，未选中为空心圆点）
+fn color_swatch(
+    color: TagColor,
+    label: &'static str,
+    selected: TagColor,
+) -> iced::widget::Button<'static, Message> {
+    let marker = if color == selected { "●" } else { "○" };
+    button(text(format!("{marker} {label}"))).on_press(Message::PopupColorSelected(color))
 }

@@ -74,6 +74,10 @@ const CHIP_GAP: i32 = 8;
 const WIN_W: i32 = 420;
 const WIN_H: i32 = 320;
 
+/// 标签弹窗逻辑尺寸（供主线程计算 iced 弹窗定位钳制用；与上方 WIN_W/WIN_H 一致）
+pub const POPUP_LOGICAL_W: i32 = 420;
+pub const POPUP_LOGICAL_H: i32 = 320;
+
 /// 弹窗窗口的用户数据（随 `lpCreateParams` 传入，`WM_DESTROY` 时释放）
 struct PopupData {
     tag_store: Arc<Mutex<TagStore>>,
@@ -333,7 +337,7 @@ pub fn create_popup(
 ///
 /// 首选光标右下偏移 (16, 16)；越出工作区右/下边界时向左/上收回，
 /// 负坐标时贴工作区左/上边缘。
-fn clamp_to_work(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+pub fn clamp_to_work(x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
     // SAFETY: MonitorFromPoint 为只读查询，取不到时返回 NULL 由下方回退处理。
     let hmon = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
     if hmon.is_invalid() {

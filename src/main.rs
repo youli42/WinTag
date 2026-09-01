@@ -431,16 +431,15 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let Some(tag) = tags.get(&target_hwnd) else {
                 return LRESULT(0);
             };
-            let window_title = tag.window_title.clone();
-            let process_name = tag.process_name.clone();
+            let tag = tag.clone();
             drop(tags);
-            ui::popup::create_popup(
-                Arc::clone(store),
-                target_hwnd,
-                &window_title,
-                &process_name,
-                hwnd.0 as isize,
-            );
+            // D27 G3：弹窗迁至 iced，主线程算好位置后发 EditTag
+            let position = popup_position(hwnd);
+            send_iced(crate::ui::iced_proto::IcedCommand::EditTag {
+                target: target_hwnd,
+                position,
+                tag,
+            });
             LRESULT(0)
         }
         common::WM_APP_THEME_CHANGED => {
@@ -651,18 +650,40 @@ fn remove_tag(target_hwnd: isize) {
 }
 
 /// 处理快速标记热键
-fn handle_quick_tag(store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
+fn handle_quick_tag(_store: Arc<Mutex<TagStore>>, hidden_hwnd: isize) {
     // 前台窗口信息获取失败时静默（无窗口可标记）
     if let Ok(info) = sys::window::get_foreground_window_info() {
-        // 创建 Win32 弹窗（覆盖层创建已移到弹窗确认分支）
-        ui::popup::create_popup(
-            store,
-            info.hwnd,
-            &info.title,
-            &info.process_name,
-            hidden_hwnd,
-        );
+        // D27 G3：弹窗迁至 iced，主线程算好位置后发 EditTag（新建标签，
+        // 标题预填窗口标题、备注空、颜色默认橙；覆盖层创建已移到保存分支）
+        let position = popup_position(HWND(hidden_hwnd as *mut std::ffi::c_void));
+        send_iced(crate::ui::iced_proto::IcedCommand::EditTag {
+            target: info.hwnd,
+            position,
+            tag: crate::core::tag::Tag {
+                title: info.title.clone(),
+                note: String::new(),
+                color: crate::core::tag::TagColor::Orange,
+                window_title: info.title,
+                process_name: info.process_name,
+            },
+        });
     }
+}
+
+/// 计算 iced 标签弹窗的左上角物理像素坐标（光标右下偏移 + 钳制到工作区，R19）
+///
+/// 沿用 Win32 版弹窗的定位语义：`GetCursorPos` + (16,16) 偏移，再用
+/// `ui::popup::clamp_to_work`（含 DPI 缩放后的窗口尺寸）钳制到所在显示器工作区。
+/// 位置在主线程算好传给 iced 线程（`window::Position::Specific`）。
+fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
+    let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+    // SAFETY: GetCursorPos 为只读查询，失败时 origin 保持 (0,0)（默认靠左上）。
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut origin);
+    }
+    let w = ui::layout::dp(hidden_hwnd, ui::popup::POPUP_LOGICAL_W);
+    let h = ui::layout::dp(hidden_hwnd, ui::popup::POPUP_LOGICAL_H);
+    ui::popup::clamp_to_work(origin.x + 16, origin.y + 16, w, h)
 }
 
 /// 向 iced 线程发送一条命令（D27；通道未就绪时静默）
@@ -705,7 +726,8 @@ fn pump_background_events(
 ///
 /// - `ConfirmExit`：以 confirmed=true 重入规范退出流；
 /// - `CancelExit`：无动作（iced 已自行关闭确认窗）；
-/// - `SettingsChanged`：写入全局设置 + 持久化 + 触发 `reapply_theme`。
+/// - `SettingsChanged`：写入全局设置 + 持久化 + 触发 `reapply_theme`；
+/// - `TagSaved`：写入标签存储 + 请求覆盖层创建 + 广播标签变更。
 fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
     match event {
         ui::iced_proto::GuiEvent::ConfirmExit => request_exit(hwnd, true),
@@ -722,6 +744,31 @@ fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
             }
             // 广播主题变更，令覆盖层/tooltip/各窗口即时生效
             reapply_theme(hwnd);
+        }
+        ui::iced_proto::GuiEvent::TagSaved { target, tag } => {
+            // 写回标签存储（唯一权威 TagStore）
+            if let Some(store) = GLOBAL_TAG_STORE.get() {
+                if let Ok(mut tags) = store.lock() {
+                    tags.insert(target, tag);
+                }
+            }
+            // 请求创建/刷新覆盖层（WM_CREATE_OVERLAY 由隐藏窗口去重）
+            // SAFETY: hwnd 为存活隐藏窗口；PostMessageW 为线程安全标准 API。
+            unsafe {
+                let _ = PostMessageW(
+                    hwnd,
+                    common::WM_CREATE_OVERLAY,
+                    WPARAM(target as usize),
+                    LPARAM(0),
+                );
+                // 广播标签变更，令概览面板刷新（镜像确认分支语义）
+                let _ = PostMessageW(
+                    hwnd,
+                    common::WM_APP_TAGS_CHANGED,
+                    WPARAM(target as usize),
+                    LPARAM(0),
+                );
+            }
         }
     }
 }
