@@ -536,3 +536,27 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
 - **影响与后续跟进**：`src/ui/layout.rs` 增 `TITLEBAR_H`/`client_height`（保留既有 `dp`，新增 1 个 `ignore` doctest）；`confirm.rs` 改 `client_h = client_height(hwnd, WIN_H)` 定位按钮行与消息区，修复退出确认窗按钮溢出裁切；`popup.rs`/`settings.rs` 改用同一函数（`popup` 行为完全一致，`settings` 一并修正高 DPI 外高未缩放的隐患）。`cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿。
 
 ---
+
+## D26：托盘底层迁移至 tray-icon(tauri) + 气泡迁至 notify-rust（2026-09-01）
+
+- **决策**：把 `sys/tray.rs` 从手写 `Shell_NotifyIconW` + `NOTIFYICONDATAW` + `CreatePopupMenu`/`AppendMenuW`/`TrackPopupMenu`（D22/D24 落地）整体迁至 [`tray-icon`](https://crates.io/crates/tray-icon)（tauri）——`TrayIconBuilder` + `Menu(MenuItem)` + 嵌入资源图标；图标点击/菜单选择经 `TrayIconEvent`/`MenuEvent` 静态 crossbeam channel 投递，由主线程消息循环 `GetMessageW` 返回后非阻塞 `try_recv` 排空并分发。启动气泡从 `NIF_INFO`+`NIM_MODIFY` 迁至 [`notify-rust`](https://crates.io/crates/notify-rust)（Windows 走 `tauri-winrt-notification` 的 WinRT TOAST）。
+- **背景**：手写托盘层要处理的东西过多（约 10 项职责：图标加载、NOTIFYICONDATAW 填充、UTF-16 截断、回调消息解码、右键菜单四项、气泡弹出、TaskbarCreated 重注册、移除、`--no-tray` 三分支、纯函数单测），且与主线程消息泵 / 注入模式 / 退出流深度耦合，改动一处要联动四处。迁移评估结论：底层换库、上层架构不破坏——保留 `TrayCommand` 纯逻辑层与 `dispatch_tray_command`，仅替换托盘实现末端。
+- **备选方案**：
+  1. 迁至 `tray-item`（olback）（否决：0.10.0 在 docs.rs 构建失败、文档缺失，事件同样跨线程，Windows 图标要求 `.rc` 打包，且与 `windows 0.58` 并存两套绑定）；
+  2. 继续手写仅做轻度重构（否决：仍保留全部 Win32 手写面与 unsafe，治标不治本）；
+  3. `winrt-notification` 做气泡（否决：依赖旧 `windows 0.24`，类型与项目 `windows 0.58` 不互通）。
+- **理由**：
+  1. `tray-icon`（tauri）维护活跃、API 更现代，事件模型经 channel 与现有"主线程统一消息泵"契合（事件写 channel 在 `DispatchMessageW` 调起其内部 WndProc 时发生，主循环天然唤醒）；
+  2. 图标取自嵌入资源（build.rs `winresource::set_icon` 写 ID=1，`Icon::from_resource(1, None)` 读取），消除"共享类图标/IDI_WINLOGO 不销毁"的取巧语义，`exe` 资源管理器里也有正式应用图标；
+  3. `TaskbarCreated`（explorer 重启）由 tray-icon 窗口过程内部接管重注册（`ChangeWindowMessageFilterEx` + 静态注册），删去本项目自实现；
+  4. 净删 ~250 行 Win32 手写，unsafe 块由 ~10 处收敛到 ~2 处；`TrayCommand` 纯逻辑层与 `dispatch_tray_command` 原样复用，单测保留并新增事件解码用例。
+- **线程模型**：tray-icon 要求托盘与 Win32 事件循环同线程创建——主线程 `GetMessageW` 循环恰好满足，故零新增线程；`TrayIcon` 参考计数、最后实例 drop 自动移除，`create_tray` 返回句柄以 main 局部变量持有至退出。
+- **影响与后续跟进**：
+  - `Cargo.toml` 增 `tray-icon = "0.24"`、`notify-rust = "4"`（新增 ~150 传递依赖：`muda`、`windows-sys 0.61`、`crossbeam-channel`、`png` 等；与项目 `windows 0.58` 两套 Win32 绑定并存，无运行时冲突）；
+  - 新增 `assets/icon.ico`（仅新资源文件，Python 脚本生成 16/32/48/256 多尺寸 PNG 压缩 ICO）；`build.rs` 用 `winresource::set_icon` 嵌入；文件缺失时降级跳过（图标缺失仅影响外观）；
+  - `src/sys/tray.rs` 重写为「纯逻辑层（`TrayCommand` + `icon_event_to_command`/`menu_id_to_command`/`should_show_balloon`，零 tray-icon 依赖）+ 适配层（`create_tray`/`set_balloon_enabled`/`show_balloon`）」，删除全部 `Shell_NotifyIconW`/`fill_wide`/`show_context_menu`/`register_taskbar_created`/Win32 `load_tray_icon`；
+  - `src/main.rs`：删 `WM_APP_TRAY` 分支与 `TaskbarCreated` 分支（`registered_msg`）、删 `TASKBAR_CREATED`/`NO_TRAY` 静态与 `no_tray_active`/`remove_tray`，改在主循环 `poll_tray_events(hwnd)` 轮询两 channel 后 `dispatch_tray_command`；`request_exit` 不再显式移除托盘（`TrayIcon` drop 承担）；启动气泡定时器保留，`show_balloon` 改 notify-rust；
+  - `src/common/mod.rs`：删 `WM_APP_TRAY` 常量（`WM_APP+8` 空出），`WM_APP_EXIT`（`WM_APP+9`）保留；
+  - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（新增 4 个托盘单测用例）。
+
+---

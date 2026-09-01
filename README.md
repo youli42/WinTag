@@ -108,6 +108,8 @@ cargo test
 
 2026-09-01 后续轮次（D25）：底部控件客户区裁切修复——`ui::layout` 新增 `TITLEBAR_H`/`client_height()` 统一从窗口外高抵扣标题栏边框，`confirm`/`popup`/`settings` 底部按钮行改用客户区高度定位，修复退出确认窗"退出/取消"按钮溢出客户区被裁切。
 
+2026-09-01 后续轮次（D26）：托盘底层迁移——托盘自 `Shell_NotifyIconW` 手写迁至 `tray-icon`(tauri)（`TrayIconBuilder`+`Menu`+嵌入资源图标，事件经 crossbeam channel 由主循环轮询），气泡迁至 `notify-rust`（Windows TOAST），新增 `assets/icon.ico` 嵌入资源图标，删除 `WM_APP_TRAY` 常量与 `TaskbarCreated` 自处理。
+
 2026-08-30 后续轮次（D17）：覆盖层颜色 BGRA 字节序修复（标签颜色黄蓝互换）、统一主题管理器（`sync_window_theme`/`apply_control_theme`，下拉框/复选框/滚动条随主题）与下拉框子类化配色、窗口类光标修复（悬停鼠标消失）、弹窗单例复用与光标附近定位。遗留：问题 17（悬停备注显示不完整）待修复。
 
 2026-08-30 后续轮次（D16）：标注流程闭环——角标/标题条单击打开预填编辑弹窗（R5）、弹窗颜色选择（R16）、面板右键菜单与 Esc 关闭（R17）、标题/备注动态长度读取修复静默截断。

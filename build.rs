@@ -10,6 +10,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
 
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os != "windows" {
@@ -35,6 +36,17 @@ fn main() {
 
     let mut resource = winresource::WindowsResource::new();
     resource.set_manifest(manifest);
+    // 嵌入应用图标资源（ID=1，与 sys::tray 运行时 Icon::from_resource(1) 对应；
+    // 同时成为 exe 资源管理器里的默认应用图标）。文件不存在时静默跳过，
+    // 避免缺文件导致整次构建失败（图标缺失仅影响外观，不影响功能）。
+    // SAFETY: 路径为项目根相对路径（构建时工作目录即项目根），winresource 内部
+    // 校验文件存在性后再交给资源编译器。
+    let icon_path = std::path::Path::new("assets").join("icon.ico");
+    if icon_path.exists() {
+        resource.set_icon(icon_path.to_str().unwrap_or_default());
+    } else {
+        println!("cargo:warning=未找到 assets/icon.ico，跳过托盘图标嵌入");
+    }
     if let Err(e) = resource.compile() {
         panic!("嵌入视觉样式清单失败: {e}");
     }

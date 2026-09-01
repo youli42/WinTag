@@ -9,7 +9,6 @@ use core::settings::{Settings, ThemeMode};
 use core::tag::TagStore;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -43,12 +42,6 @@ static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
 static PANEL_HWND: OnceLock<isize> = OnceLock::new();
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
-/// `--no-tray` 开关注入（main 解析后写入，WndProc 的 TaskbarCreated 分支与
-/// request_exit 退出流读取；未注入视为 false，即默认启用托盘）
-static NO_TRAY: OnceLock<AtomicBool> = OnceLock::new();
-/// TaskbarCreated 注册消息号（main 启动时注册后写入；0 表示注册失败，
-/// WndProc 不匹配该动态消息，托盘不再自动恢复）
-static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 /// 判定单实例冲突：`CreateMutexW` 返回的句柄因同名命名互斥量已存在
 /// （`GetLastError == ERROR_ALREADY_EXISTS`）时，说明另一 WinTag 实例正在运行。
@@ -63,11 +56,6 @@ fn single_instance_conflict(err: WIN32_ERROR) -> bool {
 /// 纯函数、无副作用，便于单元测试。
 fn should_confirm_exit(has_tags: bool, confirmed: bool) -> bool {
     has_tags && !confirmed
-}
-
-/// 读取注入的 `--no-tray` 开关（未注入时视为 false，即默认启用托盘）
-fn no_tray_active() -> bool {
-    NO_TRAY.get().is_some_and(|b| b.load(Ordering::Relaxed))
 }
 
 /// 解析命令行是否含 `--no-tray`（托盘常驻化禁用开关）
@@ -110,9 +98,6 @@ fn main() -> anyhow::Result<()> {
         // 防止编译期未使用告警（进程退出时系统已自动回收，无需显式关闭）。
         let _hold = handle;
     }
-    // --no-tray 开关注入全局：WndProc（TaskbarCreated 重注册托盘）与 request_exit
-    // （是否 remove_tray）需要读取。main 单写、消息泵内只读，无竞态。
-    let _ = NO_TRAY.set(AtomicBool::new(no_tray));
 
     // 声明 Per-Monitor V2 DPI 感知（必须在创建任何窗口之前调用）
     // SAFETY: SetProcessDpiAwarenessContext 为进程级设置，无参数生命周期问题；
@@ -203,14 +188,15 @@ fn main() -> anyhow::Result<()> {
     hotkey::register_all(hwnd)?;
 
     // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式
-    // （概览面板/热键/设置均不受影响）。托盘事件经 WM_APP_TRAY 回调直达 WndProc。
-    if !no_tray {
-        let _ = sys::tray::add_tray(hwnd, None);
-    }
-    // 注册 TaskbarCreated 消息号（explorer 重启后托盘被重建，WndProc 收到该动态
-    // 消息时重新 add_tray 恢复图标）；注册失败降级为 0（WndProc 不匹配，不再恢复）。
-    let taskbar_msg = sys::tray::register_taskbar_created().unwrap_or(0);
-    let _ = TASKBAR_CREATED.set(taskbar_msg);
+    // （概览面板/热键/设置均不受影响）。D26 由 tray-icon 承担，事件经
+    // crossbeam channel 投递，由下方消息循环 try_recv 轮询分发。
+    // TrayIcon 参考计数、最后实例 drop 时自动从系统托盘移除；以 main 局部
+    // 变量持有至进程退出（退出流经 WM_QUIT 循环退出后即 drop）。
+    let _tray = if !no_tray {
+        Some(sys::tray::create_tray()?)
+    } else {
+        None
+    };
 
     // 兜底轮询定时器：捕获 WinEvent 事件丢失 / 最小化窗口可见性误判
     // SAFETY: SetTimer 在消息循环前调用，hwnd 为存活窗口；失败仅返回 0，忽略即可
@@ -245,6 +231,11 @@ fn main() -> anyhow::Result<()> {
         if ret.0 == -1 {
             anyhow::bail!("GetMessage 错误");
         }
+
+        // D26：托盘事件经 tray-icon 的 crossbeam channel 投递（事件在上一轮
+        // DispatchMessageW 调起 tray-icon 内部 WndProc 时已写入 channel）。
+        // 此处非阻塞 try_recv 排空两 channel 并分发到现有窗口动作。
+        poll_tray_events(hwnd);
 
         if msg.message == WM_HOTKEY {
             let hotkey = hotkey::from_message(msg.message, msg.wParam.0, msg.lParam.0);
@@ -462,18 +453,6 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        common::WM_APP_TRAY => {
-            // 托盘图标回调：lParam 承载事件码。左键单击/气泡点击经纯函数解码为
-            // OpenPanel；右键（WM_RBUTTONUP）不在纯函数职责内，弹右键菜单后
-            // 按用户选择分发。
-            if let Some(cmd) = sys::tray::tray_message(lparam.0 as usize) {
-                dispatch_tray_command(hwnd, cmd);
-            } else if lparam.0 as u32 == sys::tray::WM_RBUTTONUP {
-                let cmd = sys::tray::show_context_menu(hwnd);
-                dispatch_tray_command(hwnd, cmd);
-            }
-            LRESULT(0)
-        }
         common::WM_APP_EXIT => {
             // 退出请求：面板"退出"按钮 wParam=0 仅请求；确认弹窗"确定" wParam=1
             // 已确认。request_exit 内部做"有标签且未确认 → 弹确认窗"判定。
@@ -491,30 +470,18 @@ extern "system" fn hidden_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
-        registered_msg
-            if TASKBAR_CREATED
-                .get()
-                .is_some_and(|&m| m != 0 && msg == registered_msg) =>
-        {
-            // explorer 重启后托盘被重建：--no-tray 关闭时重新创建图标恢复常驻
-            // （add_tray 失败静默，图标缺失不致命，面板/热键仍可用）。
-            if !no_tray_active() {
-                let _ = sys::tray::add_tray(hwnd, None);
-            }
-            LRESULT(0)
-        }
         WM_TIMER => {
             if wparam.0 == TIMER_POLL_OVERLAYS {
                 poll_overlays();
             } else if wparam.0 == TIMER_BALLOON {
-                // 一次性启动气泡：先 KillTimer 防重入，再经 NIM_MODIFY 弹出
+                // 一次性启动气泡：先 KillTimer 防重入，再经 notify-rust 弹出
                 // （show_balloon 内部还会校验 balloon_enabled 注入开关）。
+                // D26 由 notify-rust 走 Windows TOAST，不经 NIM_MODIFY。
                 // SAFETY: hwnd 存活；KillTimer 失败仅返回 Err，忽略（防重入非关键）。
                 unsafe {
                     let _ = KillTimer(hwnd, TIMER_BALLOON);
                 }
                 sys::tray::show_balloon(
-                    hwnd,
                     "WinTag",
                     "WinTag 已启动。点击查看已标注窗口，或按 Ctrl+Shift+M 打开概览",
                 );
@@ -705,7 +672,26 @@ fn ensure_settings_window(hidden_hwnd: isize) -> HWND {
     })
 }
 
-/// 分发托盘命令（WM_APP_TRAY 解码结果与右键菜单选择共用，D22）
+/// 排空托盘图标/菜单事件 channel 并分发高层命令（D26）。
+///
+/// tray-icon 把图标点击/菜单选择事件写入静态 crossbeam channel；主线程在
+/// 消息循环 `GetMessageW` 返回后非阻塞 `try_recv` 排空，经
+/// [`sys::tray`] 纯映射为 [`TrayCommand`] 后复用 [`dispatch_tray_command`]
+/// 分发到现有窗口动作（镜像热键分发语义）。
+fn poll_tray_events(hwnd: HWND) {
+    while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+        if let Some(cmd) = sys::tray::icon_event_to_command(&event) {
+            dispatch_tray_command(hwnd, cmd);
+        }
+    }
+    while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+        if let Some(cmd) = sys::tray::menu_id_to_command(&event.id) {
+            dispatch_tray_command(hwnd, cmd);
+        }
+    }
+}
+
+/// 分发托盘命令（右键菜单选择与图标单击解码结果共用，D26）
 ///
 /// 镜像热键分发的动作语义：OpenPanel 切换概览面板、OpenSettings 确保创建后
 /// 切换设置页、QuickTag 对前台窗口弹标记窗、Exit 走规范退出流。
@@ -735,7 +721,9 @@ fn dispatch_tray_command(hwnd: HWND, cmd: sys::tray::TrayCommand) {
 }
 
 /// 规范退出流（D22/D24）：有标签数据且未确认 → 弹确认窗；确认或无需确认 →
-/// 移除托盘图标并投递 WM_QUIT，令 GetMessageW 返回 0、main 正常返回退出码 0。
+/// 投递 WM_QUIT，令 GetMessageW 返回 0、main 正常返回退出码 0。托盘图标由
+/// [`sys::tray::create_tray`] 返回的 TrayIcon 在 main 退出时 drop 自动移除
+/// （D26：tray-icon 参考计数，最后实例 drop 即从系统托盘移除）。
 ///
 /// 入口有三：托盘右键菜单"退出"（未确认）、概览面板"退出"按钮（未确认，
 /// wParam=0）、确认弹窗"确定"（已确认，wParam=1，经 WM_APP_EXIT 回投）。
@@ -751,10 +739,6 @@ fn request_exit(hwnd: HWND, confirmed: bool) {
         let msg = format!("确定退出？将丢弃 {tag_count} 个标签/便签");
         let _ = ui::confirm::create_confirm(&msg, hwnd.0 as isize);
         return;
-    }
-    // 有托盘才移除（--no-tray 时未创建图标，跳过以保持语义清晰）
-    if !no_tray_active() {
-        sys::tray::remove_tray(hwnd);
     }
     // SAFETY: PostMessageW 为线程安全投递 API；WM_QUIT 投递给本线程隐藏窗口，
     // 令主消息循环 GetMessageW 返回 0 优雅退出（_winevent_hooks 等随 main

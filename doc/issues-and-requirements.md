@@ -305,6 +305,7 @@
 | 2026-08-31 | 扩展规划：新增需求 R18（托盘）、R19（分组/工作区）、R20（图表），登记问题 18-22；确认**分组纯会话不持久化**、**v1 系统图标可接受**、**分组控件置于新建标签弹窗标题下方（可输入或选择已有分组）**；规划归档见下文"四、扩展规划"与 [decision-records.md D21-D23](./decision-records.md) | —（文档规划，无代码提交） |
 | 2026-09-01 | 托盘常驻化（D24）：Windows 子系统 + 单实例保护（守护窗口类）+ 默认托盘常驻零窗口启动 + 启动气泡可开关（show_balloon）+ `--no-tray` 禁用 + 有标签退出弹定制主题确认窗（ui/confirm）+ 托盘右键四项菜单/左键与气泡打开面板 + 面板底部"退出"按钮 + 设置页"气泡提示"开关 | `425303d` feat(tray) |
 | 2026-09-01 | 底部控件客户区裁切修复（D25）：`ui::layout` 新增 `TITLEBAR_H`/`client_height()` 统一从窗口外高抵扣标题栏边框；`confirm`/`popup`/`settings` 底部按钮行改用客户区高度定位，修复退出确认窗"退出/取消"按钮溢出客户区被裁切 | `425303d` fix(ui) |
+| 2026-09-01 | 托盘底层迁移（D26）：托盘自 `Shell_NotifyIconW` 手写迁至 `tray-icon`(tauri)（`TrayIconBuilder`+`Menu(MenuItem)`+嵌入资源图标，事件经 `TrayIconEvent`/`MenuEvent` crossbeam channel 由主循环 `try_recv` 轮询）；气泡由 `NIF_INFO`+`NIM_MODIFY` 迁至 `notify-rust`（Windows TOAST）；`TaskbarCreated` 重注册由 tray-icon 内部接管、删除 `WM_APP_TRAY` 常量；图标取自新增 `assets/icon.ico`（winresource ID=1，`Icon::from_resource`） | —（并行迁移，见 decision-records D26） |
 
 ---
 
