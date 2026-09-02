@@ -170,6 +170,12 @@ pub enum Message {
     EscapePressed,
     /// 回车（全局键盘：确认窗=确认退出，设置窗=保存；弹窗输入框已用 on_submit）
     EnterPressed,
+    /// Tab（全局键盘：仅在标签弹窗打开时切换输入框焦点；`backwards` = Shift+Tab）
+    TabPressed { backwards: bool },
+    /// 标签弹窗窗口创建完成（`open` 任务完成，接口已建）。此时聚焦标题框——
+    /// `operation::focus` 是同步 Widget 操作，若与 `window::open` 同批返回会在
+    /// 窗口接口存在之前空转，故延迟到此刻。
+    PopupOpened(window::Id),
     // ---- 概览面板交互 ----
     /// 搜索框内容变更
     PanelSearchChanged(String),
@@ -386,6 +392,31 @@ impl WinTagApp {
                     let draft = self.settings.as_ref().map(|s| s.draft).unwrap_or_default();
                     let _ = self.gui_tx.send(GuiEvent::SettingsChanged(draft));
                     return self.close_settings();
+                }
+                Task::none()
+            }
+            // Tab：iced 0.14 无默认 Tab 焦点导航（0.13 亦然），须在此显式接线。
+            // 0.14 的内建 focusable 仅 text_input/text_editor（按钮不注册 focusable），
+            // 故仅在标签弹窗（含标题/备注两个输入框）打开时切换焦点；其余窗口忽略。
+            // `focus_next`/`focus_previous` 是线性无环绕：两个输入框在 Tab/Shift+Tab 间切换。
+            Message::TabPressed { backwards } => {
+                if self.popup.is_some() {
+                    return if backwards {
+                        operation::focus_previous()
+                    } else {
+                        operation::focus_next()
+                    };
+                }
+                Task::none()
+            }
+            // 弹窗创建完成（`open` 任务完成，窗口接口已建）。此刻聚焦标题框 + 置前：
+            // `operation::focus` 是同步 Widget 操作，须在接口存在后执行，否则空转。
+            Message::PopupOpened(id) => {
+                if let Some(p) = &self.popup {
+                    return Task::batch([
+                        operation::focus(p.title_id.clone()),
+                        window::gain_focus(id),
+                    ]);
                 }
                 Task::none()
             }
@@ -634,11 +665,7 @@ impl WinTagApp {
             process_name: tag.process_name.clone(),
             title_id: title_id.clone(),
         });
-        Task::batch([
-            open.map(|_| Message::Noop),
-            operation::focus(title_id),
-            window::gain_focus(id),
-        ])
+        Task::batch([open.map(Message::PopupOpened), window::gain_focus(id)])
     }
 
     /// 按窗口渲染界面
@@ -725,13 +752,19 @@ fn keyboard_event(
     _window: window::Id,
 ) -> Option<Message> {
     match event {
-        iced::event::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, repeat, .. }) => {
-            match key {
-                Key::Named(Named::Escape) => Some(Message::EscapePressed),
-                Key::Named(Named::Enter) if !repeat => Some(Message::EnterPressed),
-                _ => None,
-            }
-        }
+        iced::event::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat,
+            ..
+        }) => match key {
+            Key::Named(Named::Escape) => Some(Message::EscapePressed),
+            Key::Named(Named::Enter) if !repeat => Some(Message::EnterPressed),
+            Key::Named(Named::Tab) if !repeat => Some(Message::TabPressed {
+                backwards: modifiers.shift(),
+            }),
+            _ => None,
+        },
         _ => None,
     }
 }
