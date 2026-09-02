@@ -19,7 +19,8 @@ use std::collections::HashSet;
 
 use iced::keyboard::key::{Key, Named};
 use iced::widget::{
-    button, checkbox, column, combo_box, container, row, scrollable, text, text_input,
+    button, checkbox, column, combo_box, container, operation, row, scrollable, text, text_input,
+    Id,
 };
 use iced::window;
 use iced::{Element, Length, Size, Subscription, Task, Theme};
@@ -89,7 +90,7 @@ struct PopupWindow {
     /// 目标窗口进程名（只读展示，随保存带出）
     process_name: String,
     /// 标题输入框 id（用于打开时聚焦）
-    title_id: text_input::Id,
+    title_id: Id,
 }
 
 /// 概览面板的状态
@@ -164,6 +165,9 @@ pub enum Message {
     PopupSavePressed,
     /// 取消（点击"取消" / Esc / 关闭窗口）
     PopupCancelPressed,
+    /// Esc（全局键盘：按模态优先级分派——确认窗=取消退出、设置窗=不保存关闭、
+    /// 概览面板=关闭、标签弹窗=取消。弹窗输入框 Esc 亦触发）。
+    EscapePressed,
     /// 回车（全局键盘：确认窗=确认退出，设置窗=保存；弹窗输入框已用 on_submit）
     EnterPressed,
     // ---- 概览面板交互 ----
@@ -233,6 +237,10 @@ impl WinTagApp {
             Message::WindowClosed(id) => {
                 if self.confirm.as_ref().is_some_and(|c| c.id == id) {
                     self.confirm = None;
+                    // Esc/取消按钮经 CancelPressed 走 close_confirm 已发 CancelExit；此处
+                    // 兜底覆盖 X 按钮/系统关闭路径（GuiEvent::CancelExit 契约承诺三来源：
+                    // 取消按钮 / Esc / 关闭窗口），保证主线程退出意图一致。
+                    let _ = self.gui_tx.send(GuiEvent::CancelExit);
                 }
                 if self.settings.as_ref().is_some_and(|c| c.id == id) {
                     self.settings = None;
@@ -341,6 +349,32 @@ impl WinTagApp {
                 } else {
                     Task::none()
                 }
+            }
+            // Esc：按模态优先级分派关闭动作。`on_key_press` 订阅不携带窗口 id，
+            // 无法从订阅闭包判断焦点窗，故在 update 内按"当前打开的窗口"优先级处理
+            // ——确认窗>设置窗>概览面板>标签弹窗，与回车（EnterPressed）同构。
+            Message::EscapePressed => {
+                if self.confirm.is_some() {
+                    let _ = self.gui_tx.send(GuiEvent::CancelExit);
+                    return self.close_confirm();
+                }
+                if self.settings.is_some() {
+                    return self.close_settings();
+                }
+                if self.panel.is_some() {
+                    // 关闭面板：window::close 走 WindowClosed → PanelVisibilityChanged(false)
+                    // 回报可见性（与 hide_panel 语义一致）
+                    if let Some(p) = self.panel.take() {
+                        return window::close(p.id);
+                    }
+                    return Task::none();
+                }
+                if self.popup.is_some() {
+                    if let Some(p) = self.popup.take() {
+                        return window::close(p.id);
+                    }
+                }
+                Task::none()
             }
             // 回车：确认窗=确认退出；设置窗=保存；弹窗输入框已用 on_submit 提交，不重复处理。
             Message::EnterPressed => {
@@ -551,10 +585,14 @@ impl WinTagApp {
             target,
             self.popup.is_some(),
         ) {
-            // 同目标且旧弹窗存活：复用并聚焦标题框（不新建不销毁）
+            // 同目标且旧弹窗存活：复用并聚焦标题框 + 置前（不新建不销毁）。
+            // 缺 gain_focus 时弹窗被其他窗口遮挡，用户点角标无任何视觉反馈。
             PopupPlan::Reuse(_) => {
                 if let Some(p) = &self.popup {
-                    text_input::focus::<Message>(p.title_id.clone())
+                    Task::batch([
+                        operation::focus(p.title_id.clone()),
+                        window::gain_focus(p.id),
+                    ])
                 } else {
                     Task::none()
                 }
@@ -576,7 +614,7 @@ impl WinTagApp {
 
     /// 新建标签弹窗（按主线程算好的位置 + 定尺寸，并聚焦标题框）
     fn open_popup_fresh(&mut self, target: isize, position: (i32, i32), tag: Tag) -> Task<Message> {
-        let title_id = text_input::Id::unique();
+        let title_id = Id::unique();
         let (id, open) = window::open(window::Settings {
             position: window::Position::Specific(iced::Point::new(
                 position.0 as f32,
@@ -598,7 +636,7 @@ impl WinTagApp {
         });
         Task::batch([
             open.map(|_| Message::Noop),
-            text_input::focus::<Message>(title_id),
+            operation::focus(title_id),
             window::gain_focus(id),
         ])
     }
@@ -644,11 +682,11 @@ impl WinTagApp {
     }
 
     /// 主题（按当前明暗状态选取 iced 内建主题，经 `ApplyTheme` 热更新）
-    pub fn theme(&self, _window: window::Id) -> Theme {
+    pub fn theme(&self, _window: window::Id) -> Option<Theme> {
         if self.dark {
-            Theme::Dark
+            Some(Theme::Dark)
         } else {
-            Theme::Light
+            Some(Theme::Light)
         }
     }
 
@@ -658,26 +696,43 @@ impl WinTagApp {
         //（会被 iced Tracker 剪除而失效）。tick 也顺带保证零窗口时事件循环持续运转。
         let pump_sub =
             iced::time::every(std::time::Duration::from_millis(60)).map(|_| Message::Pump);
-        let esc_sub = iced::keyboard::on_key_press(|key, _modifiers| {
-            if key == Key::Named(Named::Escape) {
-                Some(Message::PopupCancelPressed)
-            } else {
-                None
-            }
-        });
-        let enter_sub = iced::keyboard::on_key_press(|key, _modifiers| {
-            if key == Key::Named(Named::Enter) {
-                Some(Message::EnterPressed)
-            } else {
-                None
-            }
-        });
+        // 键盘订阅：0.14 移除了 `keyboard::on_key_press`，改用 `event::listen_with`。
+        // 它投递 **captured + ignored** 全部键盘事件（`keyboard::listen` 只报 ignored，
+        // 会在 text_input 聚焦时漏掉按键），并附带 `window::Id`。
+        // 注意：listen_with 的 f 必须是 **裸 fn 指针**（无捕获闭包无法类型检查），
+        // 故用自由函数 [`keyboard_event`]。
+        let key_sub = iced::event::listen_with(keyboard_event);
         Subscription::batch([
             pump_sub,
             window::close_events().map(Message::WindowClosed),
-            esc_sub,
-            enter_sub,
+            key_sub,
         ])
+    }
+}
+
+/// `event::listen_with` 的回调（0.14 要求**裸 fn 指针**，无捕获）。
+///
+/// 把键盘事件映射为高层消息：Esc → [`Message::EscapePressed`]、Enter → [`Message::EnterPressed`]。
+/// 用 `event::listen_with`（而非 `keyboard::listen`）是因为后者只投递 `Ignored` 事件，
+/// 会在 text_input 聚焦时漏掉被控件消费的按键；前者同时投递 Captured + Ignored。
+///
+/// Enter 过滤 `repeat`（长按自动重复不重复触发确认/保存），并**不**处理弹窗场景：
+/// 弹窗标题/备注框的 Enter 由 `on_submit(PopupSavePressed)` 处理，若在此也响应
+/// `EnterPressed` 会双触发（弹窗 Save + 全局 Enter），故弹窗分支不在此映射。
+fn keyboard_event(
+    event: iced::event::Event,
+    _status: iced::event::Status,
+    _window: window::Id,
+) -> Option<Message> {
+    match event {
+        iced::event::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, repeat, .. }) => {
+            match key {
+                Key::Named(Named::Escape) => Some(Message::EscapePressed),
+                Key::Named(Named::Enter) if !repeat => Some(Message::EnterPressed),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -704,11 +759,15 @@ fn settings_view(sw: &SettingsWindow) -> Element<'_, Message> {
             theme,
             text("圆角"),
             corner,
-            checkbox("角标显示标题", sw.draft.show_badge_title)
+            checkbox(sw.draft.show_badge_title)
+                .label("角标显示标题")
                 .on_toggle(Message::SettingsTitleToggled),
-            checkbox("角标始终置顶", sw.draft.badge_always_top)
+            checkbox(sw.draft.badge_always_top)
+                .label("角标始终置顶")
                 .on_toggle(Message::SettingsTopToggled),
-            checkbox("气泡提示", sw.draft.show_balloon).on_toggle(Message::SettingsBalloonToggled),
+            checkbox(sw.draft.show_balloon)
+                .label("气泡提示")
+                .on_toggle(Message::SettingsBalloonToggled),
             row![
                 button(text("取消")).on_press(Message::SettingsCancelPressed),
                 button(text("保存")).on_press(Message::SettingsSavePressed),

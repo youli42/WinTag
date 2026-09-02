@@ -202,8 +202,18 @@ fn main() -> anyhow::Result<()> {
     // 主线程运行 iced daemon（winit 要求主线程创建/运行事件循环；阻塞至此）
     common::debug_log("=== 主线程启动 iced daemon ===");
     let cjk_font_bytes = load_cjk_font();
+    // 0.14：daemon 首参为 boot 函数（原 .run_with 闭包），title 挪到 .title()。
+    // boot 闭包须满足 `Fn`（BootFn 约束），不能 move 消费捕获值，故把跨线程通道
+    // 封装进 `RefCell<Option<..>>` 经 `take()` 取出（daemon boot 只调用一次）。
+    let boot_state = std::cell::RefCell::new(Some((gui_tx, cmd_rx, gui_dark)));
     let result = iced::daemon(
-        ui::iced_app::WinTagApp::title,
+        move || {
+            let (gui_tx, cmd_rx, gui_dark) = boot_state
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| std::panic!("WinTag iced daemon boot 被多次调用"));
+            ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark)
+        },
         ui::iced_app::WinTagApp::update,
         ui::iced_app::WinTagApp::view,
     )
@@ -211,7 +221,8 @@ fn main() -> anyhow::Result<()> {
     .default_font(iced::Font::with_name("Microsoft YaHei"))
     .subscription(ui::iced_app::WinTagApp::subscription)
     .theme(ui::iced_app::WinTagApp::theme)
-    .run_with(move || ui::iced_app::WinTagApp::new(gui_tx, cmd_rx, gui_dark));
+    .title(ui::iced_app::WinTagApp::title)
+    .run();
     match &result {
         Ok(()) => common::debug_log("=== iced daemon 返回 Ok ==="),
         Err(e) => common::debug_log(&format!("=== iced daemon 返回 Err: {e:?} ===")),
@@ -273,9 +284,10 @@ fn run_win32_worker(
     // 注册全局热键
     hotkey::register_all(hwnd)?;
 
-    // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式。
+    // 创建系统托盘图标（--no-tray 时跳过）；创建失败非致命，降级为无托盘模式
+    // （不可用 `?` 传播：worker 线程闭包收到 Err 会 process::exit(0) 静默杀掉 iced 主线程）。
     let _tray = if !no_tray {
-        Some(sys::tray::create_tray()?)
+        sys::tray::create_tray().ok()
     } else {
         None
     };
@@ -628,10 +640,15 @@ fn poll_overlays() {
     }
 
     // 延迟到遍历结束后统一移除（避免迭代期间修改 HashMap）
+    let had_stale = !stale.is_empty();
     for target_hwnd in stale {
         // 移除即触发 Overlay::drop，自动销毁覆盖层窗口
         overlays.remove(&target_hwnd);
         remove_tag(target_hwnd);
+    }
+    // 目标窗口已销毁清掉标签后，若面板可见需同步刷新，避免残留已消失窗口的死行
+    if had_stale {
+        refresh_panel_now();
     }
 }
 
@@ -646,6 +663,8 @@ fn forget_target(target_hwnd: isize) {
         }
     }
     remove_tag(target_hwnd);
+    // 窗口销毁清掉标签后，面板可见时同步刷新（镜像 TagSaved/RemoveTag 路径）
+    refresh_panel_now();
 }
 
 /// 从全局标签存储删除指定窗口的标签（锁中毒时静默）
@@ -692,7 +711,14 @@ fn popup_position(hidden_hwnd: HWND) -> (i32, i32) {
     }
     let w = ui::geo::dp(hidden_hwnd, ui::geo::POPUP_LOGICAL_W);
     let h = ui::geo::dp(hidden_hwnd, ui::geo::POPUP_LOGICAL_H);
-    ui::geo::clamp_to_work(origin.x + 16, origin.y + 16, w, h)
+    // 物理像素空间做钳制（clamp_to_work 按缩放后的物理尺寸判断越界）
+    let (px, py) = ui::geo::clamp_to_work(origin.x + 16, origin.y + 16, w, h);
+    // iced 的 window::Position::Specific 取**逻辑**坐标（iced_winit conversion 把它
+    // 转成 winit LogicalPosition）；Win32 此处是物理像素，须除以隐藏窗口 DPI
+    // 缩放因子还原为逻辑像素，否则 HiDPI（150%/200%）下弹窗偏移到 1.5×/2× 处。
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hidden_hwnd) };
+    let dpi = if dpi == 0 { ui::geo::BASE_DPI } else { dpi };
+    (ui::geo::unscale_px(px, dpi), ui::geo::unscale_px(py, dpi))
 }
 
 /// 向 iced 线程发送一条命令（D27；通道未就绪时静默）

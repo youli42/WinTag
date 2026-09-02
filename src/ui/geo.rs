@@ -27,6 +27,18 @@ pub fn scale_px(px: i32, dpi: u32) -> i32 {
     scaled.clamp(1, i32::MAX as i64) as i32
 }
 
+/// 纯函数：把物理像素还原为逻辑像素（`scale_px` 的逆运算，四舍五入）
+///
+/// 供主线程把 Win32 物理像素坐标（`GetCursorPos` / `GetWindowRect`）转成
+/// iced 期望的**逻辑**坐标投递。iced 的 [`iced::window::Position::Specific`]
+/// 被解释为 winit 逻辑坐标（见 iced_winit `conversion::position`），若直接传
+/// 物理像素，HiDPI（150%/200%）下弹窗会偏移到 1.5×/2× 处。
+pub fn unscale_px(px: i32, dpi: u32) -> i32 {
+    let dpi = if dpi == 0 { BASE_DPI } else { dpi };
+    let scaled = (px as i64 * BASE_DPI as i64 + dpi as i64 / 2) / dpi as i64;
+    scaled.clamp(0, i32::MAX as i64) as i32
+}
+
 /// 取窗口当前 DPI 并缩放设计像素
 ///
 /// `GetDpiForWindow` 失败（句柄无效等）时按 96 DPI（不缩放）处理；
@@ -102,5 +114,32 @@ mod tests {
         assert_eq!(scale_px(1, 96), 1);
         // 0px 请求也至少返回 1，避免控件归零不可见
         assert_eq!(scale_px(0, 96), 1);
+    }
+
+    /// unscale_px：96 DPI 不缩放；高 DPI 线性还原（scale_px 的逆运算）
+    #[test]
+    fn unscale_px_reverts_scale() {
+        // 96 DPI 恒等：物理 == 逻辑
+        assert_eq!(unscale_px(24, 96), 24);
+        // 150%：物理 36 ← 逻辑 24
+        assert_eq!(unscale_px(36, 144), 24);
+        // 200%：物理 48 ← 逻辑 24
+        assert_eq!(unscale_px(48, 192), 24);
+    }
+
+    /// unscale_px 与 scale_px 往返一致（含四舍五入边界）
+    #[test]
+    fn unscale_scale_roundtrip() {
+        for dpi in [96, 110, 120, 144, 192] {
+            for logical in [1, 8, 16, 24, 100, 420] {
+                assert_eq!(unscale_px(scale_px(logical, dpi), dpi), logical);
+            }
+        }
+    }
+
+    /// unscale_px 异常输入：dpi=0 回退 96（不缩放）
+    #[test]
+    fn unscale_px_fallback() {
+        assert_eq!(unscale_px(24, 0), 24);
     }
 }
