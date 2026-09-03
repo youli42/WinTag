@@ -41,6 +41,10 @@ static OVERLAY_STORE: OnceLock<Arc<Mutex<OverlayMap>>> = OnceLock::new();
 static PANEL_VISIBLE: AtomicBool = AtomicBool::new(false);
 /// 全局标签存储（供 WndProc 清理路径访问；与 `overlay::set_tag_store` 注入的是同一份 Arc）
 static GLOBAL_TAG_STORE: OnceLock<Arc<Mutex<TagStore>>> = OnceLock::new();
+/// 会话内概览面板标签顺序（纯内存，程序退出即清）：
+/// `None` = 尚未手动排序，按默认标题字母序；`Some(vec)` = 用户拖拽后的手动顺序。
+/// 与 `TagStore`（HashMap，无序）解耦：顺序以并行 vec 承载，主线程唯一权威。
+static TAG_ORDER: OnceLock<Arc<Mutex<Option<Vec<isize>>>>> = OnceLock::new();
 /// 主线程 → iced 线程的命令发送端（D27）
 ///
 /// 镜像 `GLOBAL_TAG_STORE` 的注入模式：`main` 启动时写入一次，供
@@ -255,6 +259,10 @@ fn run_win32_worker(
     sys::overlay::set_tag_store(Arc::clone(&tag_store));
     if GLOBAL_TAG_STORE.get().is_none() {
         let _ = GLOBAL_TAG_STORE.set(Arc::clone(&tag_store));
+    }
+    // 会话内标签顺序（None=未手动排序走默认字母序；OnceLock 仅首次设置生效）
+    if TAG_ORDER.get().is_none() {
+        let _ = TAG_ORDER.set(Arc::new(Mutex::new(None)));
     }
     // 注入覆盖层的消息中转目标（R5：角标/标题条单击 → WM_APP_EDIT_TAG 请求编辑）
     sys::overlay::set_message_target(hwnd.0 as isize);
@@ -667,13 +675,21 @@ fn forget_target(target_hwnd: isize) {
     refresh_panel_now();
 }
 
-/// 从全局标签存储删除指定窗口的标签（锁中毒时静默）
+/// 从全局标签存储删除指定窗口的标签（锁中毒时静默），并同步从手动顺序移除该 target
 fn remove_tag(target_hwnd: isize) {
     let Some(store) = GLOBAL_TAG_STORE.get() else {
         return;
     };
     if let Ok(mut tags) = store.lock() {
         tags.remove(&target_hwnd);
+    }
+    // 手动顺序已建立时同步剔除（None=未手动排序，无 manual 可维护，跳过）
+    if let Some(order) = TAG_ORDER.get() {
+        if let Ok(mut manual) = order.lock() {
+            if let Some(manual) = manual.as_mut() {
+                manual.retain(|target| *target != target_hwnd);
+            }
+        }
     }
 }
 
@@ -764,12 +780,101 @@ fn refresh_panel_now() {
     send_iced(crate::ui::iced_proto::IcedCommand::RefreshTags { rows });
 }
 
-/// 从全局标签存储构建面板行快照（纯数据组装）
+/// 默认行序：按标题字母升序（忽略大小写），title 相同按 target 升序稳定
+///
+/// 纯函数、无副作用（不访问全局状态），便于单元测试。
+fn sort_rows_default(tags: &[(&isize, &crate::core::tag::Tag)]) -> Vec<isize> {
+    let mut entries: Vec<(&isize, &crate::core::tag::Tag)> = tags.to_vec();
+    entries.sort_by(|a, b| {
+        a.1.title
+            .to_lowercase()
+            .cmp(&b.1.title.to_lowercase())
+            .then_with(|| a.0.cmp(b.0))
+    });
+    entries.into_iter().map(|(target, _)| *target).collect()
+}
+
+/// 把手动顺序应用于当前标签集：
+/// - `manual` 中存在于 `current` 的 target 按 manual 序排前（重复项去重）；
+/// - `current` 有但 `manual` 缺失的 target 按默认字母序追加到尾部；
+/// - `manual` 有但 `current` 已不存在的 target 剔除。
+///
+/// 纯函数、无副作用，便于单元测试。
+fn apply_manual_order(
+    current: &[(&isize, &crate::core::tag::Tag)],
+    manual: &[isize],
+) -> Vec<isize> {
+    let mut ordered: Vec<isize> = Vec::new();
+    let known: Vec<&isize> = current.iter().map(|(target, _)| *target).collect();
+    for target in manual {
+        if known.contains(&target) && !ordered.contains(target) {
+            ordered.push(*target);
+        }
+    }
+    // 缺失项补尾：按默认字母序保持稳定（复用 sort_rows_default 的标题序）
+    let missing: Vec<(&isize, &crate::core::tag::Tag)> = current
+        .iter()
+        .filter(|(target, _)| !ordered.contains(*target))
+        .copied()
+        .collect();
+    ordered.extend(sort_rows_default(&missing));
+    ordered
+}
+
+/// 记录手动顺序：新标签 target 追加到已有 manual 尾部（若已在则原样返回）
+///
+/// 纯函数、无副作用，便于单元测试。
+fn note_manual_order(manual: &[isize], target: isize) -> Vec<isize> {
+    if manual.contains(&target) {
+        return manual.to_vec();
+    }
+    let mut next = manual.to_vec();
+    next.push(target);
+    next
+}
+
+/// 从全局标签存储构建面板行快照（按会话内顺序模型组装）
 fn build_tag_rows() -> Vec<crate::ui::iced_proto::TagRow> {
     let mut rows = Vec::new();
-    if let Some(store) = GLOBAL_TAG_STORE.get() {
-        if let Ok(tags) = store.lock() {
-            for (&target, tag) in tags.iter() {
+    let Some(store) = GLOBAL_TAG_STORE.get() else {
+        return rows;
+    };
+    // 锁内只克隆 tag 快照，释放锁后再排序与组装（避免长临界区）
+    let snapshot: Vec<(isize, crate::core::tag::Tag)> = {
+        let Ok(tags) = store.lock() else {
+            return rows;
+        };
+        tags.iter()
+            .map(|(&target, tag)| (target, tag.clone()))
+            .collect()
+    };
+    let refs: Vec<(&isize, &crate::core::tag::Tag)> =
+        snapshot.iter().map(|(target, tag)| (target, tag)).collect();
+    // 顺序解析：None → 默认标题字母序；Some(manual) → 手动顺序（缺失补尾 / 失效剔除）
+    let manual: Option<Vec<isize>> = match TAG_ORDER.get() {
+        Some(order) => match order.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    let ordered = match manual {
+        Some(manual) => apply_manual_order(&refs, &manual),
+        None => sort_rows_default(&refs),
+    };
+    let mut by_target: HashMap<isize, crate::core::tag::Tag> = snapshot.into_iter().collect();
+    for target in ordered {
+        if let Some(tag) = by_target.remove(&target) {
+            rows.push(crate::ui::iced_proto::TagRow { target, tag });
+        }
+    }
+    // 防御兜底：顺序模型理论上覆盖全部标签，若未来实现遗漏则按默认序补尾，避免丢行
+    if !by_target.is_empty() {
+        let leftover: Vec<(isize, crate::core::tag::Tag)> = by_target.into_iter().collect();
+        let leftover_refs: Vec<(&isize, &crate::core::tag::Tag)> =
+            leftover.iter().map(|(target, tag)| (target, tag)).collect();
+        for target in sort_rows_default(&leftover_refs) {
+            if let Some((_, tag)) = leftover.iter().find(|(t, _)| *t == target) {
                 rows.push(crate::ui::iced_proto::TagRow {
                     target,
                     tag: tag.clone(),
@@ -884,6 +989,15 @@ fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
                     tags.insert(target, tag);
                 }
             }
+            // 手动顺序已建立时把新 target 追加到 manual 尾部（None=未手动排序，
+            // 保持默认字母序由 sort_rows_default 自行纳入，不提前物化 manual）
+            if let Some(order) = TAG_ORDER.get() {
+                if let Ok(mut manual) = order.lock() {
+                    if let Some(existing) = manual.as_ref() {
+                        *manual = Some(note_manual_order(existing, target));
+                    }
+                }
+            }
             // 请求创建/刷新覆盖层（WM_CREATE_OVERLAY 由隐藏窗口去重）
             // SAFETY: hwnd 为存活隐藏窗口；PostMessageW 为线程安全标准 API。
             unsafe {
@@ -925,6 +1039,24 @@ fn dispatch_iced_event(hwnd: HWND, event: ui::iced_proto::GuiEvent) {
             refresh_panel_now();
         }
         ui::iced_proto::GuiEvent::PanelExit => request_exit(hwnd, false),
+        ui::iced_proto::GuiEvent::ReorderTags { targets } => {
+            // 面板拖拽排序完成（D28）：把收到的完整新顺序与当前标签集合并校验后
+            // 写入会话内 TAG_ORDER。apply_manual_order 负责剔除失效 target、
+            // 并对拖拽期间新增的标签按默认序补尾，保证顺序自洽（不漂移）。
+            if let Some(order) = TAG_ORDER.get() {
+                if let Ok(mut guard) = order.lock() {
+                    let refs = GLOBAL_TAG_STORE
+                        .get()
+                        .and_then(|s| s.lock().ok())
+                        .map(|tags| {
+                            // 锁守卫活到本闭包末尾；tags.iter() 即 (&isize, &Tag)
+                            apply_manual_order(&tags.iter().collect::<Vec<_>>(), &targets)
+                        })
+                        .unwrap_or_default();
+                    *guard = Some(refs);
+                }
+            }
+        }
     }
 }
 
@@ -1126,5 +1258,108 @@ mod tests {
         let light = apply_native_prefs(cfg, false);
         assert_eq!(dark.tooltip_bg, ui::theme::dark_colors().tooltip_bg);
         assert_eq!(light.tooltip_bg, ui::theme::light_colors().tooltip_bg);
+    }
+
+    // ---------- 会话内标签顺序模型 ----------
+
+    /// 构造仅标题不同的测试标签（其余字段取固定默认值，镜像 smoke.rs 的 Tag 构造）
+    fn test_tag(title: &str) -> crate::core::tag::Tag {
+        crate::core::tag::Tag {
+            title: title.to_string(),
+            note: String::new(),
+            color: crate::core::tag::TagColor::Orange,
+            window_title: String::new(),
+            process_name: String::new(),
+        }
+    }
+
+    /// 把 (target, Tag) 列表转成顺序模型纯函数签名的引用切片
+    fn test_pairs(
+        entries: &[(isize, crate::core::tag::Tag)],
+    ) -> Vec<(&isize, &crate::core::tag::Tag)> {
+        entries.iter().map(|(target, tag)| (target, tag)).collect()
+    }
+
+    // ---------- sort_rows_default ----------
+
+    /// 默认序按标题字母升序且忽略大小写：Apple < banana < cherry
+    #[test]
+    fn sort_rows_default_alphabetical_ignores_case() {
+        let entries = [
+            (1, test_tag("banana")),
+            (2, test_tag("Apple")),
+            (3, test_tag("cherry")),
+        ];
+        let refs = test_pairs(&entries);
+        assert_eq!(sort_rows_default(&refs), vec![2, 1, 3]);
+    }
+
+    /// 仅大小写不同的同标题：忽略大小写视为相等
+    #[test]
+    fn sort_rows_default_case_insensitive_equal() {
+        let entries = [
+            (1, test_tag("apple")),
+            (2, test_tag("APPLE")),
+            (3, test_tag("Apple")),
+        ];
+        let refs = test_pairs(&entries);
+        assert_eq!(sort_rows_default(&refs), vec![1, 2, 3]);
+    }
+
+    /// 标题完全相同 → 按 target 升序稳定（不依赖输入顺序）
+    #[test]
+    fn sort_rows_default_tie_break_by_target() {
+        let entries = [
+            (7, test_tag("same")),
+            (2, test_tag("same")),
+            (9, test_tag("same")),
+        ];
+        let refs = test_pairs(&entries);
+        assert_eq!(sort_rows_default(&refs), vec![2, 7, 9]);
+    }
+
+    // ---------- apply_manual_order ----------
+
+    /// 正常重排：manual 中存在的 target 按 manual 序排前
+    #[test]
+    fn apply_manual_order_reorders_existing() {
+        let entries = [(1, test_tag("a")), (2, test_tag("b")), (3, test_tag("c"))];
+        let refs = test_pairs(&entries);
+        assert_eq!(apply_manual_order(&refs, &[3, 1]), vec![3, 1, 2]);
+    }
+
+    /// current 多出的 target（manual 缺失）按默认字母序追加到尾部
+    #[test]
+    fn apply_manual_order_appends_missing_in_default_order() {
+        let entries = [
+            (1, test_tag("banana")),
+            (2, test_tag("apple")),
+            (3, test_tag("cherry")),
+        ];
+        let refs = test_pairs(&entries);
+        assert_eq!(apply_manual_order(&refs, &[2]), vec![2, 1, 3]);
+    }
+
+    /// manual 中已失效的 target（current 不存在）被剔除
+    #[test]
+    fn apply_manual_order_drops_stale_targets() {
+        let entries = [(1, test_tag("a")), (2, test_tag("b"))];
+        let refs = test_pairs(&entries);
+        assert_eq!(apply_manual_order(&refs, &[99, 1]), vec![1, 2]);
+    }
+
+    // ---------- note_manual_order ----------
+
+    /// 新 target 追加到 manual 尾部（空 manual 亦然）
+    #[test]
+    fn note_manual_order_appends_to_tail() {
+        assert_eq!(note_manual_order(&[1, 2], 3), vec![1, 2, 3]);
+        assert_eq!(note_manual_order(&[], 5), vec![5]);
+    }
+
+    /// target 已在 manual 中 → 原样不动（编辑保存标签时不会改变顺序）
+    #[test]
+    fn note_manual_order_existing_is_noop() {
+        assert_eq!(note_manual_order(&[1, 2], 2), vec![1, 2]);
     }
 }
