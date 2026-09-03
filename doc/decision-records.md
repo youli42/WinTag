@@ -594,3 +594,22 @@ unsafe 全部集中在与 Win32 API 直接交互的层：sys 层（window/win_ev
   - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（本决策仅登记设计；分阶段实施见 `doc/iced-migration.md`）。
 
 ---
+
+## D28：概览面板 Win11 暗色紧凑视觉对齐 + 行内编辑 + 拖拽排序（2026-09-02）
+
+- **背景**：D27 把四窗迁至 iced 后，概览面板沿用 iced 内建默认样式——行是「▸/▾ 按钮 + 标题|窗口名」，顺序是 `HashMap` 桶序（`build_tag_rows` 遍历 `tags.iter()`）。用户对照一个 Win11 暗色紧凑版 HTML demo（搜索框 + 卡片式标签行 + 拖拽手柄 + 双击行内编辑 + 图标操作按钮），希望面板达到该观感并补齐交互。核心痛点：① 展示顺序无意义（桶序随机）；② 长标题/路径无省略号截断；③ 无按住手柄拖拽排序；④ 编辑只能弹窗、无行内双击编辑。
+- **决策**：
+  1. **默认排序**：面板行按标签标题字母/拼音升序（忽略大小写），标签追加尾部；用户拖拽后可改为手动顺序。顺序**纯会话内存不持久**（与标签一致，程序退出即清）。主线程维护 `TAG_ORDER: OnceLock<Arc<Mutex<Option<Vec<isize>>>>>`（`None`=默认排序，`Some`=手动顺序），`build_tag_rows` 据此组装快照。
+  2. **视觉对齐 demo**：新增 `ui/panel_style.rs` 叶子模块（`PanelPalette` Win11 暗色/亮色 + 图标字形常量 + `truncate_units` CJK 双宽省略号纯函数）；`panel_row` 改为「拖拽手柄 + chevron + 标题|窗口 合并（省略号截断）+ hover 高亮 + 展开区图标按钮（置前▲/编辑✎/移除🗑）」；列表改用 `keyed::Column`（key=`target`）保行内状态。
+  3. **行内编辑**：`PanelState.editing` 状态驱动换 widget——双击标题/备注进入 `text_input` 编辑，Enter 保存（复用 `GuiEvent::TagSaved`）、Esc 取消（`EscapePressed` 加「编辑优先」分支）；单击标题仍置前。
+  4. **拖拽排序**：冰(iced)无内置列表 DnD，采用 `mouse_area` 组合——拖拽手柄 `on_press` 起拖、拖拽中行 `on_enter`/`on_press` 上报预览位、列表级 `on_release` 提交、`on_exit` 拖出取消；drop 时经 `preview_reorder` 纯函数算新顺序，发新增 `GuiEvent::ReorderTags{targets}` 回主线程合并写入 `TAG_ORDER`。已确认 iced 0.14 `mouse_area` 在 `on_press`/`on_double_click` 调用 `shell.capture_event()` 阻止冒泡，手柄/行主体/列表三级 mouse_area 无双触发冲突。
+  5. **不用右键菜单**：demo 的右键置前/编辑/移除改为展开区图标按钮（更稳健，避开 iced 右键菜单 + 拖拽 + 双击叠加的交互复杂度）。
+- **未采纳的替代**：
+  1. **`iced_focus`（2021, iced 0.3 时代）**：crates.io 双重取证确认硬依赖 `iced ^0.3.0`，其依赖的 `text_input::State`/`iced_native::subscription::events_with` 在 0.14 均已删除，无法编译。README 自述「作为 iced 官方焦点支持前的临时 workaround」——而 iced 0.14 已原生实现 `operation::focus_next`/`focus_previous`/`focus(id)`，本方案正是用该官方 API。
+  2. **换 GUI 库**（egui/Slint/Tauri/fltk 等）：librarian 调研证明没有任何库能在「Tab 焦点开箱即用 + Windows 中文 IME + 生产成熟 + 迁移成本低」上同时赢过留在 iced；各候选库均有自己的 IME 边界问题（Slint #8716 冻结未定位、Tauri contenteditable WebView2 bug 等）。D27 刚完成 iced 迁移，重写 UI 层成本远超收益。
+- **影响与后续跟进**：
+  - `src/ui/panel_style.rs` 新增（叶子，`ui/mod.rs` 注册）；`src/ui/iced_app.rs`（PanelState 加 `hovered`/`editing`/`drag`，Message 加 hover/编辑/拖拽系列，`panel_view`/`panel_row` 重写）；`src/ui/iced_proto.rs`（`GuiEvent::ReorderTags`）；`src/main.rs`（`TAG_ORDER` + 排序纯函数 + `dispatch_iced_event` 分支）。
+  - **协议铁律**：未新增通道，`ReorderTags` 复用现有 iced 出站通道；符合「总线最小化」。
+  - **TDD**：新增单测覆盖 `sort_rows_default`/`apply_manual_order`/`note_manual_order`（main）、`truncate_units`/`panel_palette`（panel_style）、`apply_edit_to_rows`/`preview_reorder`/`reorder_rows`（iced_app）、`ReorderTags` 协议变体（iced_proto）。
+  - **回归面**：Tab 焦点、Esc 取消、回车保存、单击置前、双击编辑、拖拽排序、搜索过滤——需手动验收（拖拽手势/hover 高亮/双击编辑的最终视觉交互需真机桌面确认）。
+  - `cargo build`/`clippy -D warnings`/`fmt --check`/`test` 全绿（新增 24 项单测，合计 120 项）。

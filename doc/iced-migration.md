@@ -43,6 +43,7 @@
 | `ExpandAll` / `CollapseAll` | 展开/收起（供主线程留快照） | — |
 | `ConfirmExit` / `CancelExit` | 确认/取消退出 | — |
 | `PanelVisibilityChanged` | 面板显隐上报 | `bool` |
+| `ReorderTags` | 面板拖拽排序回传（D28） | `targets: Vec<isize>`（完整新顺序） |
 
 ### 原生层注入（收敛后）
 

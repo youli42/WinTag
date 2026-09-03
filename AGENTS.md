@@ -121,4 +121,7 @@ tests/
 
 **2026-09-01 D27 落地（GUI 全面迁至 iced）**：四个 GUI 窗口（confirm/settings/popup/panel）迁至 iced（`tiny-skia` 软件渲染器 + 独立线程 `wintag-gui` + crossbeam 通道，分阶段 G0-G4），删除手写 Win32 UI（`ui/{button,layout,panel,popup,settings,confirm}.rs`），`ui/` 收敛为 `iced_app.rs`/`iced_proto.rs`/`geo.rs`/`theme.rs`；原生层注入收敛为 `sys::native_prefs::NativePrefs` + 单一 `pump_background_events` dispatch（托盘/覆盖层/热键保持纯 Win32）。见 [decision-records.md D27](./doc/decision-records.md) 与 [doc/iced-migration.md](./doc/iced-migration.md)。
 
+**2026-09-02 D28 落地（概览面板 Win11 暗色紧凑视觉对齐 + 行内编辑 + 拖拽排序）**：面板视觉对齐用户 HTML demo——新增 `ui/panel_style.rs` 叶子（`PanelPalette` Win11 暗色/亮色 + 图标字形常量 + `truncate_units` CJK 双宽省略号纯函数）；`panel_row` 改「拖拽手柄 + chevron + 标题|窗口 合并（省略号）+ hover 高亮 + 展开区图标按钮（置前▲/编辑✎/移除🗑）」；列表改用 `keyed::Column`（key=`target`）；行内双击编辑（`PanelState.editing` 状态驱动换 `text_input`，Enter 保存复用 `GuiEvent::TagSaved`、Esc 编辑优先取消）；拖拽手柄排序（`mouse_area` 组合：手柄起拖 / 行上报预览位 / 列表级提交与取消，drop 经 `preview_reorder` 发新增 `GuiEvent::ReorderTags{targets}` 回主线程写 `TAG_ORDER`）。默认排序改按标题字母/拼音升序（`main.rs` 维护 `TAG_ORDER`）。不用右键菜单（用图标按钮替代）。见 [decision-records.md D28](./doc/decision-records.md)。
+
+
 **扩展规划（2026-08-31，只读调研，未实施）**：功能增强与使用性问题修复已调研并归档——① ~~系统托盘（D22，v1 系统图标可接受）~~（✅ 已随 D24 落地）；② 标签分组/工作区（D23，**纯会话不持久化**，分组控件置于新建标签弹窗标题下方，可输入或选择已有分组）；③ 统计图表（D23，形态待确认，默认按分组计数柱状图）；④ 自定义快捷键（D23，设置页"快捷键"分页录制）；⑤ 面板增强（默认展开、一键展开收起、贴边隐藏、纯键盘操作，D21）；⑥ 标签跟随移动修复（D21，MOVESIZESEND 最终同步 + 轮询加速）。详见 [doc/issues-and-requirements.md 四、扩展规划](./doc/issues-and-requirements.md) 与 [doc/decision-records.md D21-D23](./doc/decision-records.md)。详细设计文档见 `doc/` 目录。
