@@ -19,8 +19,8 @@ use std::collections::HashSet;
 
 use iced::keyboard::key::{Key, Named};
 use iced::widget::{
-    button, checkbox, column, combo_box, container, operation, row, scrollable, text, text_input,
-    Id,
+    button, checkbox, column, combo_box, container, mouse_area, operation, row, scrollable, text,
+    text_input, Id,
 };
 use iced::window;
 use iced::{Element, Length, Size, Subscription, Task, Theme};
@@ -93,6 +93,33 @@ struct PopupWindow {
     title_id: Id,
 }
 
+/// 行内编辑的字段（标题或备注，D28 双击编辑）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditField {
+    /// 标签标题
+    Title,
+    /// 标签备注
+    Note,
+}
+
+/// 行内编辑会话（D28）：目标窗口 + 编辑的字段 + 当前草稿
+struct PanelEdit {
+    /// 被编辑标签的目标窗口句柄
+    target: isize,
+    /// 正在编辑的字段（标题 / 备注）
+    field: EditField,
+    /// 编辑中的草稿文本（`text_input` 当前值）
+    draft: String,
+}
+
+/// 拖拽排序会话（D28）：按下手柄的源行 + 当前悬停的目标行（预览插入位）
+struct PanelDrag {
+    /// 拖押起的源行 target
+    from_target: isize,
+    /// 当前鼠标悬停的行 target（`None` = 尚未进入任何行）
+    over_target: Option<isize>,
+}
+
 /// 概览面板的状态
 struct PanelState {
     /// 窗口 id
@@ -103,6 +130,12 @@ struct PanelState {
     search: String,
     /// 已展开（显示备注）的目标窗口句柄集合
     expanded: HashSet<isize>,
+    /// 当前鼠标悬停的行目标（`None` = 无；供卡片 hover 高亮，D28）
+    hovered: Option<isize>,
+    /// 当前行内编辑会话（`None` = 未编辑）
+    editing: Option<PanelEdit>,
+    /// 当前拖拽排序会话（`None` = 未拖拽；D28）
+    drag: Option<PanelDrag>,
 }
 
 /// iced 应用状态（运行在 iced 线程，单线程访问，无需 `Send`）
@@ -191,6 +224,26 @@ pub enum Message {
     PanelRowEdit(isize),
     /// 行"移除"按钮
     PanelRowRemove(isize),
+    /// 位置进入某行（mouse_area on_enter，D28 hover 高亮）
+    PanelRowEntered(isize),
+    /// 位置离开某行（mouse_area on_exit，D28 hover 高亮）
+    PanelRowExited,
+    /// 双击标题/备注开始行内编辑（D28）
+    PanelBeginEdit { target: isize, field: EditField },
+    /// 行内编辑输入框内容变更（D28）
+    PanelEditInput(String),
+    /// 行内编辑提交（回车保存，发 GuiEvent::TagSaved）
+    PanelEditCommit,
+    /// 行内编辑取消（Esc）
+    PanelEditCancel,
+    /// 拖拽手柄按下（D28：开始拖拽排序）
+    PanelDragStart(isize),
+    /// 拖拽中悬停到某行（D28：更新预览插入位）
+    PanelDragHover(isize),
+    /// 拖拽释放（D28：提交 ReorderTags）
+    PanelDragDrop,
+    /// 拖拽取消/拖出列表（D28：清空拖拽态）
+    PanelDragCancel,
     /// 面板底部"退出"
     PanelExitPressed,
 }
@@ -367,6 +420,13 @@ impl WinTagApp {
                 if self.settings.is_some() {
                     return self.close_settings();
                 }
+                // 编辑优先（D28）：面板行内编辑中按 Esc 先取消编辑，而非直接关面板
+                if self.panel.as_ref().is_some_and(|p| p.editing.is_some()) {
+                    if let Some(p) = &mut self.panel {
+                        p.editing = None;
+                    }
+                    return Task::none();
+                }
                 if self.panel.is_some() {
                     // 关闭面板：window::close 走 WindowClosed → PanelVisibilityChanged(false)
                     // 回报可见性（与 hide_panel 语义一致）
@@ -459,6 +519,110 @@ impl WinTagApp {
                 let _ = self.gui_tx.send(GuiEvent::RemoveTag { target });
                 Task::none()
             }
+            Message::PanelRowEntered(target) => {
+                if let Some(p) = &mut self.panel {
+                    p.hovered = Some(target);
+                }
+                Task::none()
+            }
+            Message::PanelRowExited => {
+                if let Some(p) = &mut self.panel {
+                    p.hovered = None;
+                }
+                Task::none()
+            }
+            // 双击开始行内编辑：从 rows 找到该 target 的 tag，取对应字段作草稿
+            Message::PanelBeginEdit { target, field } => {
+                if let Some(p) = &mut self.panel {
+                    if let Some(row) = p.rows.iter().find(|r| r.target == target) {
+                        let draft = match field {
+                            EditField::Title => row.tag.title.clone(),
+                            EditField::Note => row.tag.note.clone(),
+                        };
+                        p.editing = Some(PanelEdit {
+                            target,
+                            field,
+                            draft,
+                        });
+                    }
+                }
+                Task::none()
+            }
+            Message::PanelEditInput(s) => {
+                if let Some(p) = &mut self.panel {
+                    if let Some(edit) = &mut p.editing {
+                        edit.draft = s;
+                    }
+                }
+                Task::none()
+            }
+            // 提交：合并草稿到对应 tag（纯函数可单测），发 TagSaved + 本地更新 + 清编辑
+            Message::PanelEditCommit => {
+                if let Some(p) = &mut self.panel {
+                    if let Some(edit) = p.editing.take() {
+                        if p.rows.iter().any(|r| r.target == edit.target) {
+                            let (new_rows, tag) = apply_edit_to_rows(&p.rows, &edit);
+                            p.rows = new_rows;
+                            let _ = self.gui_tx.send(GuiEvent::TagSaved {
+                                target: edit.target,
+                                tag,
+                            });
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::PanelEditCancel => {
+                if let Some(p) = &mut self.panel {
+                    p.editing = None;
+                }
+                Task::none()
+            }
+            // 拖拽排序开始（D28）：记录源行 target（禁止在搜索/编辑时拖拽）
+            Message::PanelDragStart(target) => {
+                if let Some(p) = &mut self.panel {
+                    if p.search.trim().is_empty() && p.editing.is_none() {
+                        p.drag = Some(PanelDrag {
+                            from_target: target,
+                            over_target: None,
+                        });
+                    }
+                }
+                Task::none()
+            }
+            // 拖拽中悬停某行（D28）：更新预览插入位
+            Message::PanelDragHover(target) => {
+                if let Some(p) = &mut self.panel {
+                    if let Some(drag) = &mut p.drag {
+                        if drag.from_target != target {
+                            drag.over_target = Some(target);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            // 拖拽释放（D28）：计算新顺序 → 本地更新 + 发 ReorderTags 回主线程
+            Message::PanelDragDrop => {
+                if let Some(p) = &mut self.panel {
+                    if let Some(drag) = p.drag.take() {
+                        if let Some(over) = drag.over_target {
+                            if over != drag.from_target {
+                                let order = preview_reorder(&p.rows, &drag);
+                                p.rows = reorder_rows(&p.rows, &order);
+                                let _ = self.gui_tx.send(GuiEvent::ReorderTags { targets: order });
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            // 拖拽取消/拖出列表（D28）：清空拖拽态
+            Message::PanelDragCancel => {
+                if let Some(p) = &mut self.panel {
+                    p.drag = None;
+                }
+                Task::none()
+            }
             Message::PanelExitPressed => {
                 let _ = self.gui_tx.send(GuiEvent::PanelExit);
                 Task::none()
@@ -519,6 +683,9 @@ impl WinTagApp {
             rows: Vec::new(),
             search: String::new(),
             expanded: HashSet::new(),
+            hovered: None,
+            editing: None,
+            drag: None,
         });
         Task::batch([open.map(|_| Message::Noop), window::gain_focus(id)])
     }
@@ -701,7 +868,7 @@ impl WinTagApp {
         }
         if let Some(panel) = &self.panel {
             if panel.id == window_id {
-                return panel_view(panel);
+                return panel_view(panel, self.dark);
             }
         }
         // 尚未创建的实际窗口：渲染空容器（iced 要求每窗口都有 view）
@@ -863,21 +1030,34 @@ fn color_swatch(
 }
 
 /// 概览面板视图：搜索框 + 标签列表（可展开备注）+ 全部展开/收起 + 底部"退出"
-fn panel_view(panel: &PanelState) -> Element<'_, Message> {
+///
+/// 视觉对齐 HTML demo（Win11 暗色紧凑版）：卡片式行、hover 高亮、chevron、图标按钮、
+/// 标题|窗口 合并 + CJK 双宽省略号。`dark` 决定调色板（面板无独立 dark，取应用主题）。
+fn panel_view(panel: &PanelState, dark: bool) -> Element<'_, Message> {
+    let palette = crate::ui::panel_style::panel_palette(dark);
     let search = text_input("搜索标题/备注/窗口/进程", &panel.search)
         .on_input(Message::PanelSearchChanged)
         .width(Length::Fill);
 
     let rows = filter_rows(&panel.rows, &panel.search);
-    let list = if rows.is_empty() {
-        column![text("无匹配标签").size(14)].padding(8)
+    let list: Element<'static, Message> = if rows.is_empty() {
+        column![text("无匹配标签")
+            .size(14)
+            .style(text_style(palette.subtle))]
+        .padding(8)
+        .into()
     } else {
-        column(
-            rows.into_iter()
-                .map(|row| panel_row(panel, &row))
-                .collect::<Vec<_>>(),
-        )
-        .spacing(4)
+        // keyed::Column 以 target 为 key 保行内状态（重排/刷新后避免串位）。
+        // 显式注解 Key=isize，避免 fold 类型推断歧义。
+        let col: iced::widget::keyed::Column<'static, isize, Message> =
+            iced::widget::keyed::Column::new()
+                .spacing(4)
+                .width(Length::Fill);
+        rows.iter()
+            .fold(col, |col, row| {
+                col.push(row.target, panel_row(panel, row, dark))
+            })
+            .into()
     };
 
     let content = column![
@@ -887,7 +1067,10 @@ fn panel_view(panel: &PanelState) -> Element<'_, Message> {
             button(text("全部收起")).on_press(Message::PanelCollapseAll),
         ]
         .spacing(8),
-        scrollable(list).width(Length::Fill).height(Length::Fill),
+        // 列表级鼠标区：释放=提交拖拽；离开列表=取消拖拽（D28）
+        mouse_area(scrollable(list).width(Length::Fill).height(Length::Fill))
+            .on_release(Message::PanelDragDrop)
+            .on_exit(Message::PanelDragCancel),
         row![button(text("退出")).on_press(Message::PanelExitPressed)],
     ]
     .spacing(12)
@@ -898,43 +1081,182 @@ fn panel_view(panel: &PanelState) -> Element<'_, Message> {
     content.into()
 }
 
-/// 单个标签行：标题|窗口名 点击置前；展开时显示备注 + 置前/编辑/移除按钮
+/// 次要文本（`text()`）样式辅助：设语义色（D28）
 ///
-/// 全部文案克隆为自持 `'static` 字符串（行数据由调用方持有），按钮消息携带
-/// `target` 副本，故返回 `Element<'static, Message>`。
-fn panel_row(panel: &PanelState, row: &TagRow) -> Element<'static, Message> {
-    let expanded = panel.expanded.contains(&row.target);
-    let header = row![
-        button(text(if expanded { "▾" } else { "▸" }))
-            .on_press(Message::PanelToggleExpand(row.target)),
-        button(text(format!(
-            "{} | {}",
-            row.tag.title, row.tag.window_title
-        )))
-        .on_press(Message::PanelRowActivated(row.target)),
-    ]
-    .spacing(4)
-    .width(Length::Fill);
+/// `iced::widget::text::Style` 仅含 `color` 字段，无 `..Default` 需要。
+fn text_style(color: iced::Color) -> impl Fn(&Theme) -> iced::widget::text::Style + 'static {
+    move |_theme| iced::widget::text::Style { color: Some(color) }
+}
 
-    if expanded {
-        let actions = row![
-            button(text("置前")).on_press(Message::PanelRowActivated(row.target)),
-            button(text("编辑")).on_press(Message::PanelRowEdit(row.target)),
-            button(text("移除")).on_press(Message::PanelRowRemove(row.target)),
-        ]
-        .spacing(8);
-        let note = if row.tag.note.is_empty() {
-            text("（无）").size(12)
-        } else {
-            text(row.tag.note.clone()).size(12)
-        };
-        column![header, note, actions]
-            .spacing(4)
-            .padding(4)
+/// 单个标签行：`标题 | 窗口` 合并 + chevron 展开 + hover 高亮 + 展开区图标按钮
+///
+/// 文案克隆为自持 `'static` 字符串；行数据由调用方持有。`mouse_area` 实现 hover
+/// 上报与单击置前；`dark` 取调色板。返回 `Element<'static, Message>`。
+fn panel_row(panel: &PanelState, row: &TagRow, dark: bool) -> Element<'static, Message> {
+    let palette = crate::ui::panel_style::panel_palette(dark);
+    let expanded = panel.expanded.contains(&row.target);
+    let hovered = panel.hovered == Some(row.target);
+
+    // 判断标题是否处于行内编辑（D28：双击标题进入）
+    let editing_title = panel
+        .editing
+        .as_ref()
+        .is_some_and(|e| e.target == row.target && e.field == EditField::Title);
+
+    // 标题|窗口名合并：demo 用一行标题 + 长路径截断；这里 title 截断，窗口名拼接
+    let display_title = crate::ui::panel_style::truncate_units(&row.tag.title, 14);
+    let header_title = format!("{display_title} | {}", row.tag.window_title);
+
+    let chevron = text(if expanded {
+        crate::ui::panel_style::CHEVRON_DOWN
+    } else {
+        crate::ui::panel_style::CHEVRON_RIGHT
+    })
+    .size(12)
+    .style(text_style(palette.subtle));
+
+    // 标题区：编辑态用 text_input（不包 mouse_area，避免鼠标区分发点击/双击中断输入），
+    // 否则普通文本 + mouse_area（hover 上报 + 单击置前 + 双击进编辑）。
+    let title_body: Element<'static, Message> = if editing_title {
+        let draft = panel
+            .editing
+            .as_ref()
+            .map(|e| e.draft.clone())
+            .unwrap_or_default();
+        text_input("标题", &draft)
+            .id(format!("edit-{}", row.target))
+            .on_input(Message::PanelEditInput)
+            .on_submit(Message::PanelEditCommit)
             .width(Length::Fill)
             .into()
     } else {
-        header.into()
+        let dragging = panel.drag.is_some();
+        // 拖拽手柄（⋮⋮）：按下即开始拖拽（D28）
+        let handle = mouse_area(
+            container(text(crate::ui::panel_style::DRAG_HANDLE).style(text_style(palette.subtle)))
+                .padding(2),
+        )
+        .on_press(Message::PanelDragStart(row.target));
+        // 行主体：hover 上报；非拖拽时单击置前+双击编辑；拖拽中进入本行上报预览位
+        let main = mouse_area(
+            row![
+                container(chevron).padding(2),
+                handle,
+                text(header_title)
+                    .size(13)
+                    .width(Length::Fill)
+                    .style(text_style(palette.text)),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+        )
+        .on_enter(if dragging {
+            Message::PanelDragHover(row.target)
+        } else {
+            Message::PanelRowEntered(row.target)
+        })
+        .on_exit(Message::PanelRowExited)
+        .on_double_click(if dragging {
+            Message::PanelDragStart(row.target)
+        } else {
+            Message::PanelBeginEdit {
+                target: row.target,
+                field: EditField::Title,
+            }
+        });
+        let main = if dragging {
+            main.on_press(Message::PanelDragHover(row.target))
+        } else {
+            main.on_press(Message::PanelRowActivated(row.target))
+        };
+        main.into()
+    };
+
+    // 卡片容器：hover 时用 hover 底色 + 边框，否则卡片底
+    let card = container(title_body)
+        .width(Length::Fill)
+        .style(move |_theme| {
+            let bg = if hovered { palette.hover } else { palette.card };
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border::default()
+                    .rounded(iced::border::Radius::from(6))
+                    .color(palette.border)
+                    .width(if hovered { 1 } else { 0 }),
+                ..Default::default()
+            }
+        });
+
+    if expanded {
+        // 展开区：备注（可双击编辑）+ 图标按钮行（置前▲ / 编辑✎ / 移除🗑）
+        // 备注编辑态（D28）：Note 字段在编辑时换 text_input
+        let editing_note = panel
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.target == row.target && e.field == EditField::Note);
+        let note: Element<'static, Message> = if editing_note {
+            let draft = panel
+                .editing
+                .as_ref()
+                .map(|e| e.draft.clone())
+                .unwrap_or_default();
+            text_input("备注", &draft)
+                .id(format!("edit-note-{}", row.target))
+                .on_input(Message::PanelEditInput)
+                .on_submit(Message::PanelEditCommit)
+                .width(Length::Fill)
+                .into()
+        } else {
+            let txt = if row.tag.note.is_empty() {
+                text("（无）").size(12).style(text_style(palette.subtle))
+            } else {
+                text(row.tag.note.clone())
+                    .size(12)
+                    .style(text_style(palette.subtle))
+            };
+            mouse_area(txt)
+                .on_double_click(Message::PanelBeginEdit {
+                    target: row.target,
+                    field: EditField::Note,
+                })
+                .into()
+        };
+        let actions = row![
+            button(text(crate::ui::panel_style::ICON_TOP))
+                .style(icon_button_style(palette))
+                .on_press(Message::PanelRowActivated(row.target)),
+            button(text(crate::ui::panel_style::ICON_EDIT))
+                .style(icon_button_style(palette))
+                .on_press(Message::PanelRowEdit(row.target)),
+            button(text(crate::ui::panel_style::ICON_DELETE))
+                .style(icon_button_style(palette))
+                .on_press(Message::PanelRowRemove(row.target)),
+        ]
+        .spacing(8);
+        column![card, note, actions]
+            .spacing(6)
+            .padding(2)
+            .width(Length::Fill)
+            .into()
+    } else {
+        card.into()
+    }
+}
+
+/// 图标按钮样式（紧凑：透明底 + 边框 + 语义色文本，D28）
+///
+/// iced 0.14 的按钮样式闭包签名为 `Fn(&Theme, button::Status) -> Style`（带 Status 态）。
+fn icon_button_style(
+    palette: crate::ui::panel_style::PanelPalette,
+) -> impl Fn(&Theme, iced::widget::button::Status) -> iced::widget::button::Style + 'static {
+    move |_theme, _status| iced::widget::button::Style {
+        background: Some(iced::Background::Color(iced::Color::TRANSPARENT)),
+        text_color: palette.subtle,
+        border: iced::Border::default()
+            .rounded(iced::border::Radius::from(4))
+            .color(palette.border)
+            .width(1),
+        ..Default::default()
     }
 }
 
@@ -953,6 +1275,90 @@ fn filter_rows(rows: &[TagRow], query: &str) -> Vec<TagRow> {
         })
         .cloned()
         .collect()
+}
+
+/// 把行内编辑草稿合并到对应标签行（纯函数，可单测，D28）
+///
+/// 返回 `(更新后的 rows, 完整 Tag)`：把 `edit.target` 对应 tag 的指定字段
+/// 替换为 `edit.draft`；若 target 不存在则原样返回（调用方已过滤，此处兜底）。
+fn apply_edit_to_rows(rows: &[TagRow], edit: &PanelEdit) -> (Vec<TagRow>, Tag) {
+    let mut new_rows = rows.to_vec();
+    let mut committed: Option<Tag> = None;
+    for row in new_rows.iter_mut() {
+        if row.target == edit.target {
+            match edit.field {
+                EditField::Title => row.tag.title = edit.draft.clone(),
+                EditField::Note => row.tag.note = edit.draft.clone(),
+            }
+            committed = Some(row.tag.clone());
+            break;
+        }
+    }
+    match committed {
+        Some(tag) => (new_rows, tag),
+        // target 不存在：返回原 rows 与第一行 tag（调用方已保证存在，此处兜底）
+        None => {
+            let tag = rows.first().map(|r| r.tag.clone()).unwrap_or_else(|| Tag {
+                title: String::new(),
+                note: String::new(),
+                color: TagColor::Orange,
+                window_title: String::new(),
+                process_name: String::new(),
+            });
+            (new_rows, tag)
+        }
+    }
+}
+
+/// 计算拖放后的标签新顺序（纯函数，可单测，D28）
+///
+/// 把 `drag.from_target` 移到「`over_target` 之后」的位置（若 over_target 为 None
+/// 则原序不动）。返回完整 target 序列（保持其余行相对顺序）。
+fn preview_reorder(rows: &[TagRow], drag: &PanelDrag) -> Vec<isize> {
+    let order: Vec<isize> = rows.iter().map(|r| r.target).collect();
+    let Some(over) = drag.over_target else {
+        return order.clone();
+    };
+    let from = drag.from_target;
+    let Some(from_pos) = order.iter().position(|&t| t == from) else {
+        return order.clone();
+    };
+    let Some(over_pos) = order.iter().position(|&t| t == over) else {
+        return order.clone();
+    };
+    if from_pos == over_pos {
+        return order.clone();
+    }
+    // 移除 from，再在 over_pos（调整后的索引）之后插入
+    let mut new_order: Vec<isize> = order.iter().copied().filter(|&t| t != from).collect();
+    let insert_at = new_order
+        .iter()
+        .position(|&t| t == over)
+        .map(|pos| pos + 1)
+        .unwrap_or(new_order.len());
+    new_order.insert(insert_at, from);
+    new_order
+}
+
+/// 按 target 顺序重排 rows（纯函数，可单测，D28）
+///
+/// 仅重新排序 `rows`，不动其内容；`order` 中缺失的 target 追加到尾部兜底。
+fn reorder_rows(rows: &[TagRow], order: &[isize]) -> Vec<TagRow> {
+    let mut result: Vec<TagRow> = Vec::with_capacity(rows.len());
+    let mut by_target: std::collections::HashMap<isize, TagRow> =
+        rows.iter().map(|r| (r.target, r.clone())).collect();
+    for target in order {
+        if let Some(row) = by_target.remove(target) {
+            result.push(row);
+        }
+    }
+    // order 缺失项追加尾部（保持原 relative 顺序）
+    for row in rows {
+        if by_target.contains_key(&row.target) {
+            result.push(row.clone());
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -984,5 +1390,120 @@ mod tests {
         assert_eq!(filter_rows(&rows, "不存在").len(), 0);
         // 大小写不敏感
         assert_eq!(filter_rows(&rows, "WIN-记事本").len(), 1);
+    }
+
+    /// D28 apply_edit_to_rows：编辑 title 字段，全部行更新并带回完整 tag
+    #[test]
+    fn apply_edit_title_updates_row() {
+        let rows = vec![row("旧标题", "备注", 1), row("另一", "备注2", 2)];
+        let edit = PanelEdit {
+            target: 1,
+            field: EditField::Title,
+            draft: "新标题".to_string(),
+        };
+        let (new_rows, tag) = apply_edit_to_rows(&rows, &edit);
+        assert_eq!(new_rows[0].tag.title, "新标题");
+        assert_eq!(new_rows[0].tag.note, "备注"); // 其他字段不变
+        assert_eq!(tag.title, "新标题");
+        assert_eq!(new_rows[1].tag.title, "另一"); // 其他行不变
+    }
+
+    /// D28 apply_edit_to_rows：编辑 note 字段
+    #[test]
+    fn apply_edit_note_updates_row() {
+        let rows = vec![row("标题", "旧备注", 1)];
+        let edit = PanelEdit {
+            target: 1,
+            field: EditField::Note,
+            draft: "新备注".to_string(),
+        };
+        let (new_rows, tag) = apply_edit_to_rows(&rows, &edit);
+        assert_eq!(new_rows[0].tag.note, "新备注");
+        assert_eq!(tag.note, "新备注");
+        assert_eq!(tag.title, "标题");
+    }
+
+    /// D28 apply_edit_to_rows：target 不存在时原样返回（兜底）
+    #[test]
+    fn apply_edit_unknown_target_falls_back() {
+        let rows = vec![row("标题", "备注", 1)];
+        let edit = PanelEdit {
+            target: 99,
+            field: EditField::Title,
+            draft: "x".to_string(),
+        };
+        let (new_rows, tag) = apply_edit_to_rows(&rows, &edit);
+        assert_eq!(new_rows[0].tag.title, "标题"); // 不被修改
+        assert_eq!(tag.title, "标题");
+    }
+
+    // ---------- D28 preview_reorder / reorder_rows ----------
+
+    /// preview_reorder：把 from 移到 over 之后（下行）
+    #[test]
+    fn preview_reorder_move_down() {
+        let rows = vec![row("a", "", 1), row("b", "", 2), row("c", "", 3)];
+        let drag = PanelDrag {
+            from_target: 1,
+            over_target: Some(2),
+        };
+        assert_eq!(preview_reorder(&rows, &drag), vec![2, 1, 3]);
+    }
+
+    /// preview_reorder：把 from 移到 over 之后（上移）且 over==from 时不变
+    #[test]
+    fn preview_reorder_move_up_and_same() {
+        let rows = vec![row("a", "", 1), row("b", "", 2), row("c", "", 3)];
+        // 1 移到 3 之后 -> [2,3,1]
+        let drag = PanelDrag {
+            from_target: 1,
+            over_target: Some(3),
+        };
+        assert_eq!(preview_reorder(&rows, &drag), vec![2, 3, 1]);
+        // over == from：原序
+        let same = PanelDrag {
+            from_target: 2,
+            over_target: Some(2),
+        };
+        assert_eq!(preview_reorder(&rows, &same), vec![1, 2, 3]);
+    }
+
+    /// preview_reorder：over_target 为 None 或 from 不存在时原序不变
+    #[test]
+    fn preview_reorder_noop() {
+        let rows = vec![row("a", "", 1), row("b", "", 2)];
+        let none = PanelDrag {
+            from_target: 1,
+            over_target: None,
+        };
+        assert_eq!(preview_reorder(&rows, &none), vec![1, 2]);
+        let unknown = PanelDrag {
+            from_target: 99,
+            over_target: Some(1),
+        };
+        assert_eq!(preview_reorder(&rows, &unknown), vec![1, 2]);
+    }
+
+    /// reorder_rows：按顺序重排 rows（内容不变）
+    #[test]
+    fn reorder_rows_applies_order() {
+        let rows = vec![row("a", "", 1), row("b", "", 2), row("c", "", 3)];
+        let reordered = reorder_rows(&rows, &[2, 3, 1]);
+        assert_eq!(
+            reordered.iter().map(|r| r.target).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(reordered[0].tag.title, "b");
+    }
+
+    /// reorder_rows：order 缺失的 target 追加到尾部
+    #[test]
+    fn reorder_rows_append_missing() {
+        let rows = vec![row("a", "", 1), row("b", "", 2)];
+        let reordered = reorder_rows(&rows, &[1]);
+        assert_eq!(
+            reordered.iter().map(|r| r.target).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }
