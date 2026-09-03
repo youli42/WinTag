@@ -92,6 +92,9 @@ pub enum GuiEvent {
     RemoveTag { target: isize },
     /// 面板底部"退出"（G4：走规范退出流，含有标签时确认）。
     PanelExit,
+    /// 面板拖拽排序完成（iced→主线程，D28）：`targets` 为拖放后按新顺序排列的
+    /// 目标窗口句柄（完整新顺序，非增量）。主线程据此写回会话内 `tag_order`。
+    ReorderTags { targets: Vec<isize> },
 }
 
 // ---------------------------------------------------------------------
@@ -188,6 +191,12 @@ mod tests {
         };
         let _ = format!("{ev:?}");
         let _ = ev.clone();
+        // D28 ReorderTags：跨线程 Vec<isize> 需 Debug + Clone
+        let reorder = GuiEvent::ReorderTags {
+            targets: vec![1, 2, 3],
+        };
+        let _ = format!("{reorder:?}");
+        let _ = reorder.clone();
     }
 
     fn default_tag() -> Tag {
